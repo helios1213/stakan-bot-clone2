@@ -1,0 +1,45 @@
+# TAOUSDT — SELF-CONTAINED config (all fields explicit; no global.yaml inheritance).
+# Materialized from the effective runtime config. Edit here directly per-pair.
+
+meta:
+  symbol: TAOUSDT
+  behavioral_epoch: 1783954954
+  note: behavioral_epoch = unix time the TUNING last changed; bump ONLY on a real
+    config change, NOT on re-materialization. Analyze only trades with opened_at >=
+    this.
+detector:
+  min_ticks: 5
+  cooldown_sec: 3.0
+  long_only: false
+  short_only: false
+  max_spread_bps: 0.0
+exit_strategy:
+  min_hold_ms: 500
+  stop_adverse_bps: 10.0
+  trail_distance_bps: 3.0
+  breakeven_trigger_bps: 5.0
+  stall_timeout_ms: 3000
+  dead_on_arrival_timeout_ms: 2500
+  nevergreen_cut_ms: 0
+  nevergreen_adverse_ticks: 4.0
+  nevergreen_peak_ticks: 1.0
+  binance_reversal_max_ms: 1500
+execution:
+  ioc_offset_ticks: 2
+  ioc_max_attempts: 1
+  ioc_attempt_interval_ms: 0
+  margin_min_usdt: 17.0
+  margin_max_usdt: 20.0
+  leverage_min: 45
+  leverage_max: 50
+  stop_loss_ticks: 0
+  sl_grace_sec: 1.5
+  max_hold_sec: 60
+  cooldown_after_loss_sec: 3
+  cooldown_after_win_sec: 2
+  binance_reversal_ticks: 0.0   # 2026-07-14 DISABLED (mirror of primary; workflow 101%-verified +$4.4/day). Revert=15.0
+  gap_retrace_frac: 0.0
+  momentum_filter: false
+  momentum_tau_sec: 2.0
+  momentum_threshold_bps: 2.0
+  min_mexc_lag_pct: 0.02

@@ -1,0 +1,32 @@
+
+services:
+  stakan-bot:
+    build: .
+    container_name: stakan-bot
+    restart: unless-stopped
+    dns:
+      - 108.61.10.10   # Vultr Tokyo resolver -> Akamai 23.56.0.x fast POP (~0.5ms)
+      - 8.8.8.8         # Google fallback -> fast Tokyo POP (replaces Quad9 89ms far POP)
+    env_file: .env
+    environment:
+      - TZ=Europe/Kyiv
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,time; exit(0 if time.time()-os.path.getmtime('/app/data/.heartbeat')<60 else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    # Tune for many WebSocket connections
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192

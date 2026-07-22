@@ -1,0 +1,49 @@
+# ─── Secrets / env — NEVER commit (real money) ───────────────
+.env
+.env.*
+*.key
+*master_key*
+*.pem
+secrets/
+
+# ─── Per-server runtime state & data ─────────────────────────
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+logs/
+*.log
+data/instances/
+*state-export*.json
+paper_state.json
+
+# ─── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ─── Backups / archives ──────────────────────────────────────
+*.tar.gz
+*.tgz
+*-BACKUP-*
+*-PREAUDIT-*
+*-PREWEBPANEL-*
+
+# ─── Clone-local leftover backups (present on clone disk, not primary) ───
+*.bak
+*.bak-*
+*.removed
+*.backup*
+src.before-cleanup/
+
+# ─── OS / editor ─────────────────────────────────────────────
+.DS_Store
+*.swp
+
+# Claude Code local tool config
+.claude/

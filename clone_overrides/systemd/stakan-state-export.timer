@@ -1,0 +1,8 @@
+[Unit]
+Description=Export stakan state every minute
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=60s
+Unit=stakan-state-export.service
+[Install]
+WantedBy=timers.target

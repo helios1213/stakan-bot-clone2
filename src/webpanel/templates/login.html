@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>stakan · вхід</title>
+<style>
+  :root{--bg:#0e1116;--card:#161b22;--line:#232a33;--fg:#e6edf3;--mut:#8b949e;--grn:#2ea043;--red:#f85149;--acc:#388bfd;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
+    display:flex;align-items:center;justify-content:center;min-height:100vh;}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:36px 40px;width:100%;max-width:360px;}
+  .brand{font-size:22px;font-weight:700;margin-bottom:6px;}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:28px;}
+  label{display:block;color:var(--mut);font-size:12px;margin-bottom:5px;text-transform:uppercase;letter-spacing:.04em;}
+  input[type=password]{width:100%;background:#0d1117;color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:9px 12px;font-size:14px;outline:none;transition:.15s;}
+  input[type=password]:focus{border-color:var(--acc);}
+  button{width:100%;margin-top:18px;background:var(--acc);color:#fff;border:none;border-radius:6px;
+    padding:10px;font-size:14px;font-weight:600;cursor:pointer;transition:.15s;}
+  button:hover{opacity:.9;}
+  .err{color:var(--red);font-size:13px;margin-top:14px;text-align:center;min-height:20px;}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="brand">stakan</div>
+  <div class="sub">admin panel · вхід</div>
+  <form method="post" action="/login">
+    <label for="pw">Пароль</label>
+    <input type="password" id="pw" name="password" autofocus autocomplete="current-password" placeholder="введіть пароль">
+    <button type="submit">Увійти</button>
+    <div class="err">{{ error }}</div>
+  </form>
+</div>
+</body>
+</html>

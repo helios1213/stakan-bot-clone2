@@ -1,0 +1,154 @@
+# =====================================================================
+# stakan-bot config
+# =====================================================================
+# All strategy parameters live here. Hot-reload supported for most
+# values via Telegram /config set <key> <value>.
+# =====================================================================
+
+# ---- General runtime ----
+app:
+  timezone: Europe/Kyiv
+  heartbeat_interval_sec: 15           # writes /app/data/.heartbeat
+
+# ---- Exchanges ----
+binance:
+  ws_base: wss://fstream.binance.com/stream
+  rest_base: https://fapi.binance.com
+  # Public WebSocket — no auth needed.
+  # We subscribe to: <symbol>@depth20@100ms and <symbol>@aggTrade
+  depth_levels: 20
+  depth_update_speed_ms: 100
+  reconnect_delay_sec: 3
+  # latency-fix May 2026 — diagnostic-only bookTicker stream
+  book_ticker_enabled: true
+  book_ticker_log_interval_sec: 60
+  max_reconnect_delay_sec: 60
+
+mexc:
+  ws_base: wss://contract.mexc.com/edge
+  rest_base: https://contract.mexc.com
+  reconnect_delay_sec: 3
+  max_reconnect_delay_sec: 60
+  funding_intervals_utc: ["00:00", "08:00", "16:00"]
+  # Cut-off — we close shadow positions N seconds before funding tick
+  funding_cutoff_sec: 60
+
+# ---- Trading universe ----
+# Whitelist-only: the bot trades exactly the symbols listed in
+# `whitelist_priority`. No discovery, no scoring, no periodic refresh.
+# To change the universe: edit this section, rebuild image, restart container.
+#
+# Replaces the old `scanner:` section as of May 2026 scanner-removal refactor.
+universe:
+  whitelist_priority:
+    # Option Y whitelist: pairs with proven edge in shadow analysis
+    - ZECUSDT       # both detectors profitable: tf +$66, ll +$37 (best pair)
+    - TAOUSDT       # both: ll +$25, tf +$20
+    - BCHUSDT       # both: tf +$12, ll +$8
+    - ENAUSDT       # kept for Nizar-detector sub-experiment
+    - PENGUUSDT     # memecoin, micro-volatility profile
+    - DOGEUSDT      # added 2026-05-16 — manual experiment
+    - SUIUSDT       # added 2026-05-11 — mimics friend strategy
+    - WLDUSDT        # added for live fee test
+    - XMRUSDT        # shadow test 2026-06-13
+    - 1000PEPEUSDT  # uses scale=1000 (PEPE_USDT on MEXC); see KNOWN_BINANCE_SCALES
+    - 1000SHIBUSDT  # added 2026-07-04 shadow - adapted from PEPE (tick 1e-9, contract 1.0, scale 1000)
+    - HYPEUSDT
+    - AVAXUSDT      # live whitelist — morning 04-09 UTC, tight SL recommended
+    - LINKUSDT      # live whitelist — conservative 07-10 UTC, low volatility
+    - XLMUSDT       # added 2026-05-31 — shadow test (tick 1e-5, contract=10, scale=1.0)
+    - SOLUSDT       # added 2026-06-19 — manual shadow test (was excluded: historical losses)
+    - XRPUSDT       # added 2026-06-19 — manual shadow test
+    - ONDOUSDT      # added 2026-06-19 — manual shadow test
+    - BTCUSDT       # reference only — see reference_only_symbols below
+
+  # Safety net — explicitly blocked symbols (overrides whitelist if duplicated).
+  # ETHUSDT excluded: NO 0% fee promo on user's MEXC account (verified 2026-05-02).
+  # SOL/ADA/XRP/HYPE/PUMP/AAVE/LINK/(BTC traded-on): historical net losses or other reasons.
+  blacklist_symbols:
+    - ETHUSDT       # no 0% maker promo on user's MEXC account
+    # (BTCUSDT NOT blacklisted here — it's reference-only, see below)
+
+  # Reference-only: WS subscribed (we monitor prices for context) but detectors
+  # NEVER emit signals on these pairs. Use for pairs without 0-fee maker
+  # incentives or where we want price context without trading risk.
+  reference_only_symbols:
+    - BTCUSDT       # BTC moves drive altcoin moves; we monitor but don't trade it
+                    # (no 0% maker fee on MEXC for BTCUSDT futures)
+
+# ---- Strategy: lead-lag detector ----
+lead_lag:
+  enabled: true
+  window_ms: 200                       # rolling window for impulse
+  min_impulse_pct: 0.025               # 0.025% — lowered from 0.08 (patch 11)
+  max_lag_pct: 0.05                    # MEXC must still be within 0.05% of Binance start
+  min_volume_usdt_in_window: 30_000    # filters thin moves
+  cooldown_sec_per_symbol: 15
+
+# ---- Strategy: wall detector (confirmation only, not primary signal) ----
+walls:
+  enabled: true
+  min_wall_usdt: 500_000
+  min_wall_ratio_to_avg: 5.0
+  max_distance_pct_from_mid: 0.30
+  min_lifetime_sec: 3
+  spoof_detection_window_ms: 500       # if wall vanishes <500ms before price reaches it = spoof
+
+# ---- Shadow execution ----
+shadow:
+  enabled: true
+  margin_per_trade_usdt: 25
+  default_leverage: 100                # actual leverage capped by per-pair max from MEXC
+
+  # Slippage simulation — shadow IOC sleep window calibrated to live PENGU
+  # submit-latency p10..p90 (2026-06, from live_trades.latency_submit_ms).
+  entry_latency_ms: 168                # PENGU live p50 (enable flag + representative)
+  entry_latency_min_ms: 150            # shadow IOC sleep low  (PENGU submit p10)
+  entry_latency_max_ms: 205            # shadow IOC sleep high (PENGU submit p90)
+  fill_latency_ms: 50                  # order placed → order filled
+  use_real_mexc_orderbook_for_slippage: true
+
+  # Exits
+  stop_loss_roi_pct: -0.05             # -0.05% ROI = stops out very fast (you said "minimal SL")
+  trailing_take_profit:
+    enabled: true
+    activation_roi_pct: 0.10           # activate trailing after +0.10% ROI
+    trail_distance_roi_pct: 0.05       # trail by 0.05% ROI behind peak
+  hard_time_limit_sec: 600             # safety: nothing should live >10min
+
+# ---- Risk management ----
+risk:
+  max_concurrent_shadow_positions: 5
+  max_positions_per_symbol: 1
+  daily_max_signals: 500               # circuit breaker — log and pause if exceeded
+  pause_on_anomaly: true               # auto-pause if win-rate drops below threshold
+
+  anomaly_thresholds:
+    min_window_trades: 30              # need at least N trades to evaluate
+    max_loss_streak: 10
+    min_win_rate_pct_24h: 30           # alert below 30% — likely strategy broken
+
+# ---- Telegram bot ----
+telegram:
+  send_realtime_open: true             # message on every shadow position open
+  send_realtime_close: true            # ...and close
+  send_signal_only_messages: false     # don't spam every detected signal
+  send_wall_messages: false            # walls only on demand via /walls
+
+  hourly_summary: true
+  hourly_summary_minute: 0             # at HH:00
+
+  daily_report_time: "09:00"           # Kyiv time
+
+  alerts:
+    on_websocket_disconnect: true
+    on_api_error: true
+    on_anomaly: true
+    heartbeat_every_hours: 6           # "all good" check-in
+
+# ---- Logging ----
+logging:
+  console_level: INFO
+  file_level: DEBUG
+  retention_days: 14
+  separate_signals_log: true           # signals + walls go to logs/signals.log

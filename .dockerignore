@@ -1,0 +1,10 @@
+# Keep backups, caches, and dev cruft out of the image build context.
+*.bak*
+*.post-tao
+*.pre-tao
+__pycache__/
+*.pyc
+.venv/
+.git/
+config/pairs/.bak-materialize-*/
+config/.bak-sync-*/

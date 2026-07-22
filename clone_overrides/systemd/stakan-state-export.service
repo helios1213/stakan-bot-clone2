@@ -1,0 +1,5 @@
+[Unit]
+Description=Export stakan bot state for central panel
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/stakan-state-export.py clone1

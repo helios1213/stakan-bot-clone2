@@ -1,0 +1,26 @@
+# Global defaults — all pairs inherit unless overridden in per-pair YAML.
+# Changes take effect within 30s (no restart).
+
+detector:
+  scan_interval_sec: 0.05
+  cooldown_sec: 3.0
+  min_ticks: 4
+
+exit_strategy:
+
+  # BPS thresholds — universal across all pairs (1 bps = 0.01% of entry price).
+  # When bps > 0, overrides the corresponding _ticks field.
+  # Example: 10bps on ZEC ($550) = 55 ticks, on PEPE ($0.0036) = 3.6 ticks
+  stop_adverse_bps: 10         # 0.10% adverse from entry → exit (catastrophic stop)
+  trail_distance_bps: 3        # 0.03% pullback from peak → exit (trailing stop)
+  breakeven_trigger_bps: 5     # 0.05% peak profit → lock breakeven
+
+  # Time-based rules (same for all pairs)
+  min_hold_ms: 500             # ignore exits during first 500ms (spread noise)
+  stall_timeout_ms: 2000       # in profit but no improvement for 2s → exit
+  dead_on_arrival_timeout_ms: 1200  # never reached profit after 1.2s → exit
+  binance_reversal_max_ms: 1500    # Binance reversal only active first 2.5s
+
+# 2026-07-13 cleanup: execution block REMOVED (was byte-identical to ExecutionConfig dataclass defaults;
+# all 19 pair yamls are SELF-CONTAINED). exit_strategy kept as emergency fallback for a torn/deleted pair yaml.
+# detector block is LOAD-BEARING: main.py builds StaticGapConf from it at startup. Do not delete this file.

@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>stakan · панель</title>
+<style>
+:root{--bg:#0e1116;--card:#161b22;--line:#232a33;--fg:#e6edf3;--mut:#8b949e;--grn:#2ea043;--red:#f85149;--acc:#388bfd;--warn:#d29922;--shadow:#58a6ff;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;min-height:100vh}
+/* sidebar */
+nav.side{width:196px;background:var(--card);border-right:1px solid var(--line);flex-shrink:0;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;overflow-y:auto}
+.brand{padding:16px 18px 12px;font-weight:700;font-size:17px;border-bottom:1px solid var(--line)}
+nav.side a{display:flex;align-items:center;gap:10px;padding:11px 18px;color:var(--mut);cursor:pointer;text-decoration:none;border-left:3px solid transparent;font-size:13px;transition:.1s}
+nav.side a:hover{background:#1c2230;color:var(--fg)}
+nav.side a.active{color:var(--fg);border-left-color:var(--acc);background:#1a212c}
+nav.side a .ic{width:20px;text-align:center;font-size:15px}
+nav.side .sep{height:1px;background:var(--line);margin:6px 0}
+nav.side .spacer{flex:1}
+nav.side .foot{padding:12px 18px;font-size:11px;color:var(--mut);border-top:1px solid var(--line)}
+/* main */
+main{flex:1;min-width:0;display:flex;flex-direction:column}
+header.top{display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--line);background:#11151b;position:sticky;top:0;z-index:10;flex-wrap:wrap}
+header.top h1{font-size:15px;margin:0;font-weight:600}
+.hspacer{flex:1}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:3px 10px;border-radius:10px;border:1px solid var(--line);background:#21262d;white-space:nowrap}
+.badge.on{border-color:var(--grn);color:var(--grn)}
+.badge.off{border-color:var(--red);color:var(--red)}
+.badge.warn{border-color:var(--warn);color:var(--warn)}
+/* buttons */
+button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;transition:.1s}
+button:hover{border-color:var(--acc)}
+button:disabled{opacity:.4;cursor:default}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button.primary:hover{opacity:.9}
+button.success{background:#1a4731;border-color:var(--grn);color:var(--grn)}
+button.warn-btn{background:#3d2b00;border-color:var(--warn);color:var(--warn)}
+button.danger{background:#3d1418;border-color:var(--red);color:#ffb3b0}
+button.danger:hover{background:#5a1c22}
+button.kill{background:#5a1c22;border-color:var(--red);color:#ffb3b0;font-weight:700;font-size:13px;padding:6px 16px}
+button.kill:hover{background:#7a2028}
+button.sm{padding:3px 8px;font-size:11px}
+/* layout */
+.wrap{padding:16px 18px;overflow:auto;flex:1}
+section.tab{display:none} section.tab.active{display:block}
+/* cards */
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px}
+.card h2{font-size:11px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;display:flex;align-items:center;gap:8px}
+.card h2 .cnt{font-size:11px;background:#21262d;border:1px solid var(--line);border-radius:8px;padding:0 6px}
+/* kpis */
+.kpis{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 16px;min-width:110px;flex:1}
+.kpi .v{font-size:20px;font-weight:700;line-height:1.2}
+.kpi .l{color:var(--mut);font-size:11px;margin-top:2px;text-transform:uppercase;letter-spacing:.04em}
+.pos{color:var(--grn)} .neg{color:var(--red)} .clwarn{color:var(--warn)}
+/* tables */
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:right;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+tbody tr:hover{background:#1c2230}
+.tablewrap{max-height:500px;overflow-y:auto}
+/* state badges */
+.st{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.st-live{background:#1a4731;color:#3fb950;border:1px solid #2ea043}
+.st-shadow{background:#0d2045;color:#79c0ff;border:1px solid #388bfd}
+.st-paused{background:#3d2b00;color:#e3b341;border:1px solid #d29922}
+.st-discovered{background:#21262d;color:#8b949e;border:1px solid #444}
+/* pair rows */
+.pair-section{margin-bottom:20px}
+.pair-section-title{font-size:12px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+.pair-row{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.pair-row:hover{border-color:#30363d}
+.pair-sym{font-weight:700;font-size:14px;min-width:110px}
+.pair-stats{display:flex;gap:14px;flex:1;flex-wrap:wrap}
+.pair-stat{display:flex;flex-direction:column;align-items:center;min-width:52px}
+.pair-stat .sv{font-size:13px;font-weight:600}
+.pair-stat .lbl{font-size:10px;color:var(--mut);text-transform:uppercase}
+.pair-sizing{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.pair-sizing label{font-size:10px;color:var(--mut)}
+.pair-sizing input{width:56px;background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:3px 5px;text-align:center;font-size:12px}
+.pair-sizing input:focus{outline:none;border-color:var(--acc)}
+.pair-actions{display:flex;gap:6px}
+/* forms */
+.applybar{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px}
+.applybar .f{display:flex;flex-direction:column;gap:3px}
+.applybar label{color:var(--mut);font-size:11px}
+.applybar input,.applybar select{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:5px 8px;font-size:12px}
+.applybar input{width:90px}
+/* toggle switch */
+.sw{position:relative;display:inline-block;width:32px;height:18px;vertical-align:middle}
+.sw input{opacity:0;width:0;height:0;position:absolute}
+.sw-slider{position:absolute;inset:0;background:#30363d;border-radius:18px;transition:.15s;cursor:pointer}
+.sw-slider:before{content:"";position:absolute;width:14px;height:14px;left:2px;top:2px;background:#8b949e;border-radius:50%;transition:.15s}
+.sw input:checked+.sw-slider{background:var(--grn)}
+.sw input:checked+.sw-slider:before{transform:translateX(14px);background:#fff}
+.note{color:var(--mut);font-size:12px;margin-bottom:10px}
+/* engine */
+.engine-controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+/* toast */
+#toast{position:fixed;bottom:20px;right:20px;background:#21262d;border:1px solid var(--line);color:var(--fg);padding:10px 18px;border-radius:8px;font-size:13px;z-index:999;display:none;max-width:320px}
+#toast.ok{border-color:var(--grn);color:var(--grn)}
+#toast.err{border-color:var(--red);color:var(--red)}
+/* sticky table headers when the table overflows vertically */
+.tablewrap thead th{position:sticky;top:0;background:var(--card);z-index:1;box-shadow:0 1px 0 var(--line)}
+/* dashboard meta line — UTC clock + refresh marker */
+.dashmeta{display:flex;justify-content:space-between;align-items:center;gap:14px;font-size:11px;color:var(--mut);margin:-6px 0 14px;text-transform:uppercase;letter-spacing:.04em}
+.dashmeta b{color:var(--fg);font-weight:600}
+/* per-slot KPI: balance on top + small PnL row under */
+.kpi .sub{font-size:11px;color:var(--mut);margin-top:4px;letter-spacing:.02em;text-transform:none}
+.kpi .sub b{font-weight:600}
+.kpi.halted{border-color:var(--red);background:#2a1419}
+/* fee-guard / disabled-slot banner */
+.banner{margin-bottom:14px;padding:12px 16px;border-radius:8px;border:1px solid var(--red);background:#2a1419;color:#ffb3b0;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.banner .icn{font-size:18px}
+.banner .msg{flex:1;min-width:200px}
+.banner .msg b{color:#ffd0cc}
+.banner button{margin-left:auto}
+/* per-pair config snapshot row under the symbol */
+.pair-cfg{font-size:10px;color:var(--mut);margin-top:4px;display:flex;gap:10px;flex-wrap:wrap}
+.pair-cfg span{background:#0d1117;border:1px solid var(--line);border-radius:5px;padding:1px 6px;white-space:nowrap}
+.pair-cfg span b{color:var(--fg);font-weight:600}
+/* trades-tab filter bar */
+.tfilter{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+.tfilter label{font-size:11px;color:var(--mut)}
+.tfilter input,.tfilter select{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:4px 8px;font-size:12px}
+</style>
+</head>
+<body>
+<nav class="side">
+  <div class="brand">⚡ stakan</div>
+  <a data-tab="dashboard" class="active"><span class="ic">▦</span> Dashboard</a>
+  <a data-tab="pairs"><span class="ic">📈</span> Пари</a>
+  <a data-tab="trades"><span class="ic">💰</span> Історія угод</a>
+  <div class="sep"></div>
+  <a data-tab="accounts"><span class="ic">👤</span> Акаунти</a>
+  <a data-tab="engine"><span class="ic">⚙️</span> Двигун</a>
+  <div class="spacer"></div>
+</nav>
+
+<main>
+  <header class="top">
+    <h1 id="title">Dashboard</h1>
+    <span class="hspacer"></span>
+    <span id="botBadge" class="badge">● Бот</span>
+    <form method="post" action="/logout" style="margin:0"><button style="color:var(--mut);font-size:12px">Вийти</button></form>
+  </header>
+  <div class="wrap">
+
+  <!-- =================== DASHBOARD =================== -->
+  <section class="tab active" id="tab-dashboard">
+    <!-- Fee-guard / configured-but-disabled banner. Populated by loadDashboard
+         when accounts.halted has entries. -->
+    <div id="dashBanner"></div>
+    <div class="kpis" id="dashKpis"></div>
+    <div class="dashmeta">
+      <span id="dashMeta">—</span>
+      <span id="dashRefreshed">—</span>
+    </div>
+
+    <!-- One block per remote bot (clone1, clone2, …). Populated from
+         d.remote_instances which is built by data._load_remote_instances(). -->
+    <div id="dashRemote"></div>
+
+    <div id="posCard" class="card" style="display:none;border-color:var(--warn)">
+      <h2>⚠️ Відкриті позиції <span id="posCount" class="cnt"></span></h2>
+      <div class="tablewrap"><table id="posTable"><thead><tr>
+        <th>Пара</th><th>Напрямок</th><th>Плече</th><th>Маржа $</th><th>Ціна входу</th><th>Відкрита</th><th>Акаунт</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <div class="card">
+      <h2>Останні угоди <span id="dashTradesCnt" class="cnt"></span></h2>
+      <div class="tablewrap"><table id="dashTrades"><thead><tr>
+        <th>Час</th><th>Пара</th><th>Напр.</th><th>PnL $</th><th>ROI %</th><th>Плече</th><th>Причина</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+
+  </section>
+
+  <!-- =================== ПАРЫ =================== -->
+  <section class="tab" id="tab-pairs">
+    <p class="note">Керування режимами торгівлі та параметрами позицій. Зміни застосовуються ботом протягом ~30 секунд.</p>
+
+    <!-- Bot switcher: lets the operator view/edit pair configs on any bot
+         (primary + every clone exposed by data.available_servers()). The
+         active button has class .primary; click rebuilds the lists by hitting
+         /api/pairs?server=<name>. -->
+    <div id="pairsServerBar" style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap"></div>
+
+    <div id="pairsLive" class="pair-section">
+      <div class="pair-section-title" style="color:var(--grn)">🟢 Торгують реальними грошима — Live <span id="cntLive" class="cnt" style="color:var(--mut);font-size:11px;font-weight:400;background:#21262d;border:1px solid var(--line);border-radius:8px;padding:0 6px;margin-left:4px"></span></div>
+      <div id="pairsLiveList"></div>
+    </div>
+
+    <div id="pairsShadow" class="pair-section">
+      <div class="pair-section-title" style="color:var(--shadow)">📊 Моніторинг без угод — Shadow <span id="cntShadow" class="cnt" style="color:var(--mut);font-size:11px;font-weight:400;background:#21262d;border:1px solid var(--line);border-radius:8px;padding:0 6px;margin-left:4px"></span></div>
+      <div id="pairsShadowList"></div>
+    </div>
+
+    <div id="pairsPaused" class="pair-section">
+      <div class="pair-section-title" style="color:var(--warn)">⏸ Пауза / Нові <span id="cntPaused" class="cnt" style="color:var(--mut);font-size:11px;font-weight:400;background:#21262d;border:1px solid var(--line);border-radius:8px;padding:0 6px;margin-left:4px"></span></div>
+      <div id="pairsPausedList"></div>
+    </div>
+  </section>
+
+  <!-- =================== ИСТОРИЯ СДЕЛОК =================== -->
+  <section class="tab" id="tab-trades">
+    <div class="kpis" id="tradesKpis"></div>
+    <div class="card">
+      <div class="tfilter">
+        <label>Пара</label>
+        <input id="tfSymbol" placeholder="напр. TAO" autocomplete="off" style="width:120px">
+        <label>Напрямок</label>
+        <select id="tfDir"><option value="">Всі</option><option value="long">Long</option><option value="short">Short</option></select>
+        <label>Результат</label>
+        <select id="tfWin"><option value="">Всі</option><option value="win">Тільки +</option><option value="loss">Тільки −</option></select>
+        <button class="sm" id="tfReset">Скинути</button>
+        <span style="flex:1"></span>
+        <span id="tfCount" class="note" style="margin:0"></span>
+      </div>
+      <h2>Live угоди — останні 100 <span id="tradesCnt" class="cnt"></span></h2>
+      <div class="tablewrap"><table id="tradesTable"><thead><tr>
+        <th>ID</th><th>Відкрита</th><th>Закрита</th><th>Пара</th><th>Напр.</th>
+        <th>Плече</th><th>Маржа $</th><th>PnL $</th><th>ROI %</th>
+        <th>Причина</th><th>Сек.</th><th>Акаунт</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- =================== АККАУНТЫ =================== -->
+  <section class="tab" id="tab-accounts">
+    <p class="note">MEXC акаунти (webkey = значення cookie <code>u_id</code> на futures.mexc.com → DevTools → Application → Cookies). Починається з <code>WEB</code>, 67 символів.</p>
+    <div class="card">
+      <h2>➕ Підключити новий акаунт</h2>
+      <div class="applybar">
+        <div class="f"><label>Сервер</label>
+          <select id="accServer"><option value="primary">primary</option></select></div>
+        <div class="f" style="flex:1 1 360px"><label>Веб-ключ (u_id cookie)</label>
+          <input id="accWebkey" placeholder="WEB + 64 hex символи…" autocomplete="off" spellcheck="false" style="width:100%"></div>
+        <div class="f"><label>Мітка (ім'я)</label><input id="accLabel" placeholder="напр. acc-main"></div>
+        <button class="primary" id="btnConnectAcc">Підключити</button>
+      </div>
+      <div id="accMsg" class="note" style="min-height:16px"></div>
+    </div>
+    <div class="card">
+      <h2>Акаунти <span id="accCount" class="cnt"></span></h2>
+      <div class="tablewrap"><table id="accTable"><thead><tr>
+        <th>Сервер</th><th>#</th><th>Мітка</th><th>Увім</th><th>Live</th><th>Пара</th><th>Баланс $</th>
+        <th>Latency</th><th>Ключ</th><th>Помилка</th><th></th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- =================== ДВИЖОК =================== -->
+  <section class="tab" id="tab-engine">
+    <div class="card">
+      <h2>Статус бота</h2>
+      <div style="margin-bottom:14px">
+        <span id="engStatus" class="badge" style="font-size:14px;padding:6px 14px">Завантаження…</span>
+      </div>
+      <div class="engine-controls">
+        <button class="success" id="engStart">▶ Запустити бота</button>
+        <button class="danger" id="engStop">⏹ Зупинити бота</button>
+        <button id="engRestart">🔄 Перезапустити</button>
+      </div>
+      <p id="engMsg" class="note" style="min-height:16px;margin-top:8px"></p>
+      <p class="note" style="margin-top:4px;border-top:1px solid var(--line);padding-top:8px">
+        <b>Зупинити</b> — бот завершує роботу, закриває відкриті позиції (graceful shutdown).<br>
+        <b>Перезапустити</b> — зупинити + запустити знову.
+      </p>
+    </div>
+    <div class="card" style="border-color:#3d1418">
+      <h2 style="color:var(--red)">🚨 KILL ALL — Аварійний стоп</h2>
+      <p class="note">Переводить всі пари з Live у Shadow. Бот припиняє відкривати нові позиції. Вже відкриті закриє сам при наступному циклі.</p>
+      <div style="display:flex;gap:10px;align-items:center">
+        <button class="kill" id="engKill">🚨 Виконати KILL ALL</button>
+        <span id="killMsg" class="note" style="margin:0"></span>
+      </div>
+    </div>
+  </section>
+
+  </div><!-- wrap -->
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s);
+const fmt=(n,d=2)=>(n==null||n===''||isNaN(+n))?'—':Number(n).toLocaleString('en-US',{maximumFractionDigits:d,minimumFractionDigits:0});
+const fmtPct=n=>n==null?'—':fmt(n*100,1)+'%';
+const cls=n=>(+n>0)?'pos':(+n<0)?'neg':'';
+const dt=ts=>ts?new Date(ts*1000).toLocaleString('uk-UA',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—';
+const TITLES={dashboard:'Dashboard',pairs:'Пари',trades:'Історія угод',accounts:'Акаунти',engine:'Двигун'};
+
+async function api(p,m='GET',b){
+  const o={method:m,headers:{'Content-Type':'application/json'}};
+  if(b!==undefined)o.body=JSON.stringify(b);
+  const r=await fetch(p,o);
+  if(r.status===401){location.href='/login';return {};}
+  if(!r.ok)throw new Error(await r.text());
+  return r.json();
+}
+
+function toast(msg,type='ok'){
+  const t=$('#toast');t.textContent=msg;t.className=type;t.style.display='block';
+  clearTimeout(t._t);t._t=setTimeout(()=>t.style.display='none',3500);
+}
+
+// ---- tabs ----
+$$('nav.side a[data-tab]').forEach(a=>a.onclick=()=>{
+  const t=a.dataset.tab;
+  $$('nav.side a').forEach(x=>x.classList.toggle('active',x===a));
+  $$('section.tab').forEach(s=>s.classList.toggle('active',s.id==='tab-'+t));
+  $('#title').textContent=TITLES[t]||t;
+  if(t==='dashboard'){startDashPoll();}else stopDashPoll();
+  if(t==='pairs')    loadPairs();
+  if(t==='trades')   loadTrades();
+  if(t==='accounts') loadAccounts();
+  if(t==='engine')   loadEngine();
+});
+
+// ---- bot badge ----
+function updateBotBadge(running){
+  const b=$('#botBadge');
+  b.textContent=running?'● Бот працює':'● Бот зупинений';
+  b.className='badge '+(running?'on':'off');
+}
+
+// ---- Dashboard ----
+let dashTimer=null;
+async function loadDashboard(){
+  let d,bot,pos;
+  try{[d,bot,pos]=await Promise.all([api('/api/dashboard'),api('/api/bot'),api('/api/positions')]);}
+  catch(e){return;}
+  updateBotBadge(bot.running);
+  const a=d.accounts||{},lv=d.live||{};
+
+  // Fee-guard / halted-slot banner — surfaces any slot that has webkey +
+  // assigned_pair but live_enabled=0. Most often it's the IOC fee guard
+  // auto-disabling a slot when MEXC starts charging a non-zero fee.
+  const halted=a.halted||[];
+  $('#dashBanner').innerHTML=halted.map(h=>`
+    <div class="banner">
+      <span class="icn">🚨</span>
+      <div class="msg">
+        <b>Слот ${h.slot_id}${h.label?' ('+h.label+')':''} — live ВИМКНЕНО</b><br>
+        Пара ${h.assigned_pair}. ${h.last_error?'Причина: '+h.last_error:'Можливо спрацював fee-guard або ручне вимкнення.'}<br>
+        Перевір fee-tier акаунта на MEXC, потім увімкни слот назад.
+      </div>
+      <button class="success sm" data-reenable="${h.slot_id}">↻ Re-enable</button>
+    </div>`).join('');
+
+  // Per-slot KPI cards: balance (large) + 24h PnL sub-line. Card border turns
+  // red when the slot is halted (matches the banner).
+  const slotKpiHtml=(a.list||[]).map(s=>{
+    const tag=s.assigned_pair?`${s.label||'slot '+s.slot_id} · ${s.assigned_pair}`:(s.label||'slot '+s.slot_id);
+    const val=s.balance_usdt!=null?'$'+fmt(s.balance_usdt):'—';
+    const valCls=s.live_enabled?'pos':'';
+    const wr=s.trades_24h?Math.round(100*(s.wins_24h||0)/s.trades_24h)+'%':'';
+    const sub=s.pnl_24h_usdt!=null
+      ? `сьогодні: <b class="${cls(s.pnl_24h_usdt)}">$${fmt(s.pnl_24h_usdt)}</b> · ${s.trades_24h||0} уг${wr?', WR '+wr:''}`
+      : 'сьогодні: немає угод';
+    const haltedCls=(s.assigned_pair && !s.live_enabled)?' halted':'';
+    return `<div class="kpi${haltedCls}"><div class="v ${valCls}">${val}</div><div class="l">${tag}</div><div class="sub">${sub}</div></div>`;
+  }).join('');
+
+  // KPI "Відкритих позицій" удалён намеренно: сделки живут 3-6с, дашборд
+  // обновляется раз в 6с, поэтому KPI 99% времени показывал "✓ Нет" — это
+  // шум, а не сигнал. Если позиция действительно зависнет, красная карточка
+  // #posCard ниже сама всплывёт со списком открытых.
+  // Two-row KPI ladder: today (Kyiv) on the left for at-a-glance session
+  // status, all-time on the right as the lifetime scoreboard. Both come from
+  // live_trades_summary() in one query so they're always coherent.
+  const baseKpis=[
+    ['Бот',bot.running?'🟢 Працює':'⏹ Зупинений',bot.running?'pos':'neg'],
+    ['Угод сьогодні',fmt(lv.trades_today,0),''],
+    ['PnL сьогодні','$'+fmt(lv.net_pnl_today_usdt),cls(lv.net_pnl_today_usdt)],
+    ['Угод всього',fmt(lv.trades,0),''],
+    ['PnL всього','$'+fmt(lv.net_pnl_usdt),cls(lv.net_pnl_usdt)],
+    ['Акаунтів',`${a.enabled||0} / ${a.total||0}`,''],
+  ].map(([l,v,c])=>`<div class="kpi"><div class="v ${c}">${v}</div><div class="l">${l}</div></div>`).join('');
+  $('#dashKpis').innerHTML=baseKpis+slotKpiHtml;
+
+  // UTC clock + best-session hint based on the live pairs' known windows.
+  const now=new Date(); const uh=now.getUTCHours();
+  const hint=(uh>=21||uh<8)?'TAO/ZEC — основна сесія 21-08 UTC':
+             (uh>=4 && uh<10)?'HYPE/BCH — основна сесія 04-10 UTC':
+             'Поза сильними вікнами — едж знижений';
+  $('#dashMeta').innerHTML=`UTC ${String(uh).padStart(2,'0')}:${String(now.getUTCMinutes()).padStart(2,'0')} · <b>${hint}</b>`;
+  window._dashLastTs=Math.floor(Date.now()/1000);
+  updateRefreshedLabel();
+
+  // Remote bots (clones) — one block per remote instance, populated from
+  // d.remote_instances written by data._load_remote_instances() server-side.
+  const remotes=d.remote_instances||[];
+  $('#dashRemote').innerHTML=remotes.map(inst=>{
+    const ageBadge=inst.stale
+      ? `<span style="color:var(--red);font-size:11px;margin-left:8px">⚠ stale ${Math.floor((inst.age_sec||0)/60)}m ${(inst.age_sec||0)%60}s</span>`
+      : `<span style="color:var(--mut);font-size:11px;margin-left:8px">оновлено ${inst.age_sec||0}с тому</span>`;
+    const cards=(inst.list||[]).map(s=>{
+      const tag=s.assigned_pair?`${s.label||'slot '+s.slot_id} · ${s.assigned_pair}`:(s.label||'slot '+s.slot_id);
+      const val=s.balance_usdt!=null?'$'+fmt(s.balance_usdt):'—';
+      const valCls=s.live_enabled?'pos':'';
+      const wr=s.trades_24h?Math.round(100*(s.wins_24h||0)/s.trades_24h)+'%':'';
+      const sub=s.pnl_24h_usdt!=null
+        ? `сьогодні: <b class="${cls(s.pnl_24h_usdt)}">$${fmt(s.pnl_24h_usdt)}</b> · ${s.trades_24h||0} уг${wr?', WR '+wr:''}`
+        : 'сьогодні: немає угод';
+      const haltedCls=(s.assigned_pair && !s.live_enabled)?' halted':'';
+      return `<div class="kpi${haltedCls}"><div class="v ${valCls}">${val}</div><div class="l">${tag}</div><div class="sub">${sub}</div></div>`;
+    }).join('');
+    const body=cards||'<p class="note" style="margin:0">Слоти ще не налаштовані (немає webkey)</p>';
+    return `<div class="card" style="background:transparent;border:1px dashed var(--line);margin-bottom:14px">
+      <h2 style="margin:0 0 10px">🖥 ${inst.server}${ageBadge}</h2>
+      <div class="kpis" style="margin:0">${cards}</div>
+      ${cards?'':body}
+    </div>`;
+  }).join('');
+
+  // Merge remote halted slots into the fee-guard banner so the operator sees
+  // halts from any bot on one screen.
+  const remoteHalted=remotes.flatMap(r=>(r.halted||[]).map(h=>({...h,_server:r.server})));
+  if(remoteHalted.length){
+    const remoteBanners=remoteHalted.map(h=>`
+      <div class="banner">
+        <span class="icn">🚨</span>
+        <div class="msg">
+          <b>[${h._server}] Слот ${h.slot_id}${h.label?' ('+h.label+')':''} — live ВИМКНЕНО</b><br>
+          Пара ${h.assigned_pair}. ${h.last_error?'Причина: '+h.last_error:'fee-guard або ручне вимкнення.'}<br>
+          Re-enable через Telegram-бота цього інстансу.
+        </div>
+      </div>`).join('');
+    $('#dashBanner').insertAdjacentHTML('beforeend',remoteBanners);
+  }
+
+  const pp=pos.positions||[];
+  $('#posCard').style.display=pp.length?'':'none';
+  $('#posCount').textContent=pp.length;
+  $('#posTable tbody').innerHTML=pp.map(p=>`<tr>
+    <td><b>${p.symbol}</b></td>
+    <td>${p.direction==='long'?'🟢 LONG':'🔴 SHORT'}</td>
+    <td>${p.leverage}x</td><td>$${fmt(p.margin_usdt)}</td>
+    <td>${fmt(p.entry_price,6)}</td><td>${dt(p.opened_at)}</td>
+    <td>${p.account_label||'—'}</td></tr>`).join('');
+
+  const rt=d.recent_live_trades||[];
+  $('#dashTradesCnt').textContent=rt.length;
+  $('#dashTrades tbody').innerHTML=rt.map(t=>`<tr>
+    <td>${dt(t.opened_at)}</td><td><b>${t.symbol}</b></td>
+    <td>${t.direction==='long'?'🟢 L':'🔴 S'}</td>
+    <td class="${cls(t.net_pnl_usdt)}">${t.net_pnl_usdt!=null?'$'+fmt(t.net_pnl_usdt):'—'}</td>
+    <td class="${cls(t.roi_pct)}">${t.roi_pct!=null?fmt(t.roi_pct,2)+'%':'—'}</td>
+    <td>${t.leverage}x</td><td>${t.exit_reason||'—'}</td></tr>`).join('')
+    ||'<tr><td colspan="7" style="color:var(--mut);text-align:left">Немає угод</td></tr>';
+
+}
+function updateRefreshedLabel(){
+  if(!window._dashLastTs){$('#dashRefreshed').textContent='—';return;}
+  const sec=Math.floor(Date.now()/1000)-window._dashLastTs;
+  $('#dashRefreshed').textContent=sec<5?'Оновлено щойно':`Оновлено ${sec} с тому`;
+}
+let refreshLabelTimer=null;
+function startDashPoll(){
+  loadDashboard();
+  clearInterval(dashTimer); dashTimer=setInterval(loadDashboard,6000);
+  clearInterval(refreshLabelTimer); refreshLabelTimer=setInterval(updateRefreshedLabel,1000);
+}
+function stopDashPoll(){
+  clearInterval(dashTimer); dashTimer=null;
+  clearInterval(refreshLabelTimer); refreshLabelTimer=null;
+}
+
+// Re-enable click handler for the fee-guard banner button.
+document.addEventListener('click', async e=>{
+  const id=e.target.dataset?.reenable;if(!id)return;
+  if(!confirm(`Увімкнути live на слоті ${id}?\n\nЯкщо причина (наприклад, ненульова комісія MEXC) не усунена, fee-guard знову автоматично вимкне слот.`))return;
+  try{
+    await api(`/api/accounts/${id}`,'POST',{live_enabled:true});
+    toast(`Слот ${id}: live увімкнено ✓`);
+    loadDashboard();
+  }catch(err){toast('Помилка: '+err.message,'err');}
+});
+
+// ---- Пари ----
+function stBadge(state){
+  const map={live:'st-live',shadow:'st-shadow',paused:'st-paused',discovered:'st-discovered'};
+  const labels={live:'🟢 Live',shadow:'📊 Shadow',paused:'⏸ Пауза',discovered:'🔍 Нова'};
+  return `<span class="st ${map[state]||'st-discovered'}">${labels[state]||state}</span>`;
+}
+function pairRow(p){
+  const isLive=p.state==='live';
+  const btnToLive  =!isLive?`<button class="sm success" data-sym="${p.symbol}" data-action="live">→ Live</button>`:'';
+  const btnToShadow= isLive?`<button class="sm warn-btn" data-sym="${p.symbol}" data-action="shadow">→ Shadow</button>`:'';
+  const pnl=p.last_24h_pnl;
+  return `<div class="pair-row" data-sym="${p.symbol}">
+    <div class="pair-sym">${p.symbol}<br><small style="font-weight:400">${stBadge(p.state)}</small>
+      <div class="pair-cfg">
+        ${p.min_mexc_lag_pct!=null?`<span>lag <b>${fmt(p.min_mexc_lag_pct,3)}–${fmt(p.max_mexc_lag_pct,3)}%</b></span>`:''}
+        ${p.min_confidence!=null?`<span>conf <b>≥${fmt(p.min_confidence,2)}</b></span>`:''}
+        ${p.ioc_offset_bps!=null?`<span>ioc <b>${fmt(p.ioc_offset_bps,1)}bps</b></span>`:''}
+        ${p.max_hold_sec!=null?`<span>hold <b>${p.max_hold_sec}s</b></span>`:''}
+      </div>
+    </div>
+    <div class="pair-stats">
+      <div class="pair-stat"><div class="sv">${fmt(p.last_24h_trades,0)}</div><div class="lbl">сьог. уг.</div></div><!-- last_24h_* fields now overlaid by data._pair_today_stats() since Kyiv 00:00 -->
+      <div class="pair-stat"><div class="sv ${p.last_24h_winrate>0?'pos':''}">${fmtPct(p.last_24h_winrate)}</div><div class="lbl">win %</div></div>
+      <div class="pair-stat"><div class="sv ${cls(pnl)}">${pnl!=null?'$'+fmt(pnl):'—'}</div><div class="lbl">сьог. PnL</div></div>
+    </div>
+    <div class="pair-sizing">
+      <label>Маржа $</label>
+      <input type="number" min="1" data-f="margin_min_usdt" value="${p.margin_min_usdt??''}" title="Мін. маржа $">
+      <span style="color:var(--mut)">—</span>
+      <input type="number" min="1" data-f="margin_max_usdt" value="${p.margin_max_usdt??''}" title="Макс. маржа $">
+      <label style="margin-left:4px">Плече x</label>
+      <input type="number" min="1" data-f="leverage_min" value="${p.leverage_min??''}" title="Мін. плече">
+      <span style="color:var(--mut)">—</span>
+      <input type="number" min="1" data-f="leverage_max" value="${p.leverage_max??''}" title="Макс. плече">
+      <button class="sm" data-sym="${p.symbol}" data-action="save" title="Зберегти">💾</button>
+    </div>
+    <div class="pair-actions">${btnToLive}${btnToShadow}</div>
+  </div>`;
+}
+// Currently selected bot for the Pairs tab. Defaults to primary; updated when
+// the operator clicks the server-switcher buttons. Stored in localStorage so
+// the same bot is re-selected on page reload.
+let _pairsServer = localStorage.getItem('pairsServer') || 'primary';
+
+function _serverLabel(s, i){
+  // Operator-facing label: "Бот 1 (primary)", "Бот 2 (clone1)", …
+  return `Бот ${i+1} (${s})`;
+}
+
+function renderPairsServerBar(servers){
+  const bar=$('#pairsServerBar');
+  if(!servers || servers.length<=1){ bar.innerHTML=''; return; }  // hide for solo
+  bar.innerHTML = servers.map((s,i)=>{
+    const active = s===_pairsServer ? ' primary' : '';
+    return `<button class="${active}" data-pair-srv="${s}">${_serverLabel(s,i)}</button>`;
+  }).join('');
+}
+
+async function loadPairs(){
+  let d;
+  try{ d=await api(`/api/pairs?server=${encodeURIComponent(_pairsServer)}`); }
+  catch(e){toast(`Помилка завантаження пар [${_pairsServer}]`,'err');return;}
+
+  // If the requested server isn't in the available list (e.g. removed clone),
+  // fall back to primary and reload to avoid a stuck empty view.
+  const servers = d.servers || ['primary'];
+  if(!servers.includes(_pairsServer)){
+    _pairsServer='primary'; localStorage.setItem('pairsServer','primary');
+    return loadPairs();
+  }
+  renderPairsServerBar(servers);
+
+  const pairs=d.pairs||[];
+  const live  =pairs.filter(p=>p.state==='live');
+  const shadow=pairs.filter(p=>p.state==='shadow');
+  const paused=pairs.filter(p=>p.state!=='live'&&p.state!=='shadow');
+  $('#cntLive').textContent=live.length;
+  $('#cntShadow').textContent=shadow.length;
+  $('#cntPaused').textContent=paused.length;
+  const emptyHint = _pairsServer==='primary' ? '' : ` на <b>${_pairsServer}</b>`;
+  $('#pairsLiveList').innerHTML  =live.map(pairRow).join('')  ||`<p class="note">Немає пар у Live режимі${emptyHint}</p>`;
+  $('#pairsShadowList').innerHTML=shadow.map(pairRow).join('')||`<p class="note">Немає пар у Shadow${emptyHint}</p>`;
+  $('#pairsPausedList').innerHTML=paused.map(pairRow).join('')||'';
+}
+
+// Server-bar click handler — switches the active bot and reloads.
+document.addEventListener('click', e=>{
+  const srv=e.target.dataset?.pairSrv;if(!srv)return;
+  if(srv===_pairsServer)return;
+  _pairsServer=srv; localStorage.setItem('pairsServer',srv);
+  loadPairs();
+});
+document.addEventListener('click', async e=>{
+  const btn=e.target.closest('button[data-action]');if(!btn)return;
+  const sym=btn.dataset.sym, action=btn.dataset.action;
+  // Every write below carries `server: _pairsServer` so the panel writes to
+  // the bot the operator currently has selected (not always primary).
+  if(action==='live'){
+    if(!confirm(`Перевести ${sym} у Live на [${_pairsServer}]?\n\nБот почне торгувати РЕАЛЬНИМИ грошима на цій парі.`))return;
+    try{await api(`/api/pairs/${sym}`,'POST',{server:_pairsServer,mode:'live'});toast(`[${_pairsServer}] ${sym} → Live ✓`);loadPairs();}
+    catch(err){toast('Помилка: '+err.message,'err');}
+  }
+  if(action==='shadow'){
+    if(!confirm(`Перевести ${sym} у Shadow на [${_pairsServer}]? Торгівля на парі зупиниться.`))return;
+    try{await api(`/api/pairs/${sym}`,'POST',{server:_pairsServer,mode:'shadow'});toast(`[${_pairsServer}] ${sym} → Shadow ✓`);loadPairs();}
+    catch(err){toast('Помилка: '+err.message,'err');}
+  }
+  if(action==='save'){
+    const row=btn.closest('.pair-row');
+    const payload={server:_pairsServer};
+    row.querySelectorAll('input[data-f]').forEach(inp=>{
+      const v=Number(inp.value);if(!isNaN(v)&&inp.value!=='')payload[inp.dataset.f]=v;
+    });
+    try{await api(`/api/pairs/${sym}`,'POST',payload);toast(`[${_pairsServer}] ${sym}: параметри збережені ✓`);}
+    catch(err){toast('Помилка: '+err.message,'err');}
+  }
+});
+
+// ---- Історія угод ----
+let _allTrades=[];
+function renderTrades(){
+  const sym=($('#tfSymbol')?.value||'').trim().toUpperCase();
+  const dir=$('#tfDir')?.value||'';
+  const win=$('#tfWin')?.value||'';
+  const arr=_allTrades.filter(t=>{
+    if(sym && !(t.symbol||'').includes(sym)) return false;
+    if(dir && t.direction!==dir) return false;
+    if(win==='win' && !(+t.net_pnl_usdt>0)) return false;
+    if(win==='loss' && !(+t.net_pnl_usdt<0)) return false;
+    return true;
+  });
+  $('#tradesCnt').textContent=arr.length;
+  const tfc=$('#tfCount'); if(tfc) tfc.textContent=arr.length!==_allTrades.length?`показано ${arr.length} з ${_allTrades.length}`:'';
+  $('#tradesTable tbody').innerHTML=arr.map(t=>`<tr>
+    <td>${t.id}</td><td>${dt(t.opened_at)}</td>
+    <td>${t.closed_at?dt(t.closed_at):'<span class="clwarn">відкрита</span>'}</td>
+    <td><b>${t.symbol}</b></td>
+    <td>${t.direction==='long'?'🟢 L':'🔴 S'}</td>
+    <td>${t.leverage}x</td><td>$${fmt(t.margin_usdt)}</td>
+    <td class="${cls(t.net_pnl_usdt)}">${t.net_pnl_usdt!=null?'$'+fmt(t.net_pnl_usdt):'—'}</td>
+    <td class="${cls(t.roi_pct)}">${t.roi_pct!=null?fmt(t.roi_pct,2)+'%':'—'}</td>
+    <td>${t.exit_reason||'—'}</td>
+    <td>${t.duration_sec!=null?t.duration_sec+'s':'—'}</td>
+    <td>${t.account_label||'—'}</td></tr>`).join('')
+    ||'<tr><td colspan="12" style="color:var(--mut);text-align:left">Немає угод</td></tr>';
+}
+async function loadTrades(){
+  let d,s;
+  try{[d,s]=await Promise.all([api('/api/live/trades'),api('/api/live/summary')]);}
+  catch(e){toast('Помилка завантаження угод','err');return;}
+  $('#tradesKpis').innerHTML=[
+    ['Угод сьогодні',fmt(s.trades_today,0),''],
+    ['PnL сьогодні','$'+fmt(s.net_pnl_today_usdt),cls(s.net_pnl_today_usdt)],
+    ['Угод всього',fmt(s.trades,0),''],
+    ['PnL всього','$'+fmt(s.net_pnl_usdt),cls(s.net_pnl_usdt)],
+    ['Відкритих',s.open||0,''],
+  ].map(([l,v,c])=>`<div class="kpi"><div class="v ${c}">${v}</div><div class="l">${l}</div></div>`).join('');
+  _allTrades=d.trades||[];
+  renderTrades();
+}
+// Wire trade-filter inputs once at script-load time.
+['#tfSymbol','#tfDir','#tfWin'].forEach(sel=>{
+  const el=$(sel); if(el) el.addEventListener('input',renderTrades);
+});
+const _tfReset=$('#tfReset');
+if(_tfReset) _tfReset.onclick=()=>{
+  $('#tfSymbol').value=''; $('#tfDir').value=''; $('#tfWin').value=''; renderTrades();
+};
+
+// ---- Акаунти (primary + clones, единый список) ----
+async function loadAccounts(){
+  let d;try{d=await api('/api/accounts');}catch(e){toast('Помилка завантаження акаунтів','err');return;}
+  const a=d.accounts||[];
+  $('#accCount').textContent=`${a.filter(x=>x.enabled).length} з ${a.length} увімкнено`;
+
+  // Refresh server-dropdown with the set of servers we actually see.
+  const servers=[...new Set(a.map(x=>x.server||'primary'))];
+  const sel=$('#accServer');
+  const cur=sel.value||'primary';
+  sel.innerHTML=servers.map(s=>`<option value="${s}"${s===cur?' selected':''}>${s}</option>`).join('');
+
+  $('#accTable tbody').innerHTML=a.map(x=>{
+    if(x._unreachable){
+      return `<tr><td colspan="11" style="color:var(--red);text-align:left">⚠ ${x.server}: ${x.last_error||'недоступний'}</td></tr>`;
+    }
+    const srv=x.server||'primary';
+    const srvBadge=srv==='primary'
+      ? `<span class="st st-discovered">primary</span>`
+      : `<span class="st" style="background:#0d2045;color:#79c0ff;border:1px solid var(--shadow)">${srv}</span>`;
+    return `<tr data-slot="${x.slot_id}" data-server="${srv}">
+      <td style="text-align:left">${srvBadge}</td>
+      <td>${x.slot_id}</td>
+      <td style="text-align:left"><input style="width:110px;background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:2px 5px" data-f="label" value="${x.label||''}"></td>
+      <td><label class="sw"><input type="checkbox" data-f="enabled" ${x.enabled?'checked':''}><span class="sw-slider"></span></label></td>
+      <td>${x.live_enabled?'<span class="pos">🟢</span>':'—'}</td>
+      <td>${x.assigned_pair||'—'}</td>
+      <td>${x.balance_usdt!=null?'$'+fmt(x.balance_usdt):'—'}</td>
+      <td>${x.latency_ms!=null?x.latency_ms+'ms':'—'}</td>
+      <td>${x.has_key?'<span class="pos">✓</span>':'—'}</td>
+      <td style="text-align:left;color:var(--red);max-width:180px;overflow:hidden;text-overflow:ellipsis">${x.last_error||''}</td>
+      <td>${x.has_key?`<button class="sm danger" data-rm="${x.slot_id}" data-rm-server="${srv}">видалити</button>`:''}</td>
+    </tr>`;
+  }).join('')||'<tr><td colspan="11" style="color:var(--mut)">Акаунтів немає</td></tr>';
+}
+$('#accTable').onchange=async e=>{
+  const tr=e.target.closest('tr[data-slot]'),f=e.target.dataset.f;if(!tr||!f)return;
+  const id=tr.dataset.slot,srv=tr.dataset.server||'primary';
+  const v=e.target.type==='checkbox'?e.target.checked:e.target.value;
+  try{await api(`/api/accounts/${id}`,'POST',{server:srv,[f]:v});
+      toast(`[${srv}] Слот ${id}: ${f} — Збережено`);}
+  catch(err){toast('Помилка: '+err.message,'err');}
+};
+$('#accTable').onclick=async e=>{
+  const id=e.target.dataset.rm;if(!id)return;
+  const srv=e.target.dataset.rmServer||'primary';
+  if(!confirm(`Видалити ключ зі слоту ${id} на ${srv}? Дія незворотна.`))return;
+  try{await api(`/api/accounts/${id}/remove`,'POST',{server:srv});
+      await loadAccounts();toast(`[${srv}] Слот ${id} очищений`);}
+  catch(err){toast('Помилка: '+err.message,'err');}
+};
+$('#btnConnectAcc').onclick=async()=>{
+  const server=$('#accServer').value||'primary';
+  const webkey=$('#accWebkey').value.trim(),label=$('#accLabel').value.trim();
+  const msg=$('#accMsg');msg.style.color='';msg.textContent=`Підключаю до ${server}…`;
+  try{
+    const r=await api('/api/accounts/connect','POST',{server,webkey,label});
+    $('#accWebkey').value='';$('#accLabel').value='';
+    msg.style.color='var(--grn)';msg.textContent=`✓ Підключений у [${server}] слот ${r.slot_id}`;
+    await loadAccounts();toast(`[${server}] Акаунт підключений ✓`);
+  }catch(err){msg.style.color='var(--red)';msg.textContent='✗ '+err.message;}
+};
+
+// ---- Двигун ----
+async function loadEngine(){
+  let r;try{r=await api('/api/bot');}catch(e){return;}
+  updateBotBadge(r.running);
+  const es=$('#engStatus');
+  es.textContent=r.running?'● Працює':'● Зупинений';
+  es.className='badge '+(r.running?'on':'off');
+  $('#engStart').disabled=r.running;
+  $('#engStop').disabled=!r.running;
+  $('#engRestart').disabled=!r.running;
+}
+async function engAction(ep,msg){
+  $('#engMsg').textContent=msg;
+  try{
+    await api('/api/bot/'+ep,'POST');
+    toast(msg.replace('…','') +' ✓');
+  }catch(e){$('#engMsg').textContent='Помилка: '+e.message;return;}
+  setTimeout(()=>{loadEngine();$('#engMsg').textContent='';},2500);
+}
+$('#engStart').onclick=()=>engAction('start','Запускаю…');
+$('#engStop').onclick=()=>{
+  if(confirm('Зупинити бот?\n\nВідкриті позиції будуть закриті (graceful stop).'))
+    engAction('stop','Зупиняю…');
+};
+$('#engRestart').onclick=()=>{
+  if(confirm('Перезапустити бот?'))engAction('restart','Перезапускаю…');
+};
+$('#engKill').onclick=async()=>{
+  if(!confirm('KILL ALL: перевести всі Live пари у Shadow?\n\nБот припинить відкривати нові позиції.'))return;
+  try{
+    const r=await api('/api/bot/killall','POST');
+    $('#killMsg').textContent=`Готово: ${r.demoted} пар → Shadow`;
+    toast(`KILL ALL: ${r.demoted} пар переведено у Shadow`);
+    setTimeout(loadPairs,1000);
+  }catch(e){$('#killMsg').textContent='Помилка: '+e.message;}
+};
+// ---- init ----
+startDashPoll();
+</script>
+</body>
+</html>
