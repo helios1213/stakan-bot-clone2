@@ -61,6 +61,9 @@ def handle(req: dict) -> dict:
         sym = req["symbol"]; sid = int(req["slot_id"])
         kwargs = {k: v for k, v in req.items() if k not in ("op", "symbol", "slot_id")}
         return data.set_slot_pair_sizing(sym, sid, **kwargs)
+    if op == "assign_pair":
+        data.assign_pair(int(req["slot_id"]), req.get("pair"))
+        return {"ok": True}
     return {"ok": False, "error": f"unknown op: {op!r}"}
 
 try:

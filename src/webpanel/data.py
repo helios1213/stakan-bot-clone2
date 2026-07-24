@@ -8,6 +8,8 @@ flags and non-sensitive status columns.
 """
 from __future__ import annotations
 
+import logging
+
 import json
 import os
 import re
@@ -98,10 +100,23 @@ def set_account(slot_id: int, *, enabled: bool | None = None,
                          (label, int(time.time()), slot_id))
         if live_enabled is not None:
             # Drives whether the bot routes live orders through this slot.
-            # Used by the fee-guard banner's "Re-enable" button to restore a
-            # slot that was auto-disabled by the IOC fee guard.
+            _now = int(time.time())
             conn.execute("UPDATE webkey_slots SET live_enabled=?, updated_at=? WHERE slot_id=?",
-                         (1 if live_enabled else 0, int(time.time()), slot_id))
+                         (1 if live_enabled else 0, _now, slot_id))
+            # Complete panel go-live: PairStateManager.is_in_live checks
+            # pair_states.state=='live'. Setting live_enabled alone would NOT
+            # actually trade (pair stays shadow). Promote the slot's assigned
+            # pair to 'live' when enabling, demote to 'shadow' when disabling
+            # (so a turned-off slot never strands its pair live with no exec).
+            _ap_row = conn.execute(
+                "SELECT assigned_pair FROM webkey_slots WHERE slot_id=?", (slot_id,)).fetchone()
+            _ap = _ap_row[0] if _ap_row else None
+            if _ap:
+                _st = "live" if live_enabled else "shadow"
+                conn.execute(
+                    "UPDATE pair_states SET state=?, state_since=?, updated_at=?, "
+                    "last_state_change_reason=? WHERE symbol=?",
+                    (_st, _now, _now, "panel live toggle", _ap))
         conn.commit()
     finally:
         conn.close()
@@ -164,6 +179,36 @@ def set_account_routed(server: str, slot_id: int, **kwargs) -> dict:
         set_account(slot_id, **kwargs)
         return {"ok": True}
     return _remote_rpc(server, {"op": "set", "slot_id": slot_id, **kwargs})
+
+
+def assign_pair(slot_id: int, pair: str | None) -> None:
+    """Assign a pair to a slot (pair=None unassigns). Mirrors
+    WebkeyStore.assign_pair: updates webkey_slots.assigned_pair AND auto-shadows
+    the DISPLACED old pair via pair_states.state (else it's stranded live with no
+    slot → silent [SKIP SHADOW]). The bot's _load_states_from_db (≤60s) reloads."""
+    conn = sqlite3.connect(DB)
+    try:
+        row = conn.execute(
+            "SELECT assigned_pair FROM webkey_slots WHERE slot_id=?", (slot_id,)).fetchone()
+        old_pair = row[0] if row else None
+        now = int(time.time())
+        conn.execute("UPDATE webkey_slots SET assigned_pair=?, updated_at=? WHERE slot_id=?",
+                     (pair, now, slot_id))
+        if old_pair and old_pair != pair:
+            conn.execute(
+                "UPDATE pair_states SET state='shadow', state_since=?, updated_at=?, "
+                "last_state_change_reason=? WHERE symbol=?",
+                (now, now, "slot reassigned via panel", old_pair))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def assign_pair_routed(server: str, slot_id: int, pair: str | None) -> dict:
+    if server == "primary":
+        assign_pair(slot_id, pair)
+        return {"ok": True}
+    return _remote_rpc(server, {"op": "assign_pair", "slot_id": slot_id, "pair": pair})
 
 
 def remove_account_routed(server: str, slot_id: int) -> dict:
@@ -564,15 +609,41 @@ def dashboard(sim_summary: dict | None) -> dict:
     accs = accounts()
     inc = incidents(limit=500)
     pnl24 = slot_24h_pnl()
-    ri = _load_remote_instances()
-    # Fold remote bots (clones) into the top-level account tallies AND the recent-
-    # trades table so the dashboard KPIs reflect ALL bots, not just primary.
-    _clone_accs = [x for inst in ri for x in (inst.get("accounts") or [])]
+    def _f(v):
+        try:
+            return float(v) if v not in (None, "") else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+    # Remote (clone) data arrives via JSON and is best-effort: a malformed or
+    # partial payload must NEVER blank the whole dashboard. Fold it defensively
+    # so any error degrades to primary-only instead of 500ing /api/dashboard.
+    try:
+        ri = _load_remote_instances()
+    except Exception:
+        logging.exception("dashboard: _load_remote_instances failed")
+        ri = []
+    try:
+        _clone_accs = [x for inst in ri for x in (inst.get("accounts") or [])]
+        _acc_live_extra = sum(1 for x in _clone_accs if x.get("live_enabled"))
+        _acc_bal_extra = sum(_f(x.get("last_balance_usdt")) for x in _clone_accs)
+    except Exception:
+        logging.exception("dashboard: clone account fold failed; primary only")
+        _clone_accs, _acc_live_extra, _acc_bal_extra = [], 0, 0.0
     _acc_total = len(accs) + len(_clone_accs)
-    _acc_live = (sum(1 for a in accs if a["live_enabled"])
-                 + sum(1 for x in _clone_accs if x.get("live_enabled")))
-    _acc_balance = (sum((a["balance_usdt"] or 0) for a in accs)
-                    + sum((x.get("last_balance_usdt") or 0) for x in _clone_accs))
+    _acc_live = sum(1 for a in accs if a["live_enabled"]) + _acc_live_extra
+    _acc_balance = sum(_f(a.get("balance_usdt")) for a in accs) + _acc_bal_extra
+    # Top-KPI live totals = primary + every clone (coerce every term; JSON strings possible).
+    _live = live_trades_summary()
+    try:
+        for inst in ri:
+            _ls = inst.get("live_summary") or {}
+            _live["trades"] = int(_f(_live.get("trades")) + _f(_ls.get("trades")))
+            _live["net_pnl_usdt"] = _f(_live.get("net_pnl_usdt")) + _f(_ls.get("net_pnl_usdt"))
+            _live["trades_today"] = int(_f(_live.get("trades_today")) + _f(_ls.get("trades_today")))
+            _live["net_pnl_today_usdt"] = _f(_live.get("net_pnl_today_usdt")) + _f(_ls.get("net_pnl_today_usdt"))
+    except Exception:
+        logging.exception("dashboard: clone live_summary fold failed; primary totals only")
+        _live = live_trades_summary()
     return {
         "accounts": {
             "total": _acc_total,
@@ -619,7 +690,7 @@ def dashboard(sim_summary: dict | None) -> dict:
             "total": len(inc),
             "open": sum(1 for i in inc if not i["acked"]),
         },
-        "live": live_trades_summary(),
+        "live": _live,
         "sim": sim_summary,
         "recent_incidents": inc[:6],
         "recent_live_trades": live_trades(25),   # primary (Основа) only
