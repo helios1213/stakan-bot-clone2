@@ -231,16 +231,6 @@ def _fmt_pair_detail(row: dict, slots: list | None = None) -> str:
         lines.append(f"<i>{desc}</i>")
     lines.append("")
 
-    if mn is not None and mx is not None:
-        lines.append(f"<b>Margin:</b> <code>${mn:g} – ${mx:g}</code> USDT")
-    else:
-        lines.append("<b>Margin:</b> <i>not set</i>")
-
-    if ln is not None and lx is not None:
-        lines.append(f"<b>Leverage:</b> <code>{ln}x – {lx}x</code>")
-    else:
-        lines.append("<b>Leverage:</b> <i>not set</i>")
-
     # Per-slot effective sizing (override if set, else inherits this pair) so
     # the pair screen shows what Slot 1 / Slot 2 actually trade with.
     for _s in (slots or []):
