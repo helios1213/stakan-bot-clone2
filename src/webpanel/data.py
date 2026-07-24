@@ -112,11 +112,14 @@ def set_account(slot_id: int, *, enabled: bool | None = None,
                 "SELECT assigned_pair FROM webkey_slots WHERE slot_id=?", (slot_id,)).fetchone()
             _ap = _ap_row[0] if _ap_row else None
             if _ap:
-                _st = "live" if live_enabled else "shadow"
-                conn.execute(
-                    "UPDATE pair_states SET state=?, state_since=?, updated_at=?, "
-                    "last_state_change_reason=? WHERE symbol=?",
-                    (_st, _now, _now, "panel live toggle", _ap))
+                if live_enabled:
+                    conn.execute(
+                        "UPDATE pair_states SET state='live', state_since=?, updated_at=?, "
+                        "last_state_change_reason=? WHERE symbol=?",
+                        (_now, _now, "panel live toggle", _ap))
+                else:
+                    # Only shadow the pair if NO other live slot still trades it.
+                    _demote_pair_if_orphaned(conn, _ap, slot_id, "panel live toggle off")
         conn.commit()
     finally:
         conn.close()
@@ -132,12 +135,30 @@ def set_account(slot_id: int, *, enabled: bool | None = None,
 REMOTE_BOTS = ["clone1"]
 
 
-def _remote_rpc(server: str, payload: dict, timeout: int = 20) -> dict:
+def _demote_pair_if_orphaned(conn, symbol, keep_slot_id: int, reason: str) -> None:
+    """Set pair_states.state='shadow' for `symbol` UNLESS another live_enabled
+    slot (other than keep_slot_id) still trades it — otherwise disabling/
+    reassigning/removing one slot would silently kill a sibling slot's live on
+    the same pair. Same-conn (caller commits)."""
+    if not symbol:
+        return
+    other = conn.execute(
+        "SELECT 1 FROM webkey_slots WHERE assigned_pair=? AND live_enabled=1 "
+        "AND slot_id!=? LIMIT 1", (symbol, keep_slot_id)).fetchone()
+    if other:
+        return  # a sibling slot still holds it live → keep it live
+    now = int(time.time())
+    conn.execute(
+        "UPDATE pair_states SET state='shadow', state_since=?, updated_at=?, "
+        "last_state_change_reason=? WHERE symbol=?", (now, now, reason, symbol))
+
+
+def _remote_rpc(server: str, payload: dict, timeout: int = 8) -> dict:
     """SSH to `server` and run the account-RPC script, piping JSON in/out."""
     import subprocess
     try:
         proc = subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+            ["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
              server, "python3", "/usr/local/bin/stakan-account-rpc.py"],
             input=json.dumps(payload),
             capture_output=True, text=True, timeout=timeout,
@@ -195,10 +216,7 @@ def assign_pair(slot_id: int, pair: str | None) -> None:
         conn.execute("UPDATE webkey_slots SET assigned_pair=?, updated_at=? WHERE slot_id=?",
                      (pair, now, slot_id))
         if old_pair and old_pair != pair:
-            conn.execute(
-                "UPDATE pair_states SET state='shadow', state_since=?, updated_at=?, "
-                "last_state_change_reason=? WHERE symbol=?",
-                (now, now, "slot reassigned via panel", old_pair))
+            _demote_pair_if_orphaned(conn, old_pair, slot_id, "slot reassigned via panel")
         conn.commit()
     finally:
         conn.close()
@@ -513,10 +531,11 @@ def remove_account(slot_id: int) -> bool:
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
-            "SELECT webkey_blob FROM webkey_slots WHERE slot_id=?", (slot_id,)
+            "SELECT webkey_blob, assigned_pair FROM webkey_slots WHERE slot_id=?", (slot_id,)
         ).fetchone()
         if not row or row["webkey_blob"] is None:
             return False
+        _old_pair = row["assigned_pair"]
         conn.execute(
             "UPDATE webkey_slots SET webkey_blob=NULL, visitor_blob=NULL, proxy_blob=NULL, "
             "enabled=0, live_enabled=0, assigned_pair=NULL, last_health_check=NULL, "
@@ -524,6 +543,9 @@ def remove_account(slot_id: int) -> bool:
             "webkey_refreshed_at=NULL, label=NULL, updated_at=? WHERE slot_id=?",
             (int(time.time()), slot_id),
         )
+        # Auto-shadow the displaced pair (unless a sibling live slot still trades
+        # it) — else it is stranded live with no credential/slot to execute it.
+        _demote_pair_if_orphaned(conn, _old_pair, slot_id, "webkey removed via panel")
         conn.commit()
         return True
     finally:

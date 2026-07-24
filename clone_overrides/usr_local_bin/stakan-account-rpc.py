@@ -47,7 +47,6 @@ def handle(req: dict) -> dict:
         res = data.add_account(
             webkey=req.get("webkey", ""),
             label=req.get("label") or None,
-            proxy=req.get("proxy") or None,
         )
         return {"ok": True, **res}
     if op == "pairs_list":
