@@ -75,7 +75,8 @@ async def _reset_slot_pnl(live_db, slot_id: int) -> None:
 
 
 def _fmt_slot_config(slot, whitelist_lookup: dict | None = None,
-                      sizing: dict | None = None, pnl: dict | None = None) -> str:
+                      sizing: dict | None = None, pnl: dict | None = None,
+                      override: dict | None = None) -> str:
     """Format slot config for display. Plain text, no markdown.
 
     `sizing` (optional): dict from config_writer.read_pair_sizing() (YAML —
@@ -111,14 +112,19 @@ def _fmt_slot_config(slot, whitelist_lookup: dict | None = None,
         # Sizing comes from the pair YAML (read_pair_sizing, the single source
         # of truth) — the caller fetches it since this is a sync formatter.
         if sizing is not None:
-            margin_min = sizing["margin_min_usdt"]
-            margin_max = sizing["margin_max_usdt"]
-            leverage_min = sizing["leverage_min"]
-            leverage_max = sizing["leverage_max"]
+            # Effective sizing = this (slot, pair) override where set, else the
+            # pair YAML. Shows the values the slot ACTUALLY trades with.
+            ovr = override or {}
+            margin_min = ovr["margin_min_usdt"] if ovr.get("margin_min_usdt") is not None else sizing["margin_min_usdt"]
+            margin_max = ovr["margin_max_usdt"] if ovr.get("margin_max_usdt") is not None else sizing["margin_max_usdt"]
+            leverage_min = ovr["leverage_min"] if ovr.get("leverage_min") is not None else sizing["leverage_min"]
+            leverage_max = ovr["leverage_max"] if ovr.get("leverage_max") is not None else sizing["leverage_max"]
+            has_ovr = any(ovr.get(k) is not None for k in ("margin_min_usdt", "margin_max_usdt", "leverage_min", "leverage_max"))
+            src = "this slot's override" if has_ovr else "inherited from pair YAML"
             lines.append(f"💰 Margin: ${margin_min:.0f}-{margin_max:.0f} (random per trade)")
             lines.append(f"📊 Leverage: {leverage_min}x-{leverage_max}x (random per trade)")
             lines.append(f"📈 Max notional: ${margin_max * leverage_max:.0f}")
-            lines.append("   (from YAML — same as shadow simulation)")
+            lines.append(f"   ({src})")
         else:
             lines.append("⚠️  No pair_configs entry — sizing will use hardcoded fallback")
     else:
@@ -312,9 +318,10 @@ async def cmd_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # fetch sizing from the pair YAML (read_pair_sizing, single source of truth)
     sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
+    slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
     pnl = await _get_slot_pnl(context.bot_data.get("live_db"), slot_id)
 
-    text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, pnl=pnl)
+    text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr, pnl=pnl)
     kb = _kb_slot_config(slot)
     await update.message.reply_text(text, reply_markup=kb)
 
@@ -360,8 +367,9 @@ async def handle_slot_callback(query, context, data: str) -> None:
         wl = await store.list_live_whitelist()
         wl_lookup = {w["symbol"]: w for w in wl}
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
+        slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
         pnl = await _get_slot_pnl(context.bot_data.get("live_db"), slot_id)
-        text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, pnl=pnl)
+        text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr, pnl=pnl)
         kb = _kb_slot_config(slot)
         try:
             await query.edit_message_text(text, reply_markup=kb)
@@ -412,8 +420,9 @@ async def handle_slot_callback(query, context, data: str) -> None:
         wl = await store.list_live_whitelist()
         wl_lookup = {w["symbol"]: w for w in wl}
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
+        slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
         pnl = await _get_slot_pnl(context.bot_data.get("live_db"), slot_id)
-        text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, pnl=pnl)
+        text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr, pnl=pnl)
         kb = _kb_slot_config(slot)
         try:
             await query.edit_message_text(text, reply_markup=kb)
@@ -448,8 +457,9 @@ async def handle_slot_callback(query, context, data: str) -> None:
         wl = await store.list_live_whitelist()
         wl_lookup = {w["symbol"]: w for w in wl}
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
+        slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
         pnl = await _get_slot_pnl(context.bot_data.get("live_db"), slot_id)
-        text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, pnl=pnl)
+        text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr, pnl=pnl)
         kb = _kb_slot_config(slot)
         try:
             await query.edit_message_text(text, reply_markup=kb)
@@ -571,7 +581,8 @@ async def handle_slot_callback(query, context, data: str) -> None:
         if demoted_pair:
             text = "⬇️ " + demoted_pair + " demoted to SHADOW\n" + text
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
-        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing)
+        slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
+        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr)
         kb = _kb_slot_config(slot)
         try:
             await query.edit_message_text(text, reply_markup=kb)
@@ -593,7 +604,8 @@ async def handle_slot_callback(query, context, data: str) -> None:
         else:
             text = "✅ Unassigned. Live also disabled.\n\n"
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
-        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing)
+        slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
+        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr)
         kb = _kb_slot_config(slot)
         try:
             await query.edit_message_text(text, reply_markup=kb)
@@ -692,7 +704,8 @@ async def handle_slot_callback(query, context, data: str) -> None:
             text += "\n✅ " + promoted_pair + " promoted to LIVE state"
         text += "\n\n"
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
-        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing)
+        slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
+        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr)
         kb = _kb_slot_config(slot)
         try:
             await query.edit_message_text(text, reply_markup=kb)
@@ -747,7 +760,8 @@ async def handle_slot_callback(query, context, data: str) -> None:
             text += "\n⬇️ " + demoted_pair + " demoted back to SHADOW state"
         text += "\n\n"
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
-        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing)
+        slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
+        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr)
         kb = _kb_slot_config(slot)
         try:
             await query.edit_message_text(text, reply_markup=kb)

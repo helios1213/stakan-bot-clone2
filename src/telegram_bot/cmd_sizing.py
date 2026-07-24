@@ -196,7 +196,7 @@ def _fmt_sizing_row(row: dict) -> str:
     )
 
 
-def _fmt_pair_detail(row: dict) -> str:
+def _fmt_pair_detail(row: dict, slots: list | None = None) -> str:
     """Detail screen text for a single pair."""
     sym = row["symbol"]
     desc = row.get("description") or ""
@@ -217,6 +217,22 @@ def _fmt_pair_detail(row: dict) -> str:
         lines.append(f"<b>Leverage:</b> <code>{ln}x – {lx}x</code>")
     else:
         lines.append("<b>Leverage:</b> <i>not set</i>")
+
+    # Per-slot effective sizing (override if set, else inherits this pair) so
+    # the pair screen shows what Slot 1 / Slot 2 actually trade with.
+    for _s in (slots or []):
+        sid = _s["slot_id"]
+        smn, smx = _s.get("slot_margin_min_usdt"), _s.get("slot_margin_max_usdt")
+        sln, slx = _s.get("slot_leverage_min"), _s.get("slot_leverage_max")
+        emn = smn if smn is not None else mn
+        emx = smx if smx is not None else mx
+        eln = sln if sln is not None else ln
+        elx = slx if slx is not None else lx
+        has_ovr = any(v is not None for v in (smn, smx, sln, slx))
+        tag = "override" if has_ovr else "inherits pair"
+        mtxt = f"${emn:g}–${emx:g}" if emn is not None else "—"
+        ltxt = f"{eln}x–{elx}x" if eln is not None else "—"
+        lines.append(f"<b>Slot {sid}:</b> <code>{mtxt} · {ltxt}</code> <i>({tag})</i>")
 
     lines.append("")
     lines.append(
@@ -409,7 +425,7 @@ async def handle_sizing_callback(
             return
         slots = await _slots_for_pair(db, symbol)
         await query.message.reply_text(
-            _fmt_pair_detail(row),
+            _fmt_pair_detail(row, slots),
             parse_mode=ParseMode.HTML,
             reply_markup=_kb_pair_detail(symbol, slots),
         )
