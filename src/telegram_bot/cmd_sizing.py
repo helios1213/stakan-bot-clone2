@@ -425,11 +425,8 @@ async def handle_sizing_callback(
                 "⚠️ Live pair whitelist is empty. Nothing to size.",
             )
             return
-        lines = ["<b>💰 Sizing — pick a pair</b>", ""]
-        for p in pairs:
-            _slots = await _slots_for_pair(db, p["symbol"])
-            lines.append(_fmt_picker_block(p, _slots))
-        text = "\n".join(lines)
+        # Picker = buttons only (header + pair grid); per-slot sizing shows on tap.
+        text = "<b>💰 Sizing — pick a pair</b>"
         await query.message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
