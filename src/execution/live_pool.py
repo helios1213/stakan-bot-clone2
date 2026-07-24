@@ -158,10 +158,12 @@ class LiveExecutorPool:
         returns None if there is no row — the caller treats None as "pair not
         configured for live → skip the slot".
 
-        NOTE: the margin/leverage in the returned dict are NOT the sizing the
-        bot trades. Actual margin/leverage are resolved from the pair YAML
-        (ConfigLoader) at trade time (shadow_engine builds cfg and randomizes
-        within the YAML range). This method only gates admission.
+        The returned dict carries BOTH the pair YAML base (margin_*/leverage_*)
+        AND this (slot, pair) override (slot_margin_*/slot_leverage_*, None =
+        inherit). shadow_engine's live-open MERGES them (override wins, YAML
+        fallback) and randomizes within that effective range to size the REAL
+        order — so the slot_* fields DO size the trade when set. It also gates
+        admission: None here = pair not configured for live → skip the slot.
         """
         slot = await self.webkey_store.get(slot_id)
         if symbol is None:
