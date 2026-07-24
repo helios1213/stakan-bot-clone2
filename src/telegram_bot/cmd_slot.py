@@ -633,18 +633,24 @@ async def handle_slot_callback(query, context, data: str) -> None:
             )
             return
         sizing = read_pair_sizing(slot.assigned_pair)
-        margin_min = sizing["margin_min_usdt"]
-        margin_max = sizing["margin_max_usdt"]
-        leverage_min = sizing["leverage_min"]
-        leverage_max = sizing["leverage_max"]
+        # Show the EFFECTIVE sizing this slot will actually trade with (its
+        # (slot,pair) override where set, else the pair YAML) so the go-live
+        # confirmation matches what shadow_engine really sizes — not the raw
+        # pair default.
+        _ov = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) or {}
+        margin_min = _ov["margin_min_usdt"] if _ov.get("margin_min_usdt") is not None else sizing["margin_min_usdt"]
+        margin_max = _ov["margin_max_usdt"] if _ov.get("margin_max_usdt") is not None else sizing["margin_max_usdt"]
+        leverage_min = _ov["leverage_min"] if _ov.get("leverage_min") is not None else sizing["leverage_min"]
+        leverage_max = _ov["leverage_max"] if _ov.get("leverage_max") is not None else sizing["leverage_max"]
         max_notional = margin_max * leverage_max
+        _src = "slot override" if any(_ov.get(k) is not None for k in ("margin_min_usdt", "margin_max_usdt", "leverage_min", "leverage_max")) else "pair default"
 
         text = (
             f"🔴 Confirm: Enable LIVE trading\n\n"
             f"Slot: {slot_id}\n"
             f"Pair: {slot.assigned_pair}\n"
-            f"Margin per trade: ${margin_min:.0f}-{margin_max:.0f} (random)\n"
-            f"Leverage per trade: {leverage_min}x-{leverage_max}x (random)\n"
+            f"Margin per trade: ${margin_min:.0f}-{margin_max:.0f} (random, {_src})\n"
+            f"Leverage per trade: {leverage_min}x-{leverage_max}x (random, {_src})\n"
             f"Max position size: ${max_notional:.0f}\n"
             f"Min balance recommended: ${wl_entry['recommended_min_balance_usdt']:.0f}\n\n"
             f"⚠️ Real money will be at risk!\n"
