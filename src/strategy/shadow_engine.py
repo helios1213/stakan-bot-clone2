@@ -334,6 +334,16 @@ class ShadowEngine:
         # Each pair is routed to its assigned slot via live_pool.find_slots_for_pair().
         self.live_pool = live_pool
         self._slot_cooldown_until: dict[int, float] = {}
+        # MEXC api_error_10014 = "position-opening frequency temporarily
+        # limited" — an anti-abuse throttle, NOT the ordinary 510 rate limit.
+        # Measured on this account: an isolated trip clears in 2-3s (100% <5s),
+        # but once the account is in the punished state the same probe needs
+        # minutes (median 78s, p90 328s) and every further attempt keeps it
+        # alive. So: tiny first pause, escalate on repeats, reset on a fill.
+        # per-slot: each account has its own ceiling, so strikes must not
+        # bleed from one account onto another slot's pause length.
+        self._open_rl_strikes: dict[int, int] = {}
+        self._open_rl_last: dict[int, float] = {}
         if self.live_pool is not None:
             logger.info("LIVE TRADING ENABLED (multi-slot mode) — pair routing via LiveExecutorPool")
         else:
@@ -1140,7 +1150,7 @@ class ShadowEngine:
 
                 # Skip slot if rate-limited after a recent 510
                 if time.monotonic() < self._slot_cooldown_until.get(sid, 0.0):
-                    _skip_reason = "slot_cooldown_510"
+                    _skip_reason = "slot_open_cooldown"
                     continue
 
                 # Validate the slot↔pair has a config row (admission control).
@@ -1214,6 +1224,8 @@ class ShadowEngine:
                         t_signal_created=t_sig,
                     )
                 if live_result.success:
+                    # A fill proves this slot's throttle is gone — drop its ladder.
+                    self._open_rl_strikes.pop(sid, None)
                     pos.mode = "live"
                     pos.live_order_id = live_result.order_id
                     pos.live_open_latency_ms = live_result.latency_ms
@@ -1296,6 +1308,40 @@ class ShadowEngine:
                     if live_result.error_msg and "api_error_510" in live_result.error_msg:
                         self._slot_cooldown_until[sid] = time.monotonic() + 15.0
                         logger.warning("[SLOT COOLDOWN] slot=%d 510 rate-limit, pausing 15s", sid)
+                    elif live_result.error_msg and "10014" in live_result.error_msg:
+                        # Anti-abuse open throttle — it is scoped to the ACCOUNT,
+                        # and every account has its own (unpublished) ceiling:
+                        # 2026-07-15 two different accounts ran side by side and
+                        # only one was limited; 2026-07-20 a tolerant account did
+                        # 1953 opens/day untouched. So pause ONLY this slot — a
+                        # sibling slot on the SAME account will trip within
+                        # seconds and pause itself, while a healthy account keeps
+                        # trading instead of idling for nothing.
+                        _now = time.monotonic()
+                        if _now - self._open_rl_last.get(sid, 0.0) > 3600:
+                            self._open_rl_strikes[sid] = 0  # stale, start over
+                        _strikes = self._open_rl_strikes.get(sid, 0) + 1
+                        self._open_rl_strikes[sid] = _strikes
+                        self._open_rl_last[sid] = _now
+                        _ladder = (5.0, 60.0, 300.0, 900.0, 1800.0)
+                        _wait = _ladder[min(_strikes - 1, len(_ladder) - 1)]
+                        self._slot_cooldown_until[sid] = _now + _wait
+                        logger.warning(
+                            "[OPEN THROTTLE] MEXC 10014 strike=%d — pausing opens "
+                            "on slot=%d for %.0fs (exits unaffected)",
+                            _strikes, sid, _wait,
+                        )
+                        if self.alerts is not None and _wait >= 60:
+                            try:
+                                await self.alerts.send(
+                                    f"⏸ MEXC обмежив частоту відкриттів (10014)\n"
+                                    f"Слот {sid}: пауза {int(_wait)}с · спроба #{_strikes}\n"
+                                    f"Виходи з позицій працюють як звичайно.",
+                                    category="open_throttle_10014",
+                                    throttle_sec=300,
+                                )
+                            except Exception:
+                                logger.exception("Failed to send 10014 alert")
                 break  # one slot tried — don't cascade through others
 
         # skip shadow for live pair when live execution failed.
