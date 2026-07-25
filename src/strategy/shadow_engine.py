@@ -1354,12 +1354,12 @@ class ShadowEngine:
                         self._open_rl_last[sid] = _now
                         logger.warning(
                             "[OPEN THROTTLE] MEXC 10014 slot=%d — rejected "
-                            "(%d-th this hour, no pause: measuring)", sid, _strikes)
+                            "(%d rejections since this slot last opened; no pause: measuring)", sid, _strikes)
                         if self.alerts is not None:
                             try:
                                 await self.alerts.send(
                                     f"⏸ MEXC обмежив частоту відкриттів (10014)\n"
-                                    f"SLOT{sid}: {_strikes}-й раз за годину\n"
+                                    f"SLOT{sid}: {_strikes} відмов від останньої угоди\n"
                                     f"Виходи з позицій працюють як звичайно.",
                                     category="open_throttle_10014",
                                     throttle_sec=300,
