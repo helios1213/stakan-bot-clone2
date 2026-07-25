@@ -1347,12 +1347,19 @@ class ShadowEngine:
                         _strikes = self._open_rl_strikes.get(sid, 0) + 1
                         self._open_rl_strikes[sid] = _strikes
                         self._open_rl_last[sid] = _now
-                        # FLAT 30s — deliberately NOT an escalating ladder. The
+                        # FLAT pause, deliberately NOT an escalating ladder: the
                         # severe form of 10014 is a 30-DAY account ban that no
                         # backoff can shorten, so long pauses only cost trading
-                        # time on an account that is either fine (a transient
-                        # trip clears in 2-3s) or already dead.
-                        _wait = 30.0
+                        # time on an account that is either fine or already dead.
+                        #
+                        # 60s is measured, not guessed: on the throttled account
+                        # the imposed ceiling is ONE open per ~62s (min gap 61.9s,
+                        # never >1 accepted in any 60s window despite 16 attempts).
+                        # With a 30s pause the bot woke up mid-window and simply
+                        # collected a SECOND rejection; 60s lands right as the
+                        # window reopens, so one rejection per cycle instead of ~15.
+                        # Env override for a differently-capped account.
+                        _wait = float(os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
                         self._slot_cooldown_until[sid] = _now + _wait
                         logger.warning(
                             "[OPEN THROTTLE] MEXC 10014 strike=%d — pausing opens "
