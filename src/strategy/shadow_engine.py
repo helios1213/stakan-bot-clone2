@@ -342,9 +342,12 @@ class ShadowEngine:
         # alive. So: tiny first pause, escalate on repeats, reset on a fill.
         # per-slot: each account has its own ceiling, so strikes must not
         # bleed from one account onto another slot's pause length.
-        self._open_rl_strikes: dict[int, int] = {}
         self._last_open_ts: dict[int, float] = {}
-        self._open_rl_last: dict[int, float] = {}
+        # Slot -> monotonic deadline of throttled mode. Latched by the
+        # first 10014 and refreshed by any further one; while it lasts
+        # the slot holds ~65s after each ACCEPTED open, which is the
+        # measured ceiling (1 open per ~61s).
+        self._open_rl_mode_until: dict[int, float] = {}
         if self.live_pool is not None:
             logger.info("LIVE TRADING ENABLED (multi-slot mode) — pair routing via LiveExecutorPool")
         else:
@@ -1230,7 +1233,6 @@ class ShadowEngine:
                         t_signal_created=t_sig,
                     )
                 if live_result.success:
-                    self._open_rl_strikes.pop(sid, None)
                     # MEASUREMENT: gap since this slot's previous accepted open.
                     # This is the number that reveals the imposed ceiling — read
                     # it straight from the log, no self-imposed pacing involved.
@@ -1240,6 +1242,13 @@ class ShadowEngine:
                     logger.info(
                         "[OPEN RATE] slot=%d accepted, gap_since_prev=%s",
                         sid, f"{_nowt - _prev:.1f}s" if _prev else "first")
+                    # Throttled mode: the MEXC window runs from the ACCEPTED open,
+                    # so pace from here. Slight upward jitter only — going under
+                    # the ceiling would just earn a rejection.
+                    if _nowt < self._open_rl_mode_until.get(sid, 0.0):
+                        _h = float(os.environ.get("OPEN_THROTTLE_HOLD_SEC", "65"))
+                        self._arm_open_hold(sid, self._humanize(_h, 1.0, 1.15),
+                                            "throttled: 1 open per window")
                     # Soft start: while warming up a freshly added account, space
                     # this slot's opens (12/h -> one every 300s) by arming the same
                     # pre-submit cooldown gate. Off the critical path (this order
@@ -1341,31 +1350,30 @@ class ShadowEngine:
                         self._slot_cooldown_until[sid] = time.monotonic() + 15.0
                         logger.warning("[SLOT COOLDOWN] slot=%d 510 rate-limit, pausing 15s", sid)
                     elif live_result.error_msg and "10014" in live_result.error_msg:
-                        # NO self-imposed pause here on purpose. Any brake we add
-                        # distorts the very thing we are trying to measure: what
-                        # this account is actually allowed to do. Log it, alert
-                        # once per 5 min, and let [OPEN RATE] below reveal the
-                        # real ceiling.
+                        # First 10014 latches this slot into throttled mode; from
+                        # then on it holds after every accepted open instead of
+                        # firing hundreds of doomed requests between fills.
                         _now = time.monotonic()
-                        if _now - self._open_rl_last.get(sid, 0.0) > 3600:
-                            self._open_rl_strikes[sid] = 0
-                        _strikes = self._open_rl_strikes.get(sid, 0) + 1
-                        self._open_rl_strikes[sid] = _strikes
-                        self._open_rl_last[sid] = _now
-                        logger.warning(
-                            "[OPEN THROTTLE] MEXC 10014 slot=%d — rejected "
-                            "(%d rejections since this slot last opened; no pause: measuring)", sid, _strikes)
-                        if self.alerts is not None:
-                            try:
-                                await self.alerts.send(
-                                    f"⏸ MEXC обмежив частоту відкриттів (10014)\n"
-                                    f"SLOT{sid}: {_strikes} відмов від останньої угоди\n"
-                                    f"Виходи з позицій працюють як звичайно.",
-                                    category="open_throttle_10014",
-                                    throttle_sec=300,
-                                )
-                            except Exception:
-                                logger.exception("Failed to send 10014 alert")
+                        _mode = float(os.environ.get("OPEN_THROTTLE_MODE_SEC", "21600"))
+                        _was_on = _now < self._open_rl_mode_until.get(sid, 0.0)
+                        self._open_rl_mode_until[sid] = _now + _mode
+                        if not _was_on:
+                            _hold = float(os.environ.get("OPEN_THROTTLE_HOLD_SEC", "65"))
+                            logger.warning(
+                                "[OPEN THROTTLE] slot=%d limited by MEXC — holding "
+                                "%.0fs after each open for the next %.0fh",
+                                sid, _hold, _mode / 3600)
+                            if self.alerts is not None:
+                                try:
+                                    await self.alerts.send(
+                                        f"⏸ MEXC обмежив частоту відкриттів (10014)\n"
+                                        f"SLOT{sid}: перехожу на 1 угоду / {int(_hold)}с\n"
+                                        f"Виходи з позицій працюють як звичайно.",
+                                        category=f"open_throttle_10014:{sid}",
+                                        throttle_sec=1800,
+                                    )
+                                except Exception:
+                                    logger.exception("Failed to send 10014 alert")
                 break  # one slot tried — don't cascade through others
 
         # skip shadow for live pair when live execution failed.
