@@ -1137,12 +1137,17 @@ class ShadowEngine:
         # Why no slot was used (all skipped via continue) — surfaced in the
         # failure alert so it shows the real reason instead of "Raw: ?".
         _skip_reason: str | None = None
+        # Which slot the attempt belonged to — needed by the failure alert:
+        # MEXC limits accounts individually, so "LIVE FAILED" without a slot
+        # is unactionable when more than one slot is live.
+        _attempt_sid: int | None = None
         _pair_is_live = self.state_manager is not None and self.state_manager.is_in_live(signal.symbol)
         if self.live_pool is not None and _pair_is_live:
             slot_ids = self.live_pool.find_slots_for_pair(signal.symbol)
             if not slot_ids:
                 _skip_reason = "no_slot_config"
             for sid in slot_ids:
+                _attempt_sid = sid
                 executor = self.live_pool.get_executor(sid)
                 safety = self.live_pool.get_safety(sid)
                 if executor is None or safety is None:
@@ -1354,7 +1359,7 @@ class ShadowEngine:
                             try:
                                 await self.alerts.send(
                                     f"⏸ MEXC обмежив частоту відкриттів (10014)\n"
-                                    f"Слот {sid}: пауза {int(_wait)}с · спроба #{_strikes}\n"
+                                    f"SLOT{sid}: пауза {int(_wait)}с · спроба #{_strikes}\n"
                                     f"Виходи з позицій працюють як звичайно.",
                                     category="open_throttle_10014",
                                     throttle_sec=300,
@@ -1547,15 +1552,19 @@ class ShadowEngine:
             # Send the classified alert
             if self.alerts is not None:
                 try:
+                    _slot_id = (
+                        chosen_slot_id if chosen_slot_id is not None else _attempt_sid
+                    )
+                    _slot_txt = f" · <b>SLOT{_slot_id}</b>" if _slot_id is not None else ""
                     alert_text = (
-                        f"{emoji} <b>{title}</b>\n"
+                        f"{emoji} <b>{title}</b>{_slot_txt}\n"
                         f"Pair: <code>{sym}</code> · {direction}"
                     )
                     if hint:
                         alert_text += f"\n\n{hint}"
                     await self.alerts.send(
                         alert_text,
-                        category=f"live_fail_{kind}:{sym}",
+                        category=f"live_fail_{kind}:{sym}:{_slot_id}",
                         throttle_sec=throttle,
                     )
                 except Exception:

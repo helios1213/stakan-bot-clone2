@@ -188,7 +188,7 @@ class TelegramAlerts:
         """Fire on position opened."""
         # Which slot/account this trade belongs to: with several slots live
         # the pair alone is ambiguous, and MEXC limits accounts individually.
-        slot_tag = f" · <b>{account_label}</b>" if account_label else ""
+        slot_tag = f" · <b>{account_label.upper()}</b>" if account_label else ""
         arrow = "🟢 LONG" if direction == "long" else "🔴 SHORT"
         # prefix [LIVE] / [SHADOW] for clarity
         if mode == "live":
@@ -255,7 +255,7 @@ class TelegramAlerts:
         account_label: str | None = None,  # e.g. "slot2" — which account
     ) -> None:
         """Fire on shadow position closed."""
-        slot_tag = f" · <b>{account_label}</b>" if account_label else ""
+        slot_tag = f" · <b>{account_label.upper()}</b>" if account_label else ""
         # Stash mode for the format string lookup below
         self._last_close_mode = mode
         # Filter low-PnL trades if user set a threshold

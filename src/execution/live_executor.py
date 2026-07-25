@@ -833,7 +833,7 @@ class LiveExecutor:
                     try:
                         await self.alerts.send(
                             text=(
-                                f"🚨 <b>Slot {self.slot_id} blocked</b>\n\n"
+                                f"🚨 <b>SLOT{self.slot_id} blocked</b>\n\n"
                                 f"<b>MEXC error:</b> <i>{msg}</i>\n\n"
                                 f"⚠️ <b>Action required:</b>\n"
                                 f"Open MEXC app/website and complete the verification "
@@ -940,7 +940,7 @@ class LiveExecutor:
                 try:
                     await self.alerts.send(
                         text=(
-                            f"✅ <b>Slot {self.slot_id} resumed</b>\n\n"
+                            f"✅ <b>SLOT{self.slot_id} resumed</b>\n\n"
                             f"Previous error: <i>{previous_error}</i>\n\n"
                             f"Trading resumed on this slot."
                         ),
@@ -1024,7 +1024,7 @@ class LiveExecutor:
         if self.alerts is not None:
             try:
                 await self.alerts.send(
-                    f"🚨 <b>FEE DETECTED — slot {self.slot_id} live DISABLED</b>\n\n"
+                    f"🚨 <b>FEE DETECTED — SLOT{self.slot_id} live DISABLED</b>\n\n"
                     f"{symbol}: MEXC charged a non-zero fee (${fee_usdt:.6f}) on a fill.\n\n"
                     f"This bot only has edge at <b>0% maker fee</b>, so live trading on "
                     f"slot {self.slot_id} was halted automatically. The pair falls back "
@@ -1306,7 +1306,7 @@ class LiveExecutor:
                         try:
                             await self.alerts.send(
                                 text=(
-                                    f"🚨 <b>Slot {self.slot_id} blocked</b>\n\n"
+                                    f"🚨 <b>SLOT{self.slot_id} blocked</b>\n\n"
                                     f"Error: <i>{msg}</i>"
                                 ),
                                 category=f"slot_{self.slot_id}_error",
@@ -1441,7 +1441,7 @@ class LiveExecutor:
                         try:
                             await self.alerts.send(
                                 text=(
-                                    f"✅ <b>Slot {self.slot_id} resumed</b>\n\n"
+                                    f"✅ <b>SLOT{self.slot_id} resumed</b>\n\n"
                                     f"Previous error: <i>{previous_error}</i>"
                                 ),
                                 category=f"slot_{self.slot_id}_resumed",
@@ -1576,7 +1576,7 @@ class LiveExecutor:
                     await self.alerts.send(
                         text=(
                             f"🚨 <b>PHANTOM FILL flattened</b>\n\n"
-                            f"<b>Slot:</b> {self.slot_id}\n"
+                            f"<b>Slot:</b> SLOT{self.slot_id}\n"
                             f"<b>Pair:</b> {symbol} {direction.upper()}\n"
                             f"<b>Qty:</b> {filled} cont\n<b>Order:</b> {order_id}\n\n"
                             f"An IOC we believed EXPIRED actually FILLED and was auto-flattened "
