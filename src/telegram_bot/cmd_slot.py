@@ -135,7 +135,7 @@ def _fmt_slot_config(slot, whitelist_lookup: dict | None = None,
         _rate = int(getattr(slot, "soft_start_max_per_hour", 0) or 12)
         lines.append(
             f"🐣 Soft start: max {_rate} opens/h "
-            f"({(_ss - time.time()) / 3600:.0f}h left)"
+            f"({(_ss - time.time()) / 3600:.1f}h left)"
         )
     if slot.live_enabled:
         if slot.is_live_active:
@@ -461,7 +461,9 @@ async def handle_slot_callback(query, context, data: str) -> None:
         _active = (getattr(_cur, "soft_start_until", None) or 0) > time.time()
         if _active:
             await store.set_soft_start(slot_id, None, None)
-            _msg = "Soft start cancelled — full speed"
+            # The hold already armed for the current interval keeps running —
+            # it lives in the engine, not the DB.
+            _msg = "Soft start cancelled — full speed from the next trade"
         else:
             _until = int(time.time()) + 48 * 3600
             await store.set_soft_start(slot_id, _until, 12)

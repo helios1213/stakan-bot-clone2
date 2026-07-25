@@ -150,6 +150,8 @@ class WebkeySlot:
     # future the live-open path paces this slot to N opens/hour.
     soft_start_until: int | None = None
     soft_start_max_per_hour: int | None = None
+    # Epoch until which this account is under a MEXC 10014 open-rate limit.
+    open_throttle_until: int | None = None
 
     @property
     def is_live_active(self) -> bool:
@@ -395,7 +397,8 @@ class WebkeyStore:
                    assigned_pair, live_enabled,
                    slot_margin_min_usdt, slot_margin_max_usdt,
                    slot_leverage_min, slot_leverage_max,
-                   soft_start_until, soft_start_max_per_hour
+                   soft_start_until, soft_start_max_per_hour,
+                   open_throttle_until
               FROM webkey_slots
              WHERE slot_id=?
             """,
@@ -414,7 +417,8 @@ class WebkeyStore:
                    assigned_pair, live_enabled,
                    slot_margin_min_usdt, slot_margin_max_usdt,
                    slot_leverage_min, slot_leverage_max,
-                   soft_start_until, soft_start_max_per_hour
+                   soft_start_until, soft_start_max_per_hour,
+                   open_throttle_until
               FROM webkey_slots
              ORDER BY slot_id
             """,
@@ -597,6 +601,18 @@ class WebkeyStore:
             "leverage_max":    None,
         }
 
+    async def set_open_throttle_until(self, slot_id: int, until_ts: int | None) -> None:
+        """Remember that MEXC is rate-limiting opens on this slot until `until_ts`.
+
+        Stored as an epoch so it survives a restart; the engine converts it back
+        into a monotonic deadline on first use (never compare the two clocks).
+        """
+        _validate_slot_id(slot_id)
+        await self.db.execute(
+            "UPDATE webkey_slots SET open_throttle_until=?, updated_at=? WHERE slot_id=?",
+            (until_ts, int(time.time()), slot_id),
+        )
+
     async def set_soft_start(self, slot_id: int, until_ts: int | None,
                              per_hour: int | None = None) -> None:
         """Arm/clear the account warm-up pacing for a slot.
@@ -676,4 +692,5 @@ class WebkeyStore:
             slot_leverage_max=_safe("slot_leverage_max"),
             soft_start_until=_safe("soft_start_until"),
             soft_start_max_per_hour=_safe("soft_start_max_per_hour"),
+            open_throttle_until=_safe("open_throttle_until"),
         )

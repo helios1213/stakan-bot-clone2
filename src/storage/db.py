@@ -615,6 +615,11 @@ async def init_db(db_path: str) -> None:
         await _add_columns_idempotent(db, "webkey_slots", [
             ("soft_start_until",        "INTEGER"),
             ("soft_start_max_per_hour", "INTEGER"),
+            # Epoch until which MEXC has this account under a 10014 open-rate
+            # limit. Persisted because the in-memory latch died on every
+            # restart, and a restart is routine (deploy, WS re-warm) — the
+            # bot then hammered a limited account until the next rejection.
+            ("open_throttle_until",     "INTEGER"),
         ])
         # 2026-07-19: per-(slot, pair) margin/leverage OVERRIDE. A row here means
         # "when slot S trades pair `symbol`, use this margin/leverage instead of

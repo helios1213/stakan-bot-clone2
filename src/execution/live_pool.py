@@ -200,6 +200,7 @@ class LiveExecutorPool:
             # fill and the watcher start would leave the position unmanaged.
             "soft_start_until": getattr(slot, "soft_start_until", None),
             "soft_start_max_per_hour": getattr(slot, "soft_start_max_per_hour", None),
+            "open_throttle_until": getattr(slot, "open_throttle_until", None),
         }
 
     def get_slot_lock(self, slot_id: int) -> asyncio.Lock:

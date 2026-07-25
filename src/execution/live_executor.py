@@ -1506,7 +1506,12 @@ class LiveExecutor:
         # BACKGROUND (fire-and-forget = zero added latency). Only for the
         # accepted-but-no-fill case (we have an order_id and an ioc_* verdict),
         # NOT rejects (api_error_401/510/… never opened a position).
-        if last_order_id and str(self.last_error or "").startswith("ioc_"):
+        # Any order id we hold may have filled late — including one created on
+        # an earlier attempt whose verdict was then overwritten by a reject
+        # (e.g. attempt 1 expired, attempt 2 came back 10014). Restricting
+        # this to ioc_* verdicts skipped exactly that case, which is the
+        # -$25.82 liquidation class.
+        if last_order_id:
             self._schedule_phantom_check(last_order_id, symbol, direction, leverage)
         return LiveOrderResult(
             success=False,

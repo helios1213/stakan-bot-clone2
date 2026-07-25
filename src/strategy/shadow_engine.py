@@ -1145,6 +1145,10 @@ class ShadowEngine:
         # MEXC limits accounts individually, so "LIVE FAILED" without a slot
         # is unactionable when more than one slot is live.
         _attempt_sid: int | None = None
+        # The slot the recorded _skip_reason belongs to. _attempt_sid alone
+        # is the LAST slot tried, so an alert could name a different slot
+        # than the reason it prints.
+        _skip_sid: int | None = None
         _pair_is_live = self.state_manager is not None and self.state_manager.is_in_live(signal.symbol)
         if self.live_pool is not None and _pair_is_live:
             slot_ids = self.live_pool.find_slots_for_pair(signal.symbol)
@@ -1159,13 +1163,30 @@ class ShadowEngine:
 
                 # Skip slot if rate-limited after a recent 510
                 if time.monotonic() < self._slot_cooldown_until.get(sid, 0.0):
-                    _skip_reason = "slot_open_cooldown"
+                    # `or` — a pacing skip on a later slot must not erase an
+                    # earlier safety_blocked reason (that one silences the
+                    # kill-switch alert, which must stay visible).
+                    if _skip_reason is None:
+                        _skip_reason, _skip_sid = "slot_open_cooldown", sid
                     continue
 
                 # Validate the slot↔pair has a config row (admission control).
                 slot_cfg = await self.live_pool.get_slot_config(sid, symbol=signal.symbol)
+                if slot_cfg is not None:
+                    # Restore a throttled latch that outlived the process. Stored
+                    # as an epoch, used as monotonic — convert, never compare
+                    # the two clocks directly.
+                    _ot = slot_cfg.get("open_throttle_until") or 0
+                    _now_w = time.time()
+                    if (_ot > _now_w
+                            and time.monotonic() >= self._open_rl_mode_until.get(sid, 0.0)):
+                        self._open_rl_mode_until[sid] = time.monotonic() + (_ot - _now_w)
+                        logger.info(
+                            "[OPEN THROTTLE] slot=%d restored from DB — %.0f min left",
+                            sid, (_ot - _now_w) / 60)
                 if slot_cfg is None:
-                    _skip_reason = _skip_reason or "no_slot_config"
+                    if _skip_reason is None:
+                        _skip_reason, _skip_sid = "no_slot_config", sid
                     continue
 
                 # Sizing (margin/leverage) comes from the SAME yaml source as
@@ -1199,14 +1220,17 @@ class ShadowEngine:
                     margin_usdt=live_margin,
                 )
                 if not allowed:
-                    _skip_reason = _skip_reason or f"safety_blocked: {reason}"
+                    if _skip_reason is None:
+                        _skip_reason, _skip_sid = f"safety_blocked: {reason}", sid
                     logger.debug(
                         "[LIVE SLOT %d] not available for %s: %s",
                         sid, signal.symbol, reason,
                     )
                     continue
-                # Found a slot we can use!
-                chosen_slot_id = sid
+                # NOTE: chosen_slot_id is set only AFTER the lock is taken —
+                # setting it here made the "no slot was even attempted"
+                # repair below unreachable for a busy slot, so the operator
+                # got "LIVE FAILED — Unknown error / Raw: ?".
                 # Convert symbol format: ZECUSDT → ZEC_USDT
                 mexc_symbol = to_mexc(signal.symbol)
                 _mexc_ob_for_open = self.ob_manager.get("mexc", signal.symbol)
@@ -1219,7 +1243,10 @@ class ShadowEngine:
                 _slot_lock = self.live_pool.get_slot_lock(sid)
                 if _slot_lock.locked():
                     logger.debug("[SLOT BUSY] slot=%d busy, skipping %s", sid, signal.symbol)
+                    if _skip_reason is None:
+                        _skip_reason, _skip_sid = "slot_busy", sid
                     continue
+                chosen_slot_id = sid
                 async with _slot_lock:
                     live_result = await executor.place_ioc_open(
                         symbol=mexc_symbol,
@@ -1228,7 +1255,14 @@ class ShadowEngine:
                         leverage=live_leverage,
                         mexc_ob=_mexc_ob_for_open,
                         offset_ticks=cfg.ioc_offset_ticks,  # 0=at-touch, N>0=cross N ticks (per-pair)
-                        max_attempts=cfg.ioc_max_attempts,        # per-pair (was global env IOC_MAX_ATTEMPTS)
+                        # Throttled: force a SINGLE request per pass. Retries
+                        # spend extra /order/create calls inside one gate pass,
+                        # which is exactly the quota we are trying to ration —
+                        # and a 10014 on the last attempt masks the hold for the
+                        # earlier one that did reach MEXC.
+                        max_attempts=(
+                            1 if time.monotonic() < self._open_rl_mode_until.get(sid, 0.0)
+                            else cfg.ioc_max_attempts),
                         retry_delay_ms=cfg.ioc_attempt_interval_ms,  # per-pair (was global env IOC_RETRY_DELAY_MS)
                         t_signal_created=t_sig,
                     )
@@ -1329,9 +1363,6 @@ class ShadowEngine:
                     # not just grep-able from logs. live_trades holds only
                     # opens that filled; without this the DB is blind to
                     # ioc_expired_no_fill / rejects (the "де не встиг").
-                    await self._record_live_miss(
-                        signal, sid, live_result.error_msg, cfg,
-                    )
                     # Controlled probe (2026-07-25, 3 tiny unfillable IOCs): request
                     # #1 was refused by VALIDATION (code 2003, no order created, no
                     # position) and request #2 three seconds later still came back
@@ -1354,6 +1385,12 @@ class ShadowEngine:
                         # Same rule for the warm-up: an unfilled IOC spent the
                         # quota just as a fill would.
                         self._arm_soft_start(sid, slot_cfg)
+                    # Recorded AFTER the hold is armed: this await used to sit
+                    # between the spent request and the hold, leaving a window for a
+                    # second request inside the same MEXC window.
+                    await self._record_live_miss(
+                        signal, sid, live_result.error_msg, cfg,
+                    )
                     if live_result.error_msg and "api_error_510" in live_result.error_msg:
                         # Through _arm_open_hold: writing the deadline directly
                         # SHORTENED the 65s hold taken a few lines above to 15s.
@@ -1377,6 +1414,12 @@ class ShadowEngine:
                         _was_on = _now < self._open_rl_mode_until.get(sid, 0.0)
                         self._open_rl_mode_until[sid] = _now + _mode
                         if not _was_on:
+                            try:
+                                await self.live_pool.webkey_store.set_open_throttle_until(
+                                    sid, int(time.time() + _mode))
+                            except Exception:
+                                logger.exception(
+                                    "[OPEN THROTTLE] could not persist latch slot=%d", sid)
                             _hold = self._env_float("OPEN_THROTTLE_HOLD_SEC", 65.0)
                             logger.warning(
                                 "[OPEN THROTTLE] slot=%d limited by MEXC — holding "
@@ -1447,7 +1490,7 @@ class ShadowEngine:
                 # from the throttle handler (with the slot, the hold and the
                 # repeat count) — the generic "Unknown error" copy of the very
                 # same event is pure duplication.
-                "10014",
+                "api_error_10014",
                 "position-opening frequency",
                 # Our OWN deliberate pacing, not an exchange failure: soft-start
                 # warm-up and the 10014/510 cooldowns skip the signal on purpose.
@@ -1455,7 +1498,14 @@ class ShadowEngine:
                 # paced skip must stay silent or it spams every few seconds.
                 "slot_open_cooldown",
                 "slot_cooldown",
+                "slot_busy",              # another pair is submitting on this slot
+
             )
+            # No reason recorded at all (no live_pool / no executor / slot
+            # skipped before anything was tried) — nothing actionable to say,
+            # and it used to render as "Unknown error / Raw: ?" every 300s.
+            if not err_msg:
+                return
             if any(b in err_msg for b in _BENIGN):
                 # Silent — bot's normal logs/metrics still capture them.
                 return
@@ -1534,7 +1584,6 @@ class ShadowEngine:
             elif any(s in err_msg for s in (
                 "rate limit", "rate_limit", "429", "too many requests",
                 "api_error_429", "api_error_510", "too frequent",
-                "slot_cooldown",
             )):
                 kind = "rate_limit"
                 emoji = "🚦"
@@ -1586,7 +1635,8 @@ class ShadowEngine:
             if self.alerts is not None:
                 try:
                     _slot_id = (
-                        chosen_slot_id if chosen_slot_id is not None else _attempt_sid
+                        chosen_slot_id if chosen_slot_id is not None
+                        else (_skip_sid if _skip_sid is not None else _attempt_sid)
                     )
                     _slot_txt = f" · <b>SLOT{_slot_id}</b>" if _slot_id is not None else ""
                     alert_text = (
@@ -2228,6 +2278,9 @@ class ShadowEngine:
         one, and vice versa). Exits are unaffected — the gate this feeds sits
         before order submit only."""
         import time as _t
+        # Clamp: a hand-set OPEN_THROTTLE_*=0 would otherwise log a hold of
+        # 0s and pace nothing at all.
+        seconds = max(1.0, float(seconds))
         deadline = _t.monotonic() + seconds
         if deadline > self._slot_cooldown_until.get(sid, 0.0):
             self._slot_cooldown_until[sid] = deadline
@@ -2657,7 +2710,7 @@ class ShadowEngine:
                             f"Daily PnL: ${ss['today_pnl']:+.2f}\n"
                             f"Consec losses: {ss['consecutive_losses']}\n"
                             f"Until: {ss.get('kill_until_human', 'indefinite')}",
-                            category="kill_switch",
+                            category=f"kill_switch:{slot_for_close}",
                             throttle_sec=60,  # don't spam if multiple closes hit at once
                         )
                     except Exception:
