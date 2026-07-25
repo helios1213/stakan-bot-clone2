@@ -1238,6 +1238,11 @@ class ShadowEngine:
                             _rate = max(1, min(_rate, 3600))
                             self._slot_cooldown_until[sid] = (
                                 time.monotonic() + 3600.0 / _rate)
+                            logger.info(
+                                "[SOFT START] slot=%d paced %.0fs until next open "
+                                "(%d opens/h, %.1fh of warm-up left)",
+                                sid, 3600.0 / _rate, _rate, (_ss - time.time()) / 3600,
+                            )
                     except Exception:
                         logger.exception("[SOFT START] pacing check failed slot=%d", sid)
                     pos.mode = "live"
@@ -1406,6 +1411,12 @@ class ShadowEngine:
                 "no_bbo",
                 "orderbook_not_synced",
                 "no_slot_config",       # pair in live state but slot not yet assigned
+                # Our OWN deliberate pacing, not an exchange failure: soft-start
+                # warm-up and the 10014/510 cooldowns skip the signal on purpose.
+                # The underlying error alerts once when it happens; every later
+                # paced skip must stay silent or it spams every few seconds.
+                "slot_open_cooldown",
+                "slot_cooldown",
             )
             if any(b in err_msg for b in _BENIGN):
                 # Silent — bot's normal logs/metrics still capture them.

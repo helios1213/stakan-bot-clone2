@@ -183,12 +183,16 @@ class TelegramAlerts:
         gap_ticks: float,
         detector_source: str,
         mode: str = "shadow",  # distinguish [LIVE] vs [SHADOW]
+        account_label: str | None = None,  # e.g. "slot2" — which account
     ) -> None:
         """Fire on position opened."""
+        # Which slot/account this trade belongs to: with several slots live
+        # the pair alone is ambiguous, and MEXC limits accounts individually.
+        slot_tag = f" · <b>{account_label}</b>" if account_label else ""
         arrow = "🟢 LONG" if direction == "long" else "🔴 SHORT"
         # prefix [LIVE] / [SHADOW] for clarity
         if mode == "live":
-            prefix = "🔴 <b>[LIVE OPEN]</b>"
+            prefix = f"🔴 <b>[LIVE OPEN]</b>{slot_tag}"
             margin_label = "isolated"
         else:
             prefix = "⚡ <b>[SHADOW OPEN]</b>"
@@ -248,8 +252,10 @@ class TelegramAlerts:
         mae_pct: float,
         duration_ms: int | None = None,
         mode: str = "shadow",
+        account_label: str | None = None,  # e.g. "slot2" — which account
     ) -> None:
         """Fire on shadow position closed."""
+        slot_tag = f" · <b>{account_label}</b>" if account_label else ""
         # Stash mode for the format string lookup below
         self._last_close_mode = mode
         # Filter low-PnL trades if user set a threshold
@@ -322,7 +328,7 @@ class TelegramAlerts:
             pass
 
         text = (
-            f"{emoji} <b>[{mode_label}]</b> {arrow} <code>{symbol}</code>\n"
+            f"{emoji} <b>[{mode_label}]</b>{slot_tag} {arrow} <code>{symbol}</code>\n"
             f"Entry: <code>{entry_price:.{dp}f}</code> → "
             f"Exit: <code>{exit_price:.{dp}f}</code>\n"
             f"PnL: <b>${net_pnl_usdt:+.4f}</b> ROI: <b>{roi_pct:+.2f}%</b>\n"

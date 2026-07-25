@@ -922,6 +922,7 @@ async def main() -> None:
                         gap_ticks=pos.gap_ticks,
                         detector_source=pos.detector_source,
                         mode=pos.mode,  # pass mode for [LIVE]/[SHADOW] prefix
+                        account_label=getattr(pos, "account_label", None),
                     )
         except Exception as e:
             logger.warning("trade_open alert failed: %s", e)
@@ -946,6 +947,7 @@ async def main() -> None:
                     mfe_pct=pos.mfe_pct,
                     mae_pct=pos.mae_pct,
                     mode=pos.mode,
+                    account_label=getattr(pos, "account_label", None),
                 )
         except Exception as e:
             logger.warning("trade_close alert failed: %s", e)
