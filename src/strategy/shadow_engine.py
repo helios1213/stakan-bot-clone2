@@ -1367,6 +1367,16 @@ class ShadowEngine:
                         # then on it holds after every accepted open instead of
                         # firing hundreds of doomed requests between fills.
                         _now = time.monotonic()
+                        # Probe interval. The hold below only arms after a request
+                        # that MEXC actually processed — so while every request is
+                        # refused there was nothing to hold from and the bot fired
+                        # ~790 rejects/hour. A 10014 does NOT consume quota (proven
+                        # by the probe), so we lose nothing by retrying every ~20s
+                        # instead of continuously: the window is still caught within
+                        # 20s of reopening.
+                        _probe = float(os.environ.get("OPEN_THROTTLE_PROBE_SEC", "20"))
+                        self._arm_open_hold(sid, self._humanize(_probe, 0.8, 1.3),
+                                            "throttled: probe interval")
                         _mode = float(os.environ.get("OPEN_THROTTLE_MODE_SEC", "21600"))
                         _was_on = _now < self._open_rl_mode_until.get(sid, 0.0)
                         self._open_rl_mode_until[sid] = _now + _mode
