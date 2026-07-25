@@ -1246,27 +1246,13 @@ class ShadowEngine:
                     # so pace from here. Slight upward jitter only — going under
                     # the ceiling would just earn a rejection.
                     if _nowt < self._open_rl_mode_until.get(sid, 0.0):
-                        _h = float(os.environ.get("OPEN_THROTTLE_HOLD_SEC", "65"))
+                        _h = self._env_float("OPEN_THROTTLE_HOLD_SEC", 65.0)
                         self._arm_open_hold(sid, self._humanize(_h, 1.0, 1.15),
                                             "throttled: 1 open per window")
-                    # Soft start: while warming up a freshly added account, space
-                    # this slot's opens (12/h -> one every 300s) by arming the same
-                    # pre-submit cooldown gate. Off the critical path (this order
-                    # already filled) and position exits are unaffected.
-                    try:
-                        _sl = await self.live_pool.webkey_store.get(sid)
-                        _ss = getattr(_sl, "soft_start_until", None) or 0
-                        if _ss > time.time():
-                            _rate = int(getattr(_sl, "soft_start_max_per_hour", 0) or 12)
-                            _rate = max(1, min(_rate, 3600))
-                            _base = 3600.0 / _rate
-                            _jit = self._humanize(_base, 0.65, 1.35)
-                            self._arm_open_hold(
-                                sid, _jit,
-                                f"soft start ~{_rate}/h (jitter {_jit/_base:.2f}x), "
-                                f"{(_ss - time.time())/3600:.1f}h left")
-                    except Exception:
-                        logger.exception("[SOFT START] pacing check failed slot=%d", sid)
+                    # Soft start — synchronous, values ride in slot_cfg. NO await
+                    # here: this sits between the fill and the watcher start, and
+                    # a cancel in between would leave the position unmanaged.
+                    self._arm_soft_start(sid, slot_cfg)
                     pos.mode = "live"
                     pos.live_order_id = live_result.order_id
                     pos.live_open_latency_ms = live_result.latency_ms
@@ -1353,15 +1339,25 @@ class ShadowEngine:
                     # consumed by the REQUEST to /order/create itself, not by a fill
                     # and not even by an order existing. Hold after ANY outcome
                     # except a 10014 refusal (those are blocked before counting).
-                    if (live_result.error_msg
-                            and "10014" not in live_result.error_msg
-                            and time.monotonic() < self._open_rl_mode_until.get(sid, 0.0)):
-                        _hc = float(os.environ.get("OPEN_THROTTLE_HOLD_SEC", "65"))
-                        self._arm_open_hold(sid, self._humanize(_hc, 1.0, 1.15),
-                                            "throttled: request spent")
+                    _err = live_result.error_msg or ""
+                    # Failures that never reached MEXC spend no quota, so they must
+                    # not trigger any pacing.
+                    _local_only = any(x in _err for x in (
+                        "empty_orderbook", "no_bbo", "orderbook_not_synced",
+                        "vol calc", "fee_guard", "not in pool", "invalid direction"))
+                    _spent_quota = bool(_err) and "10014" not in _err and not _local_only
+                    if _spent_quota:
+                        if time.monotonic() < self._open_rl_mode_until.get(sid, 0.0):
+                            _hc = self._env_float("OPEN_THROTTLE_HOLD_SEC", 65.0)
+                            self._arm_open_hold(sid, self._humanize(_hc, 1.0, 1.15),
+                                                "throttled: request spent")
+                        # Same rule for the warm-up: an unfilled IOC spent the
+                        # quota just as a fill would.
+                        self._arm_soft_start(sid, slot_cfg)
                     if live_result.error_msg and "api_error_510" in live_result.error_msg:
-                        self._slot_cooldown_until[sid] = time.monotonic() + 15.0
-                        logger.warning("[SLOT COOLDOWN] slot=%d 510 rate-limit, pausing 15s", sid)
+                        # Through _arm_open_hold: writing the deadline directly
+                        # SHORTENED the 65s hold taken a few lines above to 15s.
+                        self._arm_open_hold(sid, 15.0, "510 rate-limit")
                     elif live_result.error_msg and "10014" in live_result.error_msg:
                         # First 10014 latches this slot into throttled mode; from
                         # then on it holds after every accepted open instead of
@@ -1374,14 +1370,14 @@ class ShadowEngine:
                         # by the probe), so we lose nothing by retrying every ~20s
                         # instead of continuously: the window is still caught within
                         # 20s of reopening.
-                        _probe = float(os.environ.get("OPEN_THROTTLE_PROBE_SEC", "20"))
+                        _probe = self._env_float("OPEN_THROTTLE_PROBE_SEC", 20.0)
                         self._arm_open_hold(sid, self._humanize(_probe, 0.8, 1.3),
                                             "throttled: probe interval")
-                        _mode = float(os.environ.get("OPEN_THROTTLE_MODE_SEC", "21600"))
+                        _mode = self._env_float("OPEN_THROTTLE_MODE_SEC", 21600.0)
                         _was_on = _now < self._open_rl_mode_until.get(sid, 0.0)
                         self._open_rl_mode_until[sid] = _now + _mode
                         if not _was_on:
-                            _hold = float(os.environ.get("OPEN_THROTTLE_HOLD_SEC", "65"))
+                            _hold = self._env_float("OPEN_THROTTLE_HOLD_SEC", 65.0)
                             logger.warning(
                                 "[OPEN THROTTLE] slot=%d limited by MEXC — holding "
                                 "%.0fs after each open for the next %.0fh",
@@ -2190,6 +2186,41 @@ class ShadowEngine:
         UP — dipping below the discovered ceiling would just earn a rejection.
         """
         return seconds * random.uniform(lo, hi)
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        """Never let a typo in the environment raise inside the trading loop."""
+        try:
+            return float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _arm_soft_start(self, sid: int, slot_cfg: dict | None) -> None:
+        """Pace a warming-up account after a request that reached MEXC.
+
+        Must be called for EVERY such request, not only for fills: the 10014
+        quota is spent by the /order/create call itself (a request refused by
+        validation still consumed it), so arming only on fills let a fresh key
+        run 5-20x the rate its UI advertises — on exactly the vector the
+        warm-up exists to protect. Synchronous by design: the values ride along
+        in slot_cfg, so the post-fill path needs no await.
+        """
+        try:
+            if not slot_cfg:
+                return
+            until = slot_cfg.get("soft_start_until") or 0
+            if until <= time.time():
+                return
+            rate = int(slot_cfg.get("soft_start_max_per_hour") or 12)
+            rate = max(1, min(rate, 3600))
+            base = 3600.0 / rate
+            jit = self._humanize(base, 0.65, 1.35)
+            self._arm_open_hold(
+                sid, jit,
+                f"soft start ~{rate} req/h (jitter {jit/base:.2f}x), "
+                f"{(until - time.time())/3600:.1f}h left")
+        except Exception:
+            logger.exception("[SOFT START] pacing failed slot=%d", sid)
 
     def _arm_open_hold(self, sid: int, seconds: float, why: str) -> None:
         """Hold OPENS on this slot for `seconds`, never shortening an

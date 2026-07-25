@@ -195,6 +195,11 @@ class LiveExecutorPool:
             "slot_margin_max_usdt": ovr.get("margin_max_usdt"),
             "slot_leverage_min": ovr.get("leverage_min"),
             "slot_leverage_max": ovr.get("leverage_max"),
+            # Soft start, carried here so the trading path never has to hit the
+            # DB (and never has to await) after a fill — a cancel between the
+            # fill and the watcher start would leave the position unmanaged.
+            "soft_start_until": getattr(slot, "soft_start_until", None),
+            "soft_start_max_per_hour": getattr(slot, "soft_start_max_per_hour", None),
         }
 
     def get_slot_lock(self, slot_id: int) -> asyncio.Lock:
