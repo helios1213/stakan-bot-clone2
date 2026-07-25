@@ -1252,9 +1252,12 @@ class ShadowEngine:
                         if _ss > time.time():
                             _rate = int(getattr(_sl, "soft_start_max_per_hour", 0) or 12)
                             _rate = max(1, min(_rate, 3600))
+                            _base = 3600.0 / _rate
+                            _jit = self._humanize(_base, 0.65, 1.35)
                             self._arm_open_hold(
-                                sid, 3600.0 / _rate,
-                                f"soft start {_rate}/h, {(_ss - time.time())/3600:.1f}h left")
+                                sid, _jit,
+                                f"soft start ~{_rate}/h (jitter {_jit/_base:.2f}x), "
+                                f"{(_ss - time.time())/3600:.1f}h left")
                         _th = self._throttled_hold_sec(sid)
                         if _th > 0:
                             # This open was ACCEPTED at the current hold, so the
@@ -1272,7 +1275,8 @@ class ShadowEngine:
                                         "relaxing hold to %.0fs", sid, _clean, _new)
                                 self._open_rl_clean[sid] = 0
                                 _th = _new
-                            self._arm_open_hold(sid, _th, "throttled: hold after open")
+                            self._arm_open_hold(sid, self._humanize(_th, 1.0, 1.25),
+                                                "throttled: hold after open")
                     except Exception:
                         logger.exception("[SOFT START] pacing check failed slot=%d", sid)
                     pos.mode = "live"
@@ -2204,6 +2208,17 @@ class ShadowEngine:
     # Close
     # ============================================================
 
+    @staticmethod
+    def _humanize(seconds: float, lo: float, hi: float) -> float:
+        """Jitter a hold so the cadence does not look machine-generated.
+
+        A dead-exact 300s rhythm is itself a fingerprint. `lo`/`hi` are
+        multipliers: soft start jitters both ways (mean unchanged, so the
+        opens/hour target still holds), while a throttle hold only jitters
+        UP — dipping below the discovered ceiling would just earn a rejection.
+        """
+        return seconds * random.uniform(lo, hi)
+
     def _arm_open_hold(self, sid: int, seconds: float, why: str) -> None:
         """Hold OPENS on this slot for `seconds`, never shortening an
         existing hold (a 60s throttle hold must not cancel a 300s soft-start
@@ -2245,7 +2260,8 @@ class ShadowEngine:
                 _sid = int(_lbl[4:])
                 _th = self._throttled_hold_sec(_sid)
                 if _th > 0:
-                    self._arm_open_hold(_sid, _th, "throttled: hold after close")
+                    self._arm_open_hold(_sid, self._humanize(_th, 1.0, 1.25),
+                                        "throttled: hold after close")
         except Exception:
             logger.debug("throttled close-hold failed", exc_info=True)
         if not pos.is_open or getattr(pos, 'is_closing', False):
