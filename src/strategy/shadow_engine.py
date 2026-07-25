@@ -1346,18 +1346,19 @@ class ShadowEngine:
                     await self._record_live_miss(
                         signal, sid, live_result.error_msg, cfg,
                     )
-                    # The MEXC window starts at ORDER CREATION, not at the fill:
-                    # rejections in the 61s after an UNFILLED IOC (20.2 avg) are as
-                    # dense as after a filled open (15.1). An expired IOC still
-                    # consumed the slot's quota, so hold after it too — otherwise
-                    # we burn hundreds of doomed requests between fills. Costs no
-                    # throughput: we already create ~1 order/min, which IS the cap.
+                    # Controlled probe (2026-07-25, 3 tiny unfillable IOCs): request
+                    # #1 was refused by VALIDATION (code 2003, no order created, no
+                    # position) and request #2 three seconds later still came back
+                    # 10014 — while #4, sent 70s later, passed again. So the quota is
+                    # consumed by the REQUEST to /order/create itself, not by a fill
+                    # and not even by an order existing. Hold after ANY outcome
+                    # except a 10014 refusal (those are blocked before counting).
                     if (live_result.error_msg
-                            and "expired" in live_result.error_msg
+                            and "10014" not in live_result.error_msg
                             and time.monotonic() < self._open_rl_mode_until.get(sid, 0.0)):
                         _hc = float(os.environ.get("OPEN_THROTTLE_HOLD_SEC", "65"))
                         self._arm_open_hold(sid, self._humanize(_hc, 1.0, 1.15),
-                                            "throttled: order created (unfilled)")
+                                            "throttled: request spent")
                     if live_result.error_msg and "api_error_510" in live_result.error_msg:
                         self._slot_cooldown_until[sid] = time.monotonic() + 15.0
                         logger.warning("[SLOT COOLDOWN] slot=%d 510 rate-limit, pausing 15s", sid)
