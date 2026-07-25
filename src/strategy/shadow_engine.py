@@ -349,6 +349,12 @@ class ShadowEngine:
         # further one). While active the slot holds ~60s after every trade
         # instead of hammering into the cap and collecting more errors.
         self._open_rl_mode_until: dict[int, float] = {}
+        # Self-tuning hold per slot. A fixed value cannot work: the imposed
+        # ceiling is not constant (an attempt was refused 153s after the
+        # previous accepted open while a 60s hold was in force), so each
+        # rejection widens the hold and a run of clean opens narrows it.
+        self._open_rl_hold: dict[int, float] = {}
+        self._open_rl_clean: dict[int, int] = {}
         if self.live_pool is not None:
             logger.info("LIVE TRADING ENABLED (multi-slot mode) — pair routing via LiveExecutorPool")
         else:
@@ -1251,6 +1257,21 @@ class ShadowEngine:
                                 f"soft start {_rate}/h, {(_ss - time.time())/3600:.1f}h left")
                         _th = self._throttled_hold_sec(sid)
                         if _th > 0:
+                            # This open was ACCEPTED at the current hold, so the
+                            # hold is at least sufficient. After a clean run,
+                            # creep back toward the floor to recover throughput.
+                            _clean = self._open_rl_clean.get(sid, 0) + 1
+                            self._open_rl_clean[sid] = _clean
+                            if _clean >= 3:
+                                _floor2 = float(os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
+                                _new = max(_floor2, self._open_rl_hold.get(sid, _floor2) * 0.8)
+                                if _new < self._open_rl_hold.get(sid, _floor2):
+                                    self._open_rl_hold[sid] = _new
+                                    logger.info(
+                                        "[OPEN THROTTLE] slot=%d %d clean opens — "
+                                        "relaxing hold to %.0fs", sid, _clean, _new)
+                                self._open_rl_clean[sid] = 0
+                                _th = _new
                             self._arm_open_hold(sid, _th, "throttled: hold after open")
                     except Exception:
                         logger.exception("[SOFT START] pacing check failed slot=%d", sid)
@@ -1363,7 +1384,13 @@ class ShadowEngine:
                         # collected a SECOND rejection; 60s lands right as the
                         # window reopens, so one rejection per cycle instead of ~15.
                         # Env override for a differently-capped account.
-                        _wait = float(os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
+                        _floor = float(os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
+                        _ceil = float(os.environ.get("OPEN_THROTTLE_MAX_SEC", "600"))
+                        # Widen: the cap is clearly tighter than the hold we
+                        # were using, so back off multiplicatively.
+                        _wait = min(_ceil, max(_floor, self._open_rl_hold.get(sid, _floor)) * 1.5)
+                        self._open_rl_hold[sid] = _wait
+                        self._open_rl_clean[sid] = 0
                         self._slot_cooldown_until[sid] = max(
                             self._slot_cooldown_until.get(sid, 0.0), _now + _wait)
                         # Latch the slot into self-paced mode: from now on it
@@ -1387,7 +1414,7 @@ class ShadowEngine:
                             try:
                                 await self.alerts.send(
                                     f"⏸ MEXC обмежив частоту відкриттів (10014)\n"
-                                    f"SLOT{sid}: пауза {int(_wait)}с · {_strikes}-й раз за годину\n"
+                                    f"SLOT{sid}: пауза {int(_wait)}с (авто-підбір) · {_strikes}-й раз за годину\n"
                                     f"Виходи з позицій працюють як звичайно.",
                                     category="open_throttle_10014",
                                     throttle_sec=300,
@@ -1444,6 +1471,12 @@ class ShadowEngine:
                 "no_bbo",
                 "orderbook_not_synced",
                 "no_slot_config",       # pair in live state but slot not yet assigned
+                # 10014 already sends its own "⏸ MEXC обмежив частоту" alert
+                # from the throttle handler (with the slot, the hold and the
+                # repeat count) — the generic "Unknown error" copy of the very
+                # same event is pure duplication.
+                "10014",
+                "position-opening frequency",
                 # Our OWN deliberate pacing, not an exchange failure: soft-start
                 # warm-up and the 10014/510 cooldowns skip the signal on purpose.
                 # The underlying error alerts once when it happens; every later
@@ -2187,7 +2220,8 @@ class ShadowEngine:
         import os as _os, time as _t
         if _t.monotonic() >= self._open_rl_mode_until.get(sid, 0.0):
             return 0.0
-        return float(_os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
+        _floor = float(_os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
+        return max(_floor, self._open_rl_hold.get(sid, _floor))
 
     async def _close_position(self, pos: ShadowPosition, reason: str) -> None:
         # Defensive race guard:
