@@ -1226,6 +1226,20 @@ class ShadowEngine:
                 if live_result.success:
                     # A fill proves this slot's throttle is gone — drop its ladder.
                     self._open_rl_strikes.pop(sid, None)
+                    # Soft start: while warming up a freshly added account, space
+                    # this slot's opens (12/h -> one every 300s) by arming the same
+                    # pre-submit cooldown gate. Off the critical path (this order
+                    # already filled) and position exits are unaffected.
+                    try:
+                        _sl = await self.live_pool.webkey_store.get(sid)
+                        _ss = getattr(_sl, "soft_start_until", None) or 0
+                        if _ss > time.time():
+                            _rate = int(getattr(_sl, "soft_start_max_per_hour", 0) or 12)
+                            _rate = max(1, min(_rate, 3600))
+                            self._slot_cooldown_until[sid] = (
+                                time.monotonic() + 3600.0 / _rate)
+                    except Exception:
+                        logger.exception("[SOFT START] pacing check failed slot=%d", sid)
                     pos.mode = "live"
                     pos.live_order_id = live_result.order_id
                     pos.live_open_latency_ms = live_result.latency_ms

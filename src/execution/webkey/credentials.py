@@ -146,6 +146,10 @@ class WebkeySlot:
     slot_margin_max_usdt: float | None = None
     slot_leverage_min: int | None = None
     slot_leverage_max: int | None = None
+    # Soft start (account warm-up): while `soft_start_until` is in the
+    # future the live-open path paces this slot to N opens/hour.
+    soft_start_until: int | None = None
+    soft_start_max_per_hour: int | None = None
 
     @property
     def is_live_active(self) -> bool:
@@ -390,7 +394,8 @@ class WebkeyStore:
                    last_error, webkey_refreshed_at, created_at, updated_at,
                    assigned_pair, live_enabled,
                    slot_margin_min_usdt, slot_margin_max_usdt,
-                   slot_leverage_min, slot_leverage_max
+                   slot_leverage_min, slot_leverage_max,
+                   soft_start_until, soft_start_max_per_hour
               FROM webkey_slots
              WHERE slot_id=?
             """,
@@ -408,7 +413,8 @@ class WebkeyStore:
                    last_error, webkey_refreshed_at, created_at, updated_at,
                    assigned_pair, live_enabled,
                    slot_margin_min_usdt, slot_margin_max_usdt,
-                   slot_leverage_min, slot_leverage_max
+                   slot_leverage_min, slot_leverage_max,
+                   soft_start_until, soft_start_max_per_hour
               FROM webkey_slots
              ORDER BY slot_id
             """,
@@ -591,6 +597,21 @@ class WebkeyStore:
             "leverage_max":    None,
         }
 
+    async def set_soft_start(self, slot_id: int, until_ts: int | None,
+                             per_hour: int | None = None) -> None:
+        """Arm/clear the account warm-up pacing for a slot.
+
+        until_ts=None clears it. While armed, the live-open path spaces this
+        slot to `per_hour` opens/hour — MEXC 30-day-banned both accounts we
+        lost within their FIRST DAY of use, so a fresh key starts gently.
+        """
+        _validate_slot_id(slot_id)
+        await self.db.execute(
+            "UPDATE webkey_slots SET soft_start_until=?, soft_start_max_per_hour=?, "
+            "updated_at=? WHERE slot_id=?",
+            (until_ts, per_hour, int(time.time()), slot_id),
+        )
+
     async def get_slot_pair_sizing(self, slot_id: int, symbol: str) -> dict | None:
         """Per-(slot, pair) sizing OVERRIDE for `slot_id` trading `symbol`.
 
@@ -653,4 +674,6 @@ class WebkeyStore:
             slot_margin_max_usdt=_safe("slot_margin_max_usdt"),
             slot_leverage_min=_safe("slot_leverage_min"),
             slot_leverage_max=_safe("slot_leverage_max"),
+            soft_start_until=_safe("soft_start_until"),
+            soft_start_max_per_hour=_safe("soft_start_max_per_hour"),
         )

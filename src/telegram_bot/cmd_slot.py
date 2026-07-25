@@ -130,6 +130,13 @@ def _fmt_slot_config(slot, whitelist_lookup: dict | None = None,
     else:
         lines.append("💱 Pair: not assigned")
 
+    _ss = getattr(slot, "soft_start_until", None) or 0
+    if _ss > time.time():
+        _rate = int(getattr(slot, "soft_start_max_per_hour", 0) or 12)
+        lines.append(
+            f"🐣 Soft start: max {_rate} opens/h "
+            f"({(_ss - time.time()) / 3600:.0f}h left)"
+        )
     if slot.live_enabled:
         if slot.is_live_active:
             lines.append("🟢 Live: ENABLED — real orders will be placed")
@@ -233,6 +240,17 @@ def _kb_slot_config(slot) -> InlineKeyboardMarkup:
             ),
         ])
 
+    if not slot.is_empty:
+        # Warm-up pacing for a freshly added account: MEXC 30-day-banned both
+        # accounts we lost within their FIRST DAY of use.
+        _ss = getattr(slot, "soft_start_until", None) or 0
+        rows.append([
+            InlineKeyboardButton(
+                "✖ Cancel soft start" if _ss > time.time()
+                else "🐣 Soft start (48h)",
+                callback_data=f"m:slot:{slot.slot_id}:soft_start",
+            ),
+        ])
     rows.append([
         InlineKeyboardButton("🔑 Webkey details", callback_data=f"m:webkey:slot:{slot.slot_id}"),
         InlineKeyboardButton("« Back", callback_data="m:webkey:menu"),
@@ -412,6 +430,44 @@ async def handle_slot_callback(query, context, data: str) -> None:
         await _reset_slot_pnl(context.bot_data.get("live_db"), slot_id)
         try:
             await query.answer("PnL reset ✅")
+        except Exception:
+            pass
+        slot = await store.get(slot_id)
+        if slot is None:
+            return
+        wl = await store.list_live_whitelist()
+        wl_lookup = {w["symbol"]: w for w in wl}
+        sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
+        slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
+        pnl = await _get_slot_pnl(context.bot_data.get("live_db"), slot_id)
+        text = _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr, pnl=pnl)
+        kb = _kb_slot_config(slot)
+        try:
+            await query.edit_message_text(text, reply_markup=kb)
+        except Exception:
+            await query.message.reply_text(text, reply_markup=kb)
+        return
+
+    if action == "soft_start":
+        # Toggle the account warm-up. While armed, each successful open arms
+        # the slot cooldown for 3600/rate seconds, so the slot paces itself.
+        _cur = await store.get(slot_id)
+        if _cur is None:
+            try:
+                await query.answer("Slot not found")
+            except Exception:
+                pass
+            return
+        _active = (getattr(_cur, "soft_start_until", None) or 0) > time.time()
+        if _active:
+            await store.set_soft_start(slot_id, None, None)
+            _msg = "Soft start cancelled — full speed"
+        else:
+            _until = int(time.time()) + 48 * 3600
+            await store.set_soft_start(slot_id, _until, 12)
+            _msg = "Soft start ON — max 12 opens/h for 48h"
+        try:
+            await query.answer(_msg)
         except Exception:
             pass
         slot = await store.get(slot_id)

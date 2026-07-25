@@ -607,6 +607,15 @@ async def init_db(db_path: str) -> None:
             ("slot_leverage_min",     "INTEGER"),
             ("slot_leverage_max",     "INTEGER"),
         ])
+        # 2026-07-25: per-slot "soft start" warm-up. MEXC 30-day-banned both
+        # accounts we lost within their FIRST DAY of use, while accounts that
+        # survived day one then ran for weeks at a higher rate. A fresh key can
+        # be capped to N opens/hour until `soft_start_until`; the cap then lifts
+        # by itself. NULL/absent = no cap (exact prior behaviour).
+        await _add_columns_idempotent(db, "webkey_slots", [
+            ("soft_start_until",        "INTEGER"),
+            ("soft_start_max_per_hour", "INTEGER"),
+        ])
         # 2026-07-19: per-(slot, pair) margin/leverage OVERRIDE. A row here means
         # "when slot S trades pair `symbol`, use this margin/leverage instead of
         # the pair YAML". Absent row / NULL fields = inherit the pair YAML (exact
