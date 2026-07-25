@@ -10,14 +10,27 @@ Supported ops:
   {"op": "list"}                              → list accounts
   {"op": "set",     "slot_id": N, ...fields…} → edit (enabled/label/live_enabled)
   {"op": "remove",  "slot_id": N}             → wipe slot
-  {"op": "add",     "webkey": "WEB...", "label": "...", "proxy": "..."}  → new
+  {"op": "add",     "webkey": "WEB...", "label": "..."}  → new
+                    (NO proxy arg — data.add_account(webkey, label) only)
 
   {"op": "pairs_list"}                                → list pairs
   {"op": "pairs_set",  "symbol": "X", ...fields…}     → edit pair config
                                                         (mode/margin_*/leverage_*)
+  {"op": "slot_sizing_set", "symbol": "X", "slot_id": N, ...fields…}
+                                                      → per-(slot,pair) sizing
+  {"op": "assign_pair", "slot_id": N, "pair": "X"|null} → assign / unassign
 """
 import sys, json, os
 from pathlib import Path
+
+# The panel parses THIS process's stdout as JSON (data._remote_rpc does
+# json.loads(proc.stdout)). A stray print()/library banner on stdout corrupts
+# it and makes a SUCCESSFUL rpc look like a failure to the operator. Grab the
+# real stdout handle once, then point sys.stdout at stderr so every accidental
+# write lands on the SSH stderr channel instead. Done BEFORE the imports below
+# so import-time chatter is covered too.
+_RESULT_OUT = sys.stdout
+sys.stdout = sys.stderr
 
 sys.path.insert(0, "/root/stakan-bot")
 ENV = Path("/root/stakan-bot/.env")
@@ -41,8 +54,11 @@ def handle(req: dict) -> dict:
         return {"ok": True}
     if op == "remove":
         sid = int(req["slot_id"])
-        data.remove_account(sid)
-        return {"ok": True}
+        # Parity with the primary path (data.remove_account_routed): the helper
+        # returns False when the slot was ALREADY empty — report that instead
+        # of a fake success (the panel turns ok=False into a 400).
+        ok = data.remove_account(sid)
+        return {"ok": bool(ok)}
     if op == "add":
         res = data.add_account(
             webkey=req.get("webkey", ""),
@@ -67,6 +83,12 @@ def handle(req: dict) -> dict:
 
 try:
     req = json.loads(sys.stdin.read() or "{}")
-    print(json.dumps(handle(req), default=str))
+    _result = handle(req)
 except Exception as e:
-    print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+    _result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+try:
+    _payload = json.dumps(_result, default=str)
+except Exception as e:  # unserialisable result → still answer with valid JSON
+    _payload = json.dumps({"ok": False, "error": f"json encode failed: {e}"})
+_RESULT_OUT.write(_payload + "\n")
+_RESULT_OUT.flush()

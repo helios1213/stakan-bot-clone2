@@ -92,6 +92,15 @@ def set_account(slot_id: int, *, enabled: bool | None = None,
                 label: str | None = None, live_enabled: bool | None = None) -> None:
     conn = sqlite3.connect(DB)
     try:
+        # One upfront read: slot existence + assigned pair + credential presence.
+        # A missing slot makes every UPDATE below a silent 0-row no-op (panel
+        # shows "✓" while nothing changed) — refuse instead.
+        _slot = conn.execute(
+            "SELECT assigned_pair, (webkey_blob IS NOT NULL) FROM webkey_slots "
+            "WHERE slot_id=?", (slot_id,)).fetchone()
+        if _slot is None:
+            raise AccountError(f"Слот {slot_id} не знайдено — зміну скасовано.")
+        _ap, _has_key = _slot[0], bool(_slot[1])
         if enabled is not None:
             conn.execute("UPDATE webkey_slots SET enabled=?, updated_at=? WHERE slot_id=?",
                          (1 if enabled else 0, int(time.time()), slot_id))
@@ -101,24 +110,49 @@ def set_account(slot_id: int, *, enabled: bool | None = None,
         if live_enabled is not None:
             # Drives whether the bot routes live orders through this slot.
             _now = int(time.time())
-            conn.execute("UPDATE webkey_slots SET live_enabled=?, updated_at=? WHERE slot_id=?",
-                         (1 if live_enabled else 0, _now, slot_id))
+            if live_enabled:
+                # Mirrors Telegram's slot.is_complete gate: live on a slot with
+                # no credential can never place an order.
+                if not _has_key:
+                    raise AccountError(
+                        f"Слот {slot_id}: немає веб-ключа — вмикати live нічим. "
+                        "Спершу підключіть акаунт."
+                    )
+                if not _ap:
+                    raise AccountError(
+                        f"Слот {slot_id}: пару не призначено — live не дасть жодної "
+                        "угоди. Спершу призначте пару."
+                    )
+            _cur = conn.execute(
+                "UPDATE webkey_slots SET live_enabled=?, updated_at=? WHERE slot_id=?",
+                (1 if live_enabled else 0, _now, slot_id))
+            if _cur.rowcount < 1:
+                raise AccountError(
+                    f"Слот {slot_id}: рядок не оновився — зміну скасовано.")
             # Complete panel go-live: PairStateManager.is_in_live checks
             # pair_states.state=='live'. Setting live_enabled alone would NOT
             # actually trade (pair stays shadow). Promote the slot's assigned
             # pair to 'live' when enabling, demote to 'shadow' when disabling
             # (so a turned-off slot never strands its pair live with no exec).
-            _ap_row = conn.execute(
-                "SELECT assigned_pair FROM webkey_slots WHERE slot_id=?", (slot_id,)).fetchone()
-            _ap = _ap_row[0] if _ap_row else None
             if _ap:
                 if live_enabled:
-                    conn.execute(
+                    _cur = conn.execute(
                         "UPDATE pair_states SET state='live', state_since=?, updated_at=?, "
                         "last_state_change_reason=? WHERE symbol=?",
                         (_now, _now, "panel live toggle", _ap))
+                    # 0 rows = no pair_states row for this symbol → the pair would
+                    # stay OUT of live while the panel reported success. Raise
+                    # BEFORE commit: sqlite3 rolls back on close, so live_enabled
+                    # is not left on with a non-trading pair.
+                    if _cur.rowcount < 1:
+                        raise AccountError(
+                            f"{_ap}: немає рядка в pair_states — live НЕ увімкнено "
+                            f"(слот {slot_id} не змінено)."
+                        )
                 else:
                     # Only shadow the pair if NO other live slot still trades it.
+                    # NOTE: deliberately NO rowcount check here — a failed demote
+                    # must never block turning live OFF.
                     _demote_pair_if_orphaned(conn, _ap, slot_id, "panel live toggle off")
         conn.commit()
     finally:
@@ -197,7 +231,13 @@ def accounts_all() -> list[dict]:
 
 def set_account_routed(server: str, slot_id: int, **kwargs) -> dict:
     if server == "primary":
-        set_account(slot_id, **kwargs)
+        try:
+            set_account(slot_id, **kwargs)
+        except AccountError as e:
+            # Surface the refusal as {"ok": False, "error": …} so app.py answers
+            # 400 with the reason instead of a bare 500 (same shape the remote
+            # RPC returns, and the same contract as set_pair_config_routed).
+            return {"ok": False, "error": str(e)}
         return {"ok": True}
     return _remote_rpc(server, {"op": "set", "slot_id": slot_id, **kwargs})
 
@@ -210,13 +250,47 @@ def assign_pair(slot_id: int, pair: str | None) -> None:
     conn = sqlite3.connect(DB)
     try:
         row = conn.execute(
-            "SELECT assigned_pair FROM webkey_slots WHERE slot_id=?", (slot_id,)).fetchone()
-        old_pair = row[0] if row else None
+            "SELECT assigned_pair, live_enabled, (webkey_blob IS NOT NULL) "
+            "FROM webkey_slots WHERE slot_id=?", (slot_id,)).fetchone()
+        if row is None:
+            raise AccountError(f"Слот {slot_id} не знайдено — призначення скасовано.")
+        old_pair, _slot_live, _has_key = row[0], bool(row[1]), bool(row[2])
+        # Typo guard, same rule as the Telegram slot flow: the symbol must be in
+        # live_pair_whitelist, else the slot ends up half-configured on a symbol
+        # the bot will never trade. An absent/empty whitelist can't validate →
+        # allow (never block the panel on a missing table).
+        if pair:
+            try:
+                _wl = {r[0] for r in conn.execute("SELECT symbol FROM live_pair_whitelist")}
+            except sqlite3.OperationalError:
+                _wl = set()
+            if _wl and pair not in _wl:
+                raise AccountError(
+                    f"{pair} немає в live_pair_whitelist — призначення скасовано "
+                    "(перевірте символ)."
+                )
         now = int(time.time())
         conn.execute("UPDATE webkey_slots SET assigned_pair=?, updated_at=? WHERE slot_id=?",
                      (pair, now, slot_id))
         if old_pair and old_pair != pair:
             _demote_pair_if_orphaned(conn, old_pair, slot_id, "slot reassigned via panel")
+        # The slot is ALREADY live: the pair it now points at must be live too,
+        # else the slot is live_enabled with a shadow pair → silent no-trading.
+        # We never auto-enable live for a non-live slot (that stays an explicit,
+        # confirmed act); this only keeps an already-live slot consistent.
+        if pair and pair != old_pair and _slot_live and _has_key:
+            cur = conn.execute(
+                "UPDATE pair_states SET state='live', state_since=?, updated_at=?, "
+                "last_state_change_reason=? WHERE symbol=?",
+                (now, now, f"panel assign to live slot {slot_id}", pair))
+            if cur.rowcount < 1:
+                # No pair_states row → cannot promote. Raise BEFORE commit so the
+                # whole assignment rolls back instead of leaving a live slot
+                # pointed at a pair that never trades.
+                raise AccountError(
+                    f"{pair}: немає рядка в pair_states — слот {slot_id} live, "
+                    "але пару не можна перевести в live. Призначення скасовано."
+                )
         conn.commit()
     finally:
         conn.close()
@@ -224,7 +298,10 @@ def assign_pair(slot_id: int, pair: str | None) -> None:
 
 def assign_pair_routed(server: str, slot_id: int, pair: str | None) -> dict:
     if server == "primary":
-        assign_pair(slot_id, pair)
+        try:
+            assign_pair(slot_id, pair)
+        except AccountError as e:
+            return {"ok": False, "error": str(e)}
         return {"ok": True}
     return _remote_rpc(server, {"op": "assign_pair", "slot_id": slot_id, "pair": pair})
 
@@ -272,22 +349,49 @@ def set_pair_config_routed(server: str, symbol: str, **kwargs) -> dict:
 
 def set_slot_pair_sizing(symbol: str, slot_id: int, **kwargs) -> dict:
     """Upsert a per-(slot, pair) margin/leverage OVERRIDE into slot_pair_sizing.
-    Only the provided keys are written (partial override preserved). Validates
-    min<=max within each provided pair. Keys: margin_min_usdt, margin_max_usdt,
-    leverage_min, leverage_max."""
+    Only the provided keys are written (partial override preserved). Values are
+    coerced (margin_*→float, leverage_*→int); non-numeric input is rejected.
+    min<=max is validated on the EFFECTIVE row (incoming fields merged over the
+    row already stored), so sequential single-field edits cannot leave an
+    inverted override. Keys: margin_min_usdt, margin_max_usdt, leverage_min,
+    leverage_max."""
     allowed = ("margin_min_usdt", "margin_max_usdt", "leverage_min", "leverage_max")
     fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not fields:
         return {"ok": False, "error": "no sizing fields"}
-    mmin, mmax = fields.get("margin_min_usdt"), fields.get("margin_max_usdt")
-    if mmin is not None and mmax is not None and mmin > mmax:
-        return {"ok": False, "error": "маржа: min > max"}
-    lmin, lmax = fields.get("leverage_min"), fields.get("leverage_max")
-    if lmin is not None and lmax is not None and lmin > lmax:
-        return {"ok": False, "error": "плече: min > max"}
+    # Coerce JSON payload values ("50", 50.0, …) to the column types before any
+    # comparison — strings compare as text and would also be written as junk.
+    for _k in list(fields):
+        _cast = int if _k.startswith("leverage_") else float
+        try:
+            if isinstance(fields[_k], bool):
+                raise ValueError("bool")
+            fields[_k] = _cast(fields[_k])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"{_k}: очікується число"}
     now = int(time.time())
     conn = sqlite3.connect(DB)
     try:
+        # Effective row = what is already stored, overlaid with this request.
+        # Validating only the request would let a single-field edit (e.g. just
+        # margin_max) invert an existing pair in slot_pair_sizing.
+        _cur = conn.execute(
+            "SELECT margin_min_usdt, margin_max_usdt, leverage_min, leverage_max "
+            "FROM slot_pair_sizing WHERE slot_id=? AND symbol=?",
+            (slot_id, symbol)).fetchone()
+        eff = dict(zip(allowed, _cur if _cur else (None, None, None, None)))
+        eff.update(fields)
+
+        def _f(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+        for _lo, _hi, _label in (("margin_min_usdt", "margin_max_usdt", "маржа"),
+                                 ("leverage_min", "leverage_max", "плече")):
+            _a, _b = _f(eff.get(_lo)), _f(eff.get(_hi))
+            if _a is not None and _b is not None and _a > _b:
+                return {"ok": False, "error": f"{_label}: min > max"}
         conn.execute("INSERT OR IGNORE INTO slot_pair_sizing (slot_id, symbol) VALUES (?, ?)",
                      (slot_id, symbol))
         sets = ", ".join(f"{k}=?" for k in fields) + ", updated_at=?"
