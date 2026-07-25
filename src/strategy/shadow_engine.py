@@ -344,6 +344,11 @@ class ShadowEngine:
         # bleed from one account onto another slot's pause length.
         self._open_rl_strikes: dict[int, int] = {}
         self._open_rl_last: dict[int, float] = {}
+        # Slot -> monotonic deadline while the slot stays in self-paced
+        # throttled mode (latched by the first 10014, refreshed by each
+        # further one). While active the slot holds ~60s after every trade
+        # instead of hammering into the cap and collecting more errors.
+        self._open_rl_mode_until: dict[int, float] = {}
         if self.live_pool is not None:
             logger.info("LIVE TRADING ENABLED (multi-slot mode) — pair routing via LiveExecutorPool")
         else:
@@ -1241,13 +1246,12 @@ class ShadowEngine:
                         if _ss > time.time():
                             _rate = int(getattr(_sl, "soft_start_max_per_hour", 0) or 12)
                             _rate = max(1, min(_rate, 3600))
-                            self._slot_cooldown_until[sid] = (
-                                time.monotonic() + 3600.0 / _rate)
-                            logger.info(
-                                "[SOFT START] slot=%d paced %.0fs until next open "
-                                "(%d opens/h, %.1fh of warm-up left)",
-                                sid, 3600.0 / _rate, _rate, (_ss - time.time()) / 3600,
-                            )
+                            self._arm_open_hold(
+                                sid, 3600.0 / _rate,
+                                f"soft start {_rate}/h, {(_ss - time.time())/3600:.1f}h left")
+                        _th = self._throttled_hold_sec(sid)
+                        if _th > 0:
+                            self._arm_open_hold(sid, _th, "throttled: hold after open")
                     except Exception:
                         logger.exception("[SOFT START] pacing check failed slot=%d", sid)
                     pos.mode = "live"
@@ -1360,7 +1364,20 @@ class ShadowEngine:
                         # window reopens, so one rejection per cycle instead of ~15.
                         # Env override for a differently-capped account.
                         _wait = float(os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
-                        self._slot_cooldown_until[sid] = _now + _wait
+                        self._slot_cooldown_until[sid] = max(
+                            self._slot_cooldown_until.get(sid, 0.0), _now + _wait)
+                        # Latch the slot into self-paced mode: from now on it
+                        # holds after EVERY trade instead of hammering into the
+                        # cap and collecting one 10014 per cycle.
+                        _mode = float(os.environ.get("OPEN_THROTTLE_MODE_SEC", "21600"))
+                        _was_on = _now < self._open_rl_mode_until.get(sid, 0.0)
+                        self._open_rl_mode_until[sid] = _now + _mode
+                        if not _was_on:
+                            logger.warning(
+                                "[OPEN THROTTLE] slot=%d entering self-paced mode: "
+                                "%.0fs hold after every trade for the next %.0fh",
+                                sid, _wait, _mode / 3600,
+                            )
                         logger.warning(
                             "[OPEN THROTTLE] MEXC 10014 strike=%d — pausing opens "
                             "on slot=%d for %.0fs (exits unaffected)",
@@ -2154,6 +2171,24 @@ class ShadowEngine:
     # Close
     # ============================================================
 
+    def _arm_open_hold(self, sid: int, seconds: float, why: str) -> None:
+        """Hold OPENS on this slot for `seconds`, never shortening an
+        existing hold (a 60s throttle hold must not cancel a 300s soft-start
+        one, and vice versa). Exits are unaffected — the gate this feeds sits
+        before order submit only."""
+        import time as _t
+        deadline = _t.monotonic() + seconds
+        if deadline > self._slot_cooldown_until.get(sid, 0.0):
+            self._slot_cooldown_until[sid] = deadline
+            logger.info("[OPEN HOLD] slot=%d %.0fs (%s)", sid, seconds, why)
+
+    def _throttled_hold_sec(self, sid: int) -> float:
+        """Seconds to hold after a trade while this slot is throttled, or 0."""
+        import os as _os, time as _t
+        if _t.monotonic() >= self._open_rl_mode_until.get(sid, 0.0):
+            return 0.0
+        return float(_os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
+
     async def _close_position(self, pos: ShadowPosition, reason: str) -> None:
         # Defensive race guard:
         # Two checks combined atomically (no await between):
@@ -2166,6 +2201,19 @@ class ShadowEngine:
         # close orders.
         # Python GIL guarantees that the read-check-write pattern below
         # is atomic relative to coroutine scheduling. No yield point.
+        # Throttled mode: hold the NEXT open for ~60s measured from the close
+        # (the later of open/close, which satisfies either reading of MEXC's
+        # window). Done before the early-return guards below so a re-entrant
+        # call cannot skip it.
+        try:
+            _lbl = getattr(pos, "account_label", None) or ""
+            if pos.mode == "live" and _lbl.startswith("slot"):
+                _sid = int(_lbl[4:])
+                _th = self._throttled_hold_sec(_sid)
+                if _th > 0:
+                    self._arm_open_hold(_sid, _th, "throttled: hold after close")
+        except Exception:
+            logger.debug("throttled close-hold failed", exc_info=True)
         if not pos.is_open or getattr(pos, 'is_closing', False):
             return
         pos.is_closing = True
