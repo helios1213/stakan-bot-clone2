@@ -1347,19 +1347,23 @@ class ShadowEngine:
                         _strikes = self._open_rl_strikes.get(sid, 0) + 1
                         self._open_rl_strikes[sid] = _strikes
                         self._open_rl_last[sid] = _now
-                        _ladder = (5.0, 60.0, 300.0, 900.0, 1800.0)
-                        _wait = _ladder[min(_strikes - 1, len(_ladder) - 1)]
+                        # FLAT 30s — deliberately NOT an escalating ladder. The
+                        # severe form of 10014 is a 30-DAY account ban that no
+                        # backoff can shorten, so long pauses only cost trading
+                        # time on an account that is either fine (a transient
+                        # trip clears in 2-3s) or already dead.
+                        _wait = 30.0
                         self._slot_cooldown_until[sid] = _now + _wait
                         logger.warning(
                             "[OPEN THROTTLE] MEXC 10014 strike=%d — pausing opens "
                             "on slot=%d for %.0fs (exits unaffected)",
                             _strikes, sid, _wait,
                         )
-                        if self.alerts is not None and _wait >= 60:
+                        if self.alerts is not None:
                             try:
                                 await self.alerts.send(
                                     f"⏸ MEXC обмежив частоту відкриттів (10014)\n"
-                                    f"SLOT{sid}: пауза {int(_wait)}с · спроба #{_strikes}\n"
+                                    f"SLOT{sid}: пауза {int(_wait)}с · {_strikes}-й раз за годину\n"
                                     f"Виходи з позицій працюють як звичайно.",
                                     category="open_throttle_10014",
                                     throttle_sec=300,
