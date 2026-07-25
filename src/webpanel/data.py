@@ -272,13 +272,20 @@ def assign_pair(slot_id: int, pair: str | None) -> None:
         now = int(time.time())
         conn.execute("UPDATE webkey_slots SET assigned_pair=?, updated_at=? WHERE slot_id=?",
                      (pair, now, slot_id))
+        if pair is None:
+            # No pair = nothing this slot could execute. Clearing live here
+            # keeps the slot out of the "live_enabled with no pair" state
+            # that set_account() now refuses to create.
+            conn.execute(
+                "UPDATE webkey_slots SET live_enabled=0, updated_at=? WHERE slot_id=?",
+                (now, slot_id))
         if old_pair and old_pair != pair:
             _demote_pair_if_orphaned(conn, old_pair, slot_id, "slot reassigned via panel")
         # The slot is ALREADY live: the pair it now points at must be live too,
         # else the slot is live_enabled with a shadow pair → silent no-trading.
         # We never auto-enable live for a non-live slot (that stays an explicit,
         # confirmed act); this only keeps an already-live slot consistent.
-        if pair and pair != old_pair and _slot_live and _has_key:
+        if pair and _slot_live and _has_key:
             cur = conn.execute(
                 "UPDATE pair_states SET state='live', state_since=?, updated_at=?, "
                 "last_state_change_reason=? WHERE symbol=?",
@@ -367,8 +374,20 @@ def set_slot_pair_sizing(symbol: str, slot_id: int, **kwargs) -> dict:
             if isinstance(fields[_k], bool):
                 raise ValueError("bool")
             fields[_k] = _cast(fields[_k])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: int(float("inf")) — the coercion itself raises before
+            # the finite check below could ever run (was an uncaught 500).
             return {"ok": False, "error": f"{_k}: очікується число"}
+    # Sanity bounds. NaN would pass every min<=max comparison and silently
+    # wipe the override; inf/absurd values reach MEXC as a broken order size.
+    import math
+    for _k, _v in fields.items():
+        if not math.isfinite(_v):
+            return {"ok": False, "error": f"{_k}: не число (NaN/inf)"}
+        if _k.startswith("margin_") and not (0 < _v <= 100000):
+            return {"ok": False, "error": f"{_k}: маржа поза межами 0–100000"}
+        if _k.startswith("leverage_") and not (1 <= _v <= 125):
+            return {"ok": False, "error": f"{_k}: плече поза межами 1–125"}
     now = int(time.time())
     conn = sqlite3.connect(DB)
     try:
@@ -831,9 +850,15 @@ def whitelist() -> list[dict]:
     if not WHITELIST_FILE.exists():
         return []
     try:
-        return json.loads(WHITELIST_FILE.read_text())
+        raw = json.loads(WHITELIST_FILE.read_text())
     except Exception:
         return []
+    # Shape guard: this feeds the OUTERMOST middleware. A hand-edited file
+    # holding bare strings used to raise AttributeError on every request
+    # (including /login) — i.e. a typo could lock the operator out.
+    if not isinstance(raw, list):
+        return []
+    return [e for e in raw if isinstance(e, dict) and e.get("ip")]
 
 
 def whitelist_ips() -> set[str]:
@@ -1169,6 +1194,26 @@ def set_pair_config(symbol: str, **kwargs) -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+def set_all_pairs_shadow_all() -> dict:
+    """KILL ALL across EVERY bot (primary + clones).
+
+    `set_all_pairs_shadow()` only ever touched the PRIMARY database, so a clone
+    kept trading live while the panel reported success — the one defect that can
+    cost money at the exact moment the operator is trying to stop.
+
+    Local demote runs FIRST and is committed before any SSH, so an unreachable
+    clone can never delay stopping the primary. Returns per-server results so the
+    UI can never render a clean success when a clone was not stopped.
+    """
+    out = {"primary": {"ok": True, "demoted": set_all_pairs_shadow()}}
+    for srv in REMOTE_BOTS:
+        try:
+            out[srv] = _remote_rpc(srv, {"op": "kill_all"})
+        except Exception as e:  # never let a dead clone mask the local stop
+            out[srv] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return out
 
 
 def set_all_pairs_shadow() -> int:

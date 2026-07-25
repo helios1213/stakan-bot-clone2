@@ -58,7 +58,11 @@ def handle(req: dict) -> dict:
         # returns False when the slot was ALREADY empty — report that instead
         # of a fake success (the panel turns ok=False into a 400).
         ok = data.remove_account(sid)
-        return {"ok": bool(ok)}
+        if not ok:
+            # Give the panel a distinguishable reason: "already empty" must not
+            # look identical to an SSH/transport failure.
+            return {"ok": False, "error": f"slot {sid} already empty"}
+        return {"ok": True}
     if op == "add":
         res = data.add_account(
             webkey=req.get("webkey", ""),
@@ -79,6 +83,9 @@ def handle(req: dict) -> dict:
     if op == "assign_pair":
         data.assign_pair(int(req["slot_id"]), req.get("pair"))
         return {"ok": True}
+    if op == "kill_all":
+        # Panel KILL ALL fans out here: demote every LIVE pair on THIS bot.
+        return {"ok": True, "demoted": data.set_all_pairs_shadow()}
     return {"ok": False, "error": f"unknown op: {op!r}"}
 
 try:
