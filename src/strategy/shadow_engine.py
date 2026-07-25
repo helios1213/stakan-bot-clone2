@@ -355,6 +355,10 @@ class ShadowEngine:
         # rejection widens the hold and a run of clean opens narrows it.
         self._open_rl_hold: dict[int, float] = {}
         self._open_rl_clean: dict[int, int] = {}
+        # When the hold was last widened — drives the time decay below. Without
+        # it a long hold makes opens rare, and a relax rule that needs N opens
+        # can never fire: the hold stays stuck at its peak.
+        self._open_rl_last_widen: dict[int, float] = {}
         if self.live_pool is not None:
             logger.info("LIVE TRADING ENABLED (multi-slot mode) — pair routing via LiveExecutorPool")
         else:
@@ -1263,18 +1267,20 @@ class ShadowEngine:
                             # This open was ACCEPTED at the current hold, so the
                             # hold is at least sufficient. After a clean run,
                             # creep back toward the floor to recover throughput.
+                            # Relax on EVERY clean open (was: only every 3rd). The
+                            # open was accepted, so the current hold is already
+                            # sufficient — creep back down to recover throughput.
                             _clean = self._open_rl_clean.get(sid, 0) + 1
                             self._open_rl_clean[sid] = _clean
-                            if _clean >= 3:
-                                _floor2 = float(os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
-                                _new = max(_floor2, self._open_rl_hold.get(sid, _floor2) * 0.8)
-                                if _new < self._open_rl_hold.get(sid, _floor2):
-                                    self._open_rl_hold[sid] = _new
-                                    logger.info(
-                                        "[OPEN THROTTLE] slot=%d %d clean opens — "
-                                        "relaxing hold to %.0fs", sid, _clean, _new)
-                                self._open_rl_clean[sid] = 0
-                                _th = _new
+                            _floor2 = float(os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
+                            _cur = self._open_rl_hold.get(sid, _floor2)
+                            _new = max(_floor2, _cur * 0.85)
+                            if _new < _cur:
+                                self._open_rl_hold[sid] = _new
+                                logger.info(
+                                    "[OPEN THROTTLE] slot=%d clean open #%d — "
+                                    "relaxing hold %.0fs -> %.0fs", sid, _clean, _cur, _new)
+                            _th = _new
                             self._arm_open_hold(sid, self._humanize(_th, 1.0, 1.25),
                                                 "throttled: hold after open")
                     except Exception:
@@ -1392,9 +1398,12 @@ class ShadowEngine:
                         _ceil = float(os.environ.get("OPEN_THROTTLE_MAX_SEC", "600"))
                         # Widen: the cap is clearly tighter than the hold we
                         # were using, so back off multiplicatively.
-                        _wait = min(_ceil, max(_floor, self._open_rl_hold.get(sid, _floor)) * 1.5)
+                        # Grow gently (x1.25, was x1.5): x1.5 ratcheted 60s to 455s
+                        # in half an hour, far past what the account actually needed.
+                        _wait = min(_ceil, max(_floor, self._open_rl_hold.get(sid, _floor)) * 1.25)
                         self._open_rl_hold[sid] = _wait
                         self._open_rl_clean[sid] = 0
+                        self._open_rl_last_widen[sid] = _now
                         self._slot_cooldown_until[sid] = max(
                             self._slot_cooldown_until.get(sid, 0.0), _now + _wait)
                         # Latch the slot into self-paced mode: from now on it
@@ -2236,7 +2245,19 @@ class ShadowEngine:
         if _t.monotonic() >= self._open_rl_mode_until.get(sid, 0.0):
             return 0.0
         _floor = float(_os.environ.get("OPEN_THROTTLE_PAUSE_SEC", "60"))
-        return max(_floor, self._open_rl_hold.get(sid, _floor))
+        _hold = self._open_rl_hold.get(sid, _floor)
+        # Time decay: every 10 min without a new rejection takes 15% off, so a
+        # hold that over-shot recovers on its own even if opens are too rare to
+        # trigger the per-open relax.
+        _since = _t.monotonic() - self._open_rl_last_widen.get(sid, 0.0)
+        if _hold > _floor and _since > 600:
+            _steps = int(_since // 600)
+            _hold = max(_floor, _hold * (0.85 ** _steps))
+            self._open_rl_hold[sid] = _hold
+            self._open_rl_last_widen[sid] = _t.monotonic()
+            logger.info("[OPEN THROTTLE] slot=%d quiet %.0fmin — hold decayed to %.0fs",
+                        sid, _since / 60, _hold)
+        return max(_floor, _hold)
 
     async def _close_position(self, pos: ShadowPosition, reason: str) -> None:
         # Defensive race guard:
