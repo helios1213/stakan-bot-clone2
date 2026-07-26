@@ -247,7 +247,7 @@ def _kb_slot_config(slot) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(
                 "✖ Cancel soft start" if _ss > time.time()
-                else "🐣 Soft start (48h)",
+                else "🐣 Soft start (24h)",
                 callback_data=f"m:slot:{slot.slot_id}:soft_start",
             ),
         ])
@@ -465,9 +465,9 @@ async def handle_slot_callback(query, context, data: str) -> None:
             # it lives in the engine, not the DB.
             _msg = "Soft start cancelled — full speed from the next trade"
         else:
-            _until = int(time.time()) + 48 * 3600
+            _until = int(time.time()) + 24 * 3600
             await store.set_soft_start(slot_id, _until, 12)
-            _msg = "Soft start ON — max 12 opens/h for 48h"
+            _msg = "Soft start ON — max 12 req/h for 24h"
         try:
             await query.answer(_msg)
         except Exception:
