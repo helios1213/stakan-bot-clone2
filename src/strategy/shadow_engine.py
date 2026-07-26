@@ -63,6 +63,10 @@ from src.utils.pnl import calc_pnl_usdt
 
 logger = logging.getLogger(__name__)
 
+# Warm-up window for a freshly added account. Both accounts we lost to MEXC
+# died within their first 15-21h, so the plan spans a day and a half.
+SOFT_START_HOURS = 36.0
+
 # Hardcoded upper bound on position age, independent of strategy config.
 # If a position lives this long, force-close it regardless of strategy
 # state (phase exits, trailing stops, etc.). Catches scenarios where the
@@ -348,6 +352,10 @@ class ShadowEngine:
         # the slot holds ~65s after each ACCEPTED open, which is the
         # measured ceiling (1 open per ~61s).
         self._open_rl_mode_until: dict[int, float] = {}
+        # Warm-up: slot -> soft_start_until (epoch), cached from slot_cfg so
+        # the pre-submit gate can consult the plan without a DB hit.
+        self._ss_cache: dict[int, float] = {}
+        self._ss_plan: dict[tuple, list] = {}
         if self.live_pool is not None:
             logger.info("LIVE TRADING ENABLED (multi-slot mode) — pair routing via LiveExecutorPool")
         else:
@@ -1162,6 +1170,13 @@ class ShadowEngine:
                     continue
 
                 # Skip slot if rate-limited after a recent 510
+                _ss_block = self._soft_start_now(sid)
+                if _ss_block is not None and _ss_block[0] is None:
+                    # Warm-up break — skip entirely so the pause is real and
+                    # not a trickle of one request per hold expiry.
+                    if _skip_reason is None:
+                        _skip_reason, _skip_sid = "soft_start_break", sid
+                    continue
                 if time.monotonic() < self._slot_cooldown_until.get(sid, 0.0):
                     # `or` — a pacing skip on a later slot must not erase an
                     # earlier safety_blocked reason (that one silences the
@@ -1176,6 +1191,7 @@ class ShadowEngine:
                     # Restore a throttled latch that outlived the process. Stored
                     # as an epoch, used as monotonic — convert, never compare
                     # the two clocks directly.
+                    self._ss_cache[sid] = slot_cfg.get("soft_start_until") or 0
                     _ot = slot_cfg.get("open_throttle_until") or 0
                     _now_w = time.time()
                     if (_ot > _now_w
@@ -1499,6 +1515,7 @@ class ShadowEngine:
                 "slot_open_cooldown",
                 "slot_cooldown",
                 "slot_busy",              # another pair is submitting on this slot
+                "soft_start_break",       # planned warm-up pause
 
             )
             # No reason recorded at all (no live_pool / no executor / slot
@@ -2245,6 +2262,58 @@ class ShadowEngine:
         except (TypeError, ValueError):
             return default
 
+    def _soft_start_plan(self, sid: int, until_ts: float) -> list:
+        """Deterministic activity schedule for this warm-up window.
+
+        Returns [(start_h, end_h, rate_per_hour | None)] covering SOFT_START_HOURS;
+        a None rate is a break. Seeded by (slot, arm time) so every process — and
+        every restart — reproduces the same rhythm, while two keys differ.
+        """
+        key = (sid, int(until_ts))
+        cached = self._ss_plan.get(key)
+        if cached is not None:
+            return cached
+        rng = random.Random(f"softstart:{sid}:{int(until_ts)}")
+        blocks: list = []
+        t = 0.0
+        long_left = rng.choice([1, 2])          # one or two "nights"
+        while t < SOFT_START_HOURS:
+            dur = rng.uniform(1.5, 4.0)          # a session
+            rate = rng.uniform(8.0, 26.0)        # its intensity
+            blocks.append((t, min(t + dur, SOFT_START_HOURS), rate))
+            t += dur
+            if t >= SOFT_START_HOURS:
+                break
+            if long_left > 0 and rng.random() < 0.35:
+                brk = rng.uniform(6.0, 8.0)      # sleep
+                long_left -= 1
+            else:
+                brk = rng.uniform(0.25, 1.0)     # coffee
+            blocks.append((t, min(t + brk, SOFT_START_HOURS), None))
+            t += brk
+        self._ss_plan = {key: blocks}            # only the current window matters
+        logger.info(
+            "[SOFT START] slot=%d plan: %d blocks over %.0fh (%d breaks, longest %.1fh)",
+            sid, len(blocks), SOFT_START_HOURS,
+            sum(1 for b in blocks if b[2] is None),
+            max([b[1] - b[0] for b in blocks if b[2] is None] or [0]))
+        return blocks
+
+    def _soft_start_now(self, sid: int):
+        """(rate, seconds_left_in_block) for right now, or None when not warming up.
+
+        rate is None while the plan is in a break.
+        """
+        until = self._ss_cache.get(sid) or 0
+        now = time.time()
+        if until <= now:
+            return None
+        elapsed_h = (now - (until - SOFT_START_HOURS * 3600)) / 3600
+        for a, b, rate in self._soft_start_plan(sid, until):
+            if a <= elapsed_h < b:
+                return (rate, (b - elapsed_h) * 3600)
+        return None
+
     def _arm_soft_start(self, sid: int, slot_cfg: dict | None) -> None:
         """Pace a warming-up account after a request that reached MEXC.
 
@@ -2261,13 +2330,23 @@ class ShadowEngine:
             until = slot_cfg.get("soft_start_until") or 0
             if until <= time.time():
                 return
-            rate = int(slot_cfg.get("soft_start_max_per_hour") or 12)
-            rate = max(1, min(rate, 3600))
+            self._ss_cache[sid] = until
+            _now_block = self._soft_start_now(sid)
+            if _now_block is None:
+                return
+            rate, _left = _now_block
+            if rate is None:
+                # In a break: hold in <=10 min slices so a cancel takes effect
+                # quickly. The gate skips the slot anyway, so nothing is sent.
+                self._arm_open_hold(sid, min(_left, 600.0),
+                                    f"soft start: break, {_left/60:.0f} min left")
+                return
+            rate = max(1.0, min(float(rate), 3600.0))
             base = 3600.0 / rate
             jit = self._humanize(base, 0.65, 1.35)
             self._arm_open_hold(
                 sid, jit,
-                f"soft start ~{rate} req/h (jitter {jit/base:.2f}x), "
+                f"soft start ~{rate:.0f} req/h (jitter {jit/base:.2f}x), "
                 f"{(until - time.time())/3600:.1f}h left")
         except Exception:
             logger.exception("[SOFT START] pacing failed slot=%d", sid)

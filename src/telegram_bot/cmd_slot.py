@@ -134,7 +134,7 @@ def _fmt_slot_config(slot, whitelist_lookup: dict | None = None,
     if _ss > time.time():
         _rate = int(getattr(slot, "soft_start_max_per_hour", 0) or 12)
         lines.append(
-            f"🐣 Soft start: max {_rate} opens/h "
+            f"🐣 Soft start: human-like plan "
             f"({(_ss - time.time()) / 3600:.1f}h left)"
         )
     if slot.live_enabled:
@@ -247,7 +247,7 @@ def _kb_slot_config(slot) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(
                 "✖ Cancel soft start" if _ss > time.time()
-                else "🐣 Soft start (24h)",
+                else "🐣 Soft start (36h)",
                 callback_data=f"m:slot:{slot.slot_id}:soft_start",
             ),
         ])
@@ -465,9 +465,9 @@ async def handle_slot_callback(query, context, data: str) -> None:
             # it lives in the engine, not the DB.
             _msg = "Soft start cancelled — full speed from the next trade"
         else:
-            _until = int(time.time()) + 24 * 3600
+            _until = int(time.time()) + 36 * 3600
             await store.set_soft_start(slot_id, _until, 12)
-            _msg = "Soft start ON — max 12 req/h for 24h"
+            _msg = "Soft start ON — human-like 36h plan (8-26 req/h + breaks)"
         try:
             await query.answer(_msg)
         except Exception:
