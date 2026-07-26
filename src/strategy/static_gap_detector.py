@@ -505,6 +505,22 @@ class StaticGapDetector:
             self.signals_skip_no_ob += 1
             return
 
+        # The SAME guard for the Binance side. It was missing, and a crossed
+        # Binance book is exactly as impossible: on 2026-07-27 01:33 Binance
+        # showed bid=0.0029540 above ask=0.0029230 (310 ticks crossed) while
+        # MEXC was sane, so short_gap = m_bid - b_ask manufactured a 311-tick
+        # phantom signal — 60x a normal PEPE gap — and a real $2977 live SHORT
+        # was opened on it. Skip until the feed self-heals.
+        if b_bid_p >= b_ask_p:
+            self.signals_skip_no_ob += 1
+            if not hasattr(self, "_bx_last") or time.time() - self._bx_last > 60:
+                self._bx_last = time.time()
+                logger.warning(
+                    "[CROSSED BOOK] binance %s bid=%.8f >= ask=%.8f — skipping signals",
+                    symbol, b_bid_p, b_ask_p,
+                )
+            return
+
         # FILLWATCH: if armed for this symbol, check whether the MEXC touch
         # price has moved past our at-touch limit (= no longer fillable).
         # Logs touch_survival_ms — how long we had to fill before the move.
