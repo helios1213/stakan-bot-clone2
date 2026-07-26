@@ -458,6 +458,26 @@ class BinanceWSClient:
                 asyncio.create_task(self._fetch_snapshot(symbol))
                 return
 
+        # Crossed-book self-heal — the Binance mirror of the MEXC check.
+        # A stale top level can be stranded with the SEQUENCE FULLY INTACT, so
+        # the break-detector above never fires and the book stays inverted
+        # indefinitely. 2026-07-27: the PEPE ask froze at 0.0029230 while the
+        # bid tracked up to 0.0029600 (370 ticks crossed) -> the detector saw a
+        # ~370-tick phantom gap (normal is 5-8) and the bot opened 28 real
+        # SHORTs in a row, about -$4.8 in 35 minutes. Re-snapshot from REST
+        # (rate-limited 3/min/symbol, same as sequence breaks).
+        _ob_x = self.ob_manager.get("binance", symbol)
+        if _ob_x is not None and _ob_x.is_crossed() and self._can_resnap(symbol):
+            logger.warning(
+                "BINANCE %s crossed book (bid=%.8f >= ask=%.8f) -> re-snapshot",
+                symbol, _ob_x._top_bid_price, _ob_x._top_ask_price)
+            self._snapshot_ready[symbol] = False
+            self._buffered_diffs[symbol].clear()
+            self._previous_final_id.pop(symbol, None)
+            self.resync_count += 1
+            asyncio.create_task(self._fetch_snapshot(symbol))
+            return
+
         bids = [(float(p), float(s)) for p, s in data.get("b", [])]
         asks = [(float(p), float(s)) for p, s in data.get("a", [])]
 
