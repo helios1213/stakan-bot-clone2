@@ -389,7 +389,8 @@ async def test_cooldown_uses_live_pnl_after_override(monkeypatch):
     t_after = int(_t.time())
 
     # After override, net_pnl_usdt = -0.30 → loss branch fires → cooldown 30s.
-    cooldown_until = eng._cooldown_until["PENGUUSDT"]
+    # keyed per account: pos.account_label == "slot1"
+    cooldown_until = eng._cooldown_until[(1, "PENGUUSDT")]
     cooldown_duration = cooldown_until - t_before
 
     # Tolerate 1s for clock drift.
@@ -450,7 +451,8 @@ async def test_cooldown_uses_win_sec_when_truly_won(monkeypatch):
     t_before = int(_t.time())
     await eng._close_position(pos, reason="test_close")
 
-    cooldown_duration = eng._cooldown_until["PENGUUSDT"] - t_before
+    # keyed per account: pos.account_label == "slot1"
+    cooldown_duration = eng._cooldown_until[(1, "PENGUUSDT")] - t_before
     assert 4 <= cooldown_duration <= 6, (
         f"Win cooldown {cooldown_duration}s does not match "
         f"cooldown_after_win_sec=5"

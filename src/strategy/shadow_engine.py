@@ -387,7 +387,9 @@ class ShadowEngine:
             logger.info("Live trading DISABLED (shadow-only mode)")
 
         # Per-symbol cooldown timestamps (when next entry is allowed)
-        self._cooldown_until: dict[str, int] = {}
+        # Keyed (slot_id | None, symbol): one account's post-trade pause
+        # must never silence another account on the same pair.
+        self._cooldown_until: dict[tuple, int] = {}
 
         # Momentum filter: per-symbol time-decay EMA of the Binance leader price
         # + the wall-clock timestamp of its last update (for time-based decay).
@@ -455,7 +457,7 @@ class ShadowEngine:
         # arrive while another submission is in-flight on the same symbol.
         # It does NOT serialize submissions — if signals come 5s apart, both
         # proceed normally. Exactly the behavior we want.
-        self._pending_submissions: set[str] = set()
+        self._pending_submissions: set[tuple] = set()
         self.signals_skipped_pending_submit = 0
 
         self.signals_skipped_no_book = 0
@@ -788,9 +790,52 @@ class ShadowEngine:
             self.signals_skipped_lag_out_of_range += 1
             return
 
+        # Everything above is a property of the SIGNAL and is evaluated once.
+        # Everything below is a property of an ACCOUNT: each live slot is its own
+        # MEXC account and decides on its own, concurrently, with its own gates.
+        _slots = self._entry_slots(symbol)
+        if len(_slots) == 1:
+            await self._enter_for_slot(signal, signal_id, cfg, _slots[0])
+            return
+        # One slow account must not delay the others, and its failure must not
+        # cancel their entries — hence gather with return_exceptions.
+        _res = await asyncio.gather(
+            *(self._enter_for_slot(signal, signal_id, cfg, s) for s in _slots),
+            return_exceptions=True,
+        )
+        for _s, _r in zip(_slots, _res):
+            if isinstance(_r, BaseException):
+                logger.exception(
+                    "[ENTRY] slot=%s %s raised", _s, symbol, exc_info=_r)
+
+    def _entry_slots(self, symbol: str) -> list:
+        """Slots that act on a signal for this pair, each one independently.
+
+        [None] means no live slot is pinned — the shadow simulation path, and
+        what every non-live pair keeps doing.
+        """
+        if self.live_pool is None or self.state_manager is None:
+            return [None]
+        try:
+            if not self.state_manager.is_in_live(symbol):
+                return [None]
+            slots = list(self.live_pool.find_slots_for_pair(symbol))
+        except Exception:
+            return [None]
+        return slots or [None]
+
+    async def _enter_for_slot(self, signal: Signal, signal_id: int | None,
+                              cfg: PairExecConfig, pin_slot) -> None:
+        """The per-account half of on_signal: gates, then entry, for ONE slot."""
+        symbol = signal.symbol
+        # Gate key. Keyed by symbol alone, slot 1 holding a position or serving
+        # a cooldown shut the pair for slot 2 as well.
+        _gk = (pin_slot, symbol)
+        _label = None if pin_slot is None else f"slot{pin_slot}"
+
         # Cooldown
         now_ms = int(time.time() * 1000)
-        if now_ms < self._cooldown_until.get(symbol, 0) * 1000:
+        if now_ms < self._cooldown_until.get(_gk, 0) * 1000:
             self.signals_skipped_cooldown += 1
             return
 
@@ -799,32 +844,35 @@ class ShadowEngine:
             self.signals_skipped_funding += 1
             return
 
-        # Max positions per symbol
-        if len(self._open_positions[symbol]) >= self.max_positions_per_symbol:
+        # Max positions per symbol — for THIS account only. account_label is
+        # set before the position joins _open_positions, so the count is exact.
+        if sum(1 for p in self._open_positions[symbol]
+               if (p.account_label or None) == _label) >= self.max_positions_per_symbol:
             self.signals_skipped_max_positions += 1
             return
 
         # Slot-lock single-flight guard:
-        # Block duplicate submissions on the same symbol while one is in-flight.
-        # CRITICAL: must be checked AND added atomically (no await between).
-        # Python's GIL guarantees this for single statements like `set.add()`.
-        if symbol in self._pending_submissions:
+        # Block duplicate submissions on the same (slot, symbol) while one is
+        # in-flight. CRITICAL: must be checked AND added atomically (no await
+        # between). Python's GIL guarantees this for single statements.
+        if _gk in self._pending_submissions:
             self.signals_skipped_pending_submit += 1
             logger.debug(
-                "[SLOT_LOCK] %s skip — submission already in-flight",
-                symbol,
+                "[SLOT_LOCK] %s slot=%s skip — submission already in-flight",
+                symbol, pin_slot,
             )
             return
-        self._pending_submissions.add(symbol)
+        self._pending_submissions.add(_gk)
 
         # ---- Attempt entry with EFFECTIVE config (per-detector strategy applied) ----
         try:
-            await self._try_enter(signal, signal_id, cfg)
+            await self._try_enter(signal, signal_id, cfg, pin_slot)
         finally:
             # ALWAYS release the lock — exceptions, early returns, success, all paths.
-            self._pending_submissions.discard(symbol)
+            self._pending_submissions.discard(_gk)
 
-    async def _try_enter(self, signal: Signal, signal_id: int | None, cfg: PairExecConfig) -> None:
+    async def _try_enter(self, signal: Signal, signal_id: int | None,
+                         cfg: PairExecConfig, pin_slot=None) -> None:
         """
         Try IOC entry up to ioc_max_attempts. Open position if any attempt succeeds.
 
@@ -1045,7 +1093,8 @@ class ShadowEngine:
                 # Open position with the randomized size
                 await self._open_position(signal, signal_id, cfg, result,
                                           chosen_margin=chosen_margin,
-                                          chosen_leverage=chosen_leverage)
+                                          chosen_leverage=chosen_leverage,
+                                          pin_slot=pin_slot)
                 if result.status == "filled":
                     self.entries_filled += 1
                 else:
@@ -1092,6 +1141,7 @@ class ShadowEngine:
         ioc_result,
         chosen_margin: float = 25.0,
         chosen_leverage: int = 50,
+        pin_slot=None,
     ) -> None:
         """Create ShadowPosition + start watcher task."""
         # latency tracking: signal_to_pickup_ms.
@@ -1184,7 +1234,10 @@ class ShadowEngine:
         _skip_sid: int | None = None
         _pair_is_live = self.state_manager is not None and self.state_manager.is_in_live(signal.symbol)
         if self.live_pool is not None and _pair_is_live:
-            slot_ids = self.live_pool.find_slots_for_pair(signal.symbol)
+            # One pass = one account. The caller already fanned out over
+            # every live slot, so cascading here would double-submit.
+            slot_ids = ([pin_slot] if pin_slot is not None
+                        else self.live_pool.find_slots_for_pair(signal.symbol))
             if not slot_ids:
                 _skip_reason = "no_slot_config"
             for sid in slot_ids:
@@ -2794,7 +2847,13 @@ class ShadowEngine:
         # losing live money.
         cfg = self._pair_configs.get(pos.symbol) or PairExecConfig()
         cooldown_sec = cfg.cooldown_after_win_sec if pos.net_pnl_usdt > 0 else cfg.cooldown_after_loss_sec
-        self._cooldown_until[pos.symbol] = int(time.time()) + cooldown_sec
+        _cd_slot = None
+        if pos.account_label and pos.account_label.startswith("slot"):
+            try:
+                _cd_slot = int(pos.account_label[4:])
+            except ValueError:
+                _cd_slot = None
+        self._cooldown_until[(_cd_slot, pos.symbol)] = int(time.time()) + cooldown_sec
 
         # Notify safety controller AFTER real-PnL override. Using the
         # shadow-simulated net_pnl_usdt would accumulate fake simulated
@@ -3033,7 +3092,9 @@ class ShadowEngine:
         # have opened a second one anyway, so it isn't a genuine missed
         # opportunity — counting it would understate the real fill rate
         # (fill_rate = filled / (filled + misses)). 2026-05-31.
-        if self._open_positions.get(signal.symbol):
+        _lbl = f"slot{slot_id}" if slot_id is not None else None
+        if any((p.account_label or None) == _lbl
+               for p in self._open_positions.get(signal.symbol, ())):
             return
         try:
             await self.live_db.execute(
