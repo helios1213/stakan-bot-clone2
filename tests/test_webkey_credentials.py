@@ -323,3 +323,76 @@ class TestBootstrapChashConstant:
     def test_chash_is_64_hex(self):
         assert len(BOOTSTRAP_CHASH) == 64
         assert all(c in "0123456789abcdef" for c in BOOTSTRAP_CHASH)
+
+
+# ---------------------------------------------------------------------------
+# Auto-shadow on unassign / delete — must respect the OTHER slot
+# ---------------------------------------------------------------------------
+
+class TestAutoShadowRespectsOtherSlots:
+    """Two slots may trade the same pair, so losing one must not strand it.
+
+    Regression 2026-07-27 18:57:44: slot 2 was moved from 1000PEPEUSDT to
+    TAOUSDT while slot 1 was actively trading PEPE. The move demoted the whole
+    pair to shadow and slot 1 went silent for 5.4 minutes while the detector
+    kept emitting PEPE signals.
+    """
+
+    @staticmethod
+    def _spy(store):
+        seen = []
+
+        async def _fake(pair, reason):
+            seen.append((pair, reason))
+            return True
+
+        store.demote_pair_to_shadow = _fake
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_reassign_keeps_pair_live_when_another_slot_holds_it(self, store):
+        await store.assign_pair(1, "1000PEPEUSDT")
+        await store.assign_pair(2, "1000PEPEUSDT")
+        seen = self._spy(store)
+
+        await store.assign_pair(2, "TAOUSDT")
+
+        assert seen == [], "pair demoted while slot 1 still trades it"
+
+    @pytest.mark.asyncio
+    async def test_reassign_demotes_pair_when_it_was_the_last_slot(self, store):
+        await store.assign_pair(2, "1000PEPEUSDT")
+        seen = self._spy(store)
+
+        await store.assign_pair(2, "TAOUSDT")
+
+        assert [p for p, _ in seen] == ["1000PEPEUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_delete_keeps_pair_live_when_another_slot_holds_it(self, store):
+        await store.set_webkey(1, SAMPLE_WEBKEY)
+        await store.set_webkey(2, SAMPLE_WEBKEY_2)
+        await store.assign_pair(1, "1000PEPEUSDT")
+        await store.assign_pair(2, "1000PEPEUSDT")
+        seen = self._spy(store)
+
+        await store.delete(2)
+
+        assert seen == [], "pair demoted while slot 1 still trades it"
+
+    @pytest.mark.asyncio
+    async def test_delete_demotes_pair_when_it_was_the_last_slot(self, store):
+        await store.set_webkey(2, SAMPLE_WEBKEY_2)
+        await store.assign_pair(2, "1000PEPEUSDT")
+        seen = self._spy(store)
+
+        await store.delete(2)
+
+        assert [p for p, _ in seen] == ["1000PEPEUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_helper_ignores_the_slot_being_changed(self, store):
+        await store.assign_pair(2, "1000PEPEUSDT")
+        assert await store._pair_has_another_slot("1000PEPEUSDT", 2) is False
+        await store.assign_pair(1, "1000PEPEUSDT")
+        assert await store._pair_has_another_slot("1000PEPEUSDT", 2) is True

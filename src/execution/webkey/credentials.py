@@ -367,7 +367,12 @@ class WebkeyStore:
             (now, slot_id),
         )
         # Auto-shadow the assigned pair: no webkey → can't trade live.
-        if assigned_pair:
+        if assigned_pair and await self._pair_has_another_slot(assigned_pair, slot_id):
+            logger.info(
+                "Slot %d deleted — pair %s stays LIVE, another slot still trades it",
+                slot_id, assigned_pair,
+            )
+        elif assigned_pair:
             await self.demote_pair_to_shadow(assigned_pair, "webkey deleted — auto-shadow")
             logger.info(
                 "Slot %d deleted — pair %s auto-transitioned to SHADOW (no webkey)",
@@ -457,8 +462,9 @@ class WebkeyStore:
         YAML drives both shadow and live, so they trade identical sizes.
 
         AUTO-SHADOWS the displaced pair: unassigning (pair=None) or
-        reassigning to a different pair leaves the OLD pair with no slot
-        to execute it. Like delete(), drive BOTH pair_configs.mode AND
+        reassigning to a different pair MAY leave the OLD pair with no slot
+        to execute it — but only when no other slot is assigned to it, since
+        two slots can trade the same pair as independent accounts. Like delete(), drive BOTH pair_configs.mode AND
         pair_states.state to 'shadow' — the state machine is the REAL
         live/shadow determinant, so leaving the old pair in 'live' state
         with no slot strands it (silent [SKIP SHADOW] errors, no trades).
@@ -483,13 +489,36 @@ class WebkeyStore:
             (pair, now, slot_id),
         )
         if old_pair and old_pair != pair:
-            await self.demote_pair_to_shadow(old_pair, "slot unassigned — auto-shadow")
-            logger.info(
-                "Slot %d unassigned/reassigned — pair %s auto-transitioned to "
-                "SHADOW (no slot to execute it)",
-                slot_id, old_pair,
-            )
+            if await self._pair_has_another_slot(old_pair, slot_id):
+                logger.info(
+                    "Slot %d reassigned off %s — pair stays LIVE, another slot "
+                    "still trades it",
+                    slot_id, old_pair,
+                )
+            else:
+                await self.demote_pair_to_shadow(
+                    old_pair, "slot unassigned — auto-shadow")
+                logger.info(
+                    "Slot %d unassigned/reassigned — pair %s auto-transitioned to "
+                    "SHADOW (no slot to execute it)",
+                    slot_id, old_pair,
+                )
         return True
+
+    async def _pair_has_another_slot(self, pair: str, slot_id: int) -> bool:
+        """Is some OTHER slot still assigned to this pair?
+
+        Two slots may trade the same pair as independent accounts, so losing
+        one of them does not strand the pair. Assignment alone is the test:
+        a slot with live trading merely toggled off is still the operator's
+        slot for that pair, and demoting the pair under it would be surprising.
+        """
+        row = await self.db.fetchone(
+            "SELECT COUNT(*) AS n FROM webkey_slots "
+            "WHERE assigned_pair=? AND slot_id<>?",
+            (pair, slot_id),
+        )
+        return bool(row and row["n"])
 
     async def set_live_enabled(self, slot_id: int, enabled: bool) -> bool:
         """Toggle live trading on/off for a slot.
