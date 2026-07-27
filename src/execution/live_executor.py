@@ -41,6 +41,13 @@ from src.exchanges.mexc_rest import get_binance_scale, to_binance
 
 logger = logging.getLogger(__name__)
 
+# MEXC refuses opens under three codes that all mean "this account is opening
+# positions too fast": 10014 and 9082 carry the same text under different
+# numbers, 2036 is the per-contract order limit. Declared here because this is
+# where they arrive; src.strategy.shadow_engine imports the list rather than
+# keeping a second copy that could drift.
+OPEN_FREQ_CODES = ("10014", "9082", "2036")
+
 # Hardcoded contract sizes for known pairs.
 # 1 contract = X units of base asset.
 # Verified from MEXC futures spec.
@@ -1141,6 +1148,8 @@ class LiveExecutor:
         last_order_id: str | None = None
         last_latency_ms: int = 0
 
+        # Sticky across attempts — see the final verdict below.
+        freq_error_msg: str | None = None
         for attempt in range(1, max_attempts + 1):
             # Safety: don't open a duplicate if a previous attempt partially filled.
             # Skipped on attempt #1 (no prior order possible).
@@ -1304,6 +1313,11 @@ class LiveExecutor:
 
             if code != 0:
                 last_error_msg = f"api_error_{code}: {msg}"
+                if str(code) in OPEN_FREQ_CODES:
+                    # Remember it: a later attempt that merely expires would
+                    # otherwise erase the evidence, and the throttle latch keys
+                    # off the returned message.
+                    freq_error_msg = last_error_msg
                 logger.warning("[IOC FULL RESP] %s attempt=%d code=%s response=%s", symbol, attempt, code, response)
 
                 # Slot-level error: abort all retries (face verification, KYC, etc.)
@@ -1507,7 +1521,12 @@ class LiveExecutor:
         # IMPORTANT: we do NOT fall back to market. By design — preserves the
         # 0% maker fee economic edge. Caller should treat this as a skipped signal.
         self.opens_failed += 1
-        self.last_error = last_error_msg or "ioc_all_expired"
+        _final_err = last_error_msg or "ioc_all_expired"
+        if freq_error_msg and _final_err in (
+                "ioc_expired_no_fill", "ioc_all_expired"):
+            # A plain expiry must not hide that MEXC refused us for rate.
+            _final_err = freq_error_msg
+        self.last_error = _final_err
         total_latency_ms = int((time.monotonic() - t_overall_start) * 1000)
         logger.info(
             "[IOC OPEN] %s SKIPPED after %d attempts: %s (total %dms)",

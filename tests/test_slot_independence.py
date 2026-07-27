@@ -28,6 +28,7 @@ def _engine(slots: list[int] | None, *, in_live: bool = True) -> ShadowEngine:
     eng = ShadowEngine.__new__(ShadowEngine)
     eng.cfg = SimpleNamespace(enabled=True)
     eng.signals_received = 0
+    eng.signals_fanned_out = 0
     eng.signals_skipped_not_tradeable = 0
     eng.signals_skipped_momentum = 0
     eng.signals_skipped_lag_out_of_range = 0
@@ -139,3 +140,34 @@ async def test_in_flight_key_is_released_for_its_own_slot():
     eng = _engine([1, 2])
     await eng.on_signal(_sig())
     assert eng._pending_submissions == set()
+
+
+# ── the funnel counts slot passes, not signals ────────────────────────
+
+@pytest.mark.asyncio
+async def test_slot_passes_counted_once_per_slot():
+    """passed_pre went negative because per-slot drops were subtracted from a
+    per-signal total. The gates now have their own denominator."""
+    eng = _engine([1, 2])
+    await eng.on_signal(_sig())
+    assert eng.signals_received == 1
+    assert eng.signals_fanned_out == 2
+
+
+@pytest.mark.asyncio
+async def test_slot_passes_counted_for_a_shadow_pair_too():
+    eng = _engine(None)
+    await eng.on_signal(_sig())
+    assert eng.signals_fanned_out == 1
+
+
+@pytest.mark.asyncio
+async def test_gate_skips_never_exceed_slot_passes():
+    eng = _engine([1, 2])
+    eng._cooldown_until[(1, SYM)] = 2 ** 31
+    eng._pending_submissions.add((2, SYM))
+    await eng.on_signal(_sig())
+    drops = (eng.signals_skipped_cooldown + eng.signals_skipped_funding
+             + eng.signals_skipped_max_positions
+             + eng.signals_skipped_pending_submit)
+    assert drops <= eng.signals_fanned_out

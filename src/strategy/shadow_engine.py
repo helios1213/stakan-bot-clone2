@@ -33,7 +33,11 @@ from src.exchanges.mexc_rest import to_mexc, get_binance_scale
 from src.exchanges.orderbook import OrderBookManager
 from src.execution.funding_guard import FundingGuard
 from src.execution.ioc_executor import IOCExecutor, IOCAttemptResult
-from src.execution.live_executor import get_tick_size, CONTRACT_SIZES
+from src.execution.live_executor import (
+    get_tick_size,
+    CONTRACT_SIZES,
+    OPEN_FREQ_CODES,
+)
 
 # ── Shadow-only sizing (DECOUPLED from the live cfg margin/leverage) ──
 # Shadow trades use THIS fixed margin/leverage so that tuning the per-pair LIVE
@@ -66,15 +70,6 @@ logger = logging.getLogger(__name__)
 # Warm-up window for a freshly added account. Both accounts we lost to MEXC
 # died within their first 15-21h, so the plan spans a day and a half.
 SOFT_START_HOURS = 36.0
-
-# Three MEXC codes all mean "this account is opening positions too fast".
-# 10014 and 9082 carry the SAME human text under different numbers; 2036
-# ("Number of orders has exceeded the limit") behaves identically from our
-# side. Matching the literal "10014" left the other two unlatched, so the bot
-# kept firing into them: 3,266 refusals in five hours on one account (27.07),
-# and 3,811 in 3.5h on another (20.07) — both silent.
-OPEN_FREQ_CODES = ("10014", "9082", "2036")
-
 
 def open_freq_limit_code(err_msg: str | None) -> str | None:
     """Which open-rate limit MEXC just returned, or None.
@@ -469,6 +464,9 @@ class ShadowEngine:
         # proceed normally. Exactly the behavior we want.
         self._pending_submissions: set[tuple] = set()
         self.signals_skipped_pending_submit = 0
+        # Slot passes: one per (signal, live slot). The per-slot gates are
+        # counted against THIS, not against signals_received.
+        self.signals_fanned_out = 0
 
         self.signals_skipped_no_book = 0
         self.signals_skipped_lag_out_of_range = 0
@@ -640,6 +638,7 @@ class ShadowEngine:
         # ensured pending_submit is wired through prev/skipped/log.
         prev = {
             "received": 0,
+            "fanned_out": 0,
             "not_tradeable": 0,
             "low_confidence": 0,
             "lag_out_of_range": 0,
@@ -660,6 +659,7 @@ class ShadowEngine:
 
                 cur = {
                     "received": self.signals_received,
+                    "fanned_out": self.signals_fanned_out,
                     "not_tradeable": self.signals_skipped_not_tradeable,
                     "low_confidence": self.signals_skipped_low_confidence,
                     "lag_out_of_range": self.signals_skipped_lag_out_of_range,
@@ -683,22 +683,28 @@ class ShadowEngine:
                 # Compute "passed" — signals that reached _try_enter (not all
                 # converted to trades, but cleared all pre-enter filters).
                 # pending_submit is the slot-lock single-flight drop — also pre-enter.
-                skipped_pre_enter = (
+                # Two stages, two units. The first filters run once per
+                # SIGNAL; everything from the cooldown down runs once per SLOT
+                # pass, because each live slot decides independently. Subtracting
+                # per-slot drops from a per-signal total made passed_pre go
+                # negative as soon as a pair had two slots.
+                fanned = d["received"] - (
                     d["not_tradeable"] + d["low_confidence"]
-                    + d["lag_out_of_range"] + d["cooldown"] + d["funding"]
-                    + d["max_positions"]
-                    + d["pending_submit"]
+                    + d["lag_out_of_range"]
                 )
-                passed = d["received"] - skipped_pre_enter
+                passed = d["fanned_out"] - (
+                    d["cooldown"] + d["funding"]
+                    + d["max_positions"] + d["pending_submit"]
+                )
 
                 logger.info(
-                    "[FUNNEL 60s] recv=%d → passed_pre=%d | drops: "
-                    "notrade=%d lowconf=%d lag=%d cooldown=%d "
-                    "funding=%d maxpos=%d pending=%d | "
-                    "enter_drops: nobook=%d drift=%d",
-                    d["received"], passed,
-                    d["not_tradeable"], d["low_confidence"],
-                    d["lag_out_of_range"], d["cooldown"], d["funding"],
+                    "[FUNNEL 60s] recv=%d → signals_ok=%d (notrade=%d lowconf=%d "
+                    "lag=%d) → slot_passes=%d → passed=%d (cooldown=%d funding=%d "
+                    "maxpos=%d pending=%d) | enter_drops: nobook=%d drift=%d",
+                    d["received"], fanned,
+                    d["not_tradeable"], d["low_confidence"], d["lag_out_of_range"],
+                    d["fanned_out"], passed,
+                    d["cooldown"], d["funding"],
                     d["max_positions"], d["pending_submit"],
                     d["no_book"], d["latency_drift"],
                 )
@@ -881,6 +887,8 @@ class ShadowEngine:
                               cfg: PairExecConfig, pin_slot) -> None:
         """The per-account half of on_signal: gates, then entry, for ONE slot."""
         symbol = signal.symbol
+        # One per slot pass — the denominator every gate below is counted in.
+        self.signals_fanned_out += 1
         # Gate key. Keyed by symbol alone, slot 1 holding a position or serving
         # a cooldown shut the pair for slot 2 as well.
         _gk = (pin_slot, symbol)
