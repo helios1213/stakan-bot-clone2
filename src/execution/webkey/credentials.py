@@ -230,6 +230,7 @@ class WebkeyStore:
         """
         _validate_slot_id(slot_id)
         validate_webkey(webkey)
+        await self._warn_if_key_reused(slot_id, webkey)
         webkey = webkey.strip()
         encrypted_webkey = self._fernet.encrypt(webkey.encode("utf-8"))
         now = int(time.time())
@@ -505,17 +506,55 @@ class WebkeyStore:
                 )
         return True
 
+    async def _warn_if_key_reused(self, slot_id: int, webkey: str) -> list[int]:
+        """Log loudly if this webkey is already installed in another slot.
+
+        Every live slot acts on every signal independently, so the same account
+        in two slots opens two positions per signal — double exposure on one
+        balance and double the open-rate towards MEXC's limit. Warn rather than
+        refuse: the operator may be deliberately moving a key between slots,
+        and a hard block here would strand them mid-swap.
+
+        Returns the slots that already hold this key.
+        """
+        dupes: list[int] = []
+        try:
+            rows = await self.db.fetchall(
+                "SELECT slot_id, webkey_blob FROM webkey_slots "
+                "WHERE slot_id<>? AND webkey_blob IS NOT NULL", (slot_id,))
+        except Exception:
+            logger.exception("dup-key check: could not read slots")
+            return dupes
+        for row in rows or []:
+            try:
+                if self._decrypt_optional(row["webkey_blob"]) == webkey:
+                    dupes.append(int(row["slot_id"]))
+            except Exception:
+                # An undecryptable blob is someone else's problem; skip it.
+                continue
+        if dupes:
+            logger.warning(
+                "⚠️ Slot %d gets a webkey ALREADY in slot(s) %s — both slots act "
+                "on every signal, so that one account will open two positions "
+                "per signal (double exposure, double open-rate).",
+                slot_id, ", ".join(str(d) for d in dupes),
+            )
+        return dupes
+
     async def _pair_has_another_slot(self, pair: str, slot_id: int) -> bool:
-        """Is some OTHER slot still assigned to this pair?
+        """Is some OTHER slot able to keep trading this pair?
 
         Two slots may trade the same pair as independent accounts, so losing
-        one of them does not strand the pair. Assignment alone is the test:
-        a slot with live trading merely toggled off is still the operator's
-        slot for that pair, and demoting the pair under it would be surprising.
+        one does not strand the pair. But the sibling only counts if it could
+        actually execute: assignment alone would leave the pair LIVE behind a
+        slot with no webkey or live trading switched off, which reproduces the
+        silent no-trades outage this check exists to prevent — just inverted.
         """
         row = await self.db.fetchone(
             "SELECT COUNT(*) AS n FROM webkey_slots "
-            "WHERE assigned_pair=? AND slot_id<>?",
+            "WHERE assigned_pair=? AND slot_id<>? "
+            "  AND live_enabled=1 "
+            "  AND webkey_blob IS NOT NULL AND webkey_blob<>''",
             (pair, slot_id),
         )
         return bool(row and row["n"])

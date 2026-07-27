@@ -382,6 +382,11 @@ class ShadowEngine:
         # the slot holds ~65s after each ACCEPTED open, which is the
         # measured ceiling (1 open per ~61s).
         self._open_rl_mode_until: dict[int, float] = {}
+        # Last limit class seen per slot, and the deadline last written to
+        # the DB — so a class change re-alerts and a lengthening window
+        # keeps its persisted copy in step.
+        self._open_rl_code: dict[int, str] = {}
+        self._open_rl_persisted: dict[int, int] = {}
         # Warm-up: slot -> soft_start_until (epoch), cached from slot_cfg so
         # the pre-submit gate can consult the plan without a DB hit.
         self._ss_cache: dict[int, float] = {}
@@ -565,41 +570,47 @@ class ShadowEngine:
                     try:
                         placeholders = ",".join("?" * len(live_pairs))
                         rows = await self.live_db.fetchall(
-                            f"SELECT symbol, MAX(opened_at) AS last_ts "
+                            f"SELECT symbol, account_label, "
+                            f"       MAX(opened_at) AS last_ts "
                             f"FROM live_trades "
                             f"WHERE symbol IN ({placeholders}) "
-                            f"GROUP BY symbol",
+                            f"GROUP BY symbol, account_label",
                             tuple(live_pairs),
                         )
                     except Exception:
                         logger.exception("Heartbeat: batched fetch failed")
                         continue
 
-                    last_ts_by_symbol: dict[str, int] = {}
+                    # Keyed (symbol, account_label): grouped by symbol alone, a
+                    # slot that stopped trading stayed invisible for as long as
+                    # its sibling kept the pair's MAX(opened_at) fresh.
+                    last_ts_by_key: dict[tuple, int] = {}
                     for r in rows or []:
                         try:
-                            last_ts_by_symbol[r["symbol"]] = int(r["last_ts"]) if r["last_ts"] else 0
+                            last_ts_by_key[(r["symbol"], r["account_label"])] = (
+                                int(r["last_ts"]) if r["last_ts"] else 0)
                         except Exception:
                             logger.debug("Heartbeat: unparseable last_ts row %r", r)
 
-                    for symbol in live_pairs:
-                        last_ts = last_ts_by_symbol.get(symbol, 0)
+                    for symbol, label in self._heartbeat_keys(live_pairs):
+                        last_ts = last_ts_by_key.get((symbol, label), 0)
                         silence_sec = now - last_ts if last_ts else 999999
 
                         if silence_sec >= silence_threshold_sec:
                             # Throttle: don't alert more than once per cooldown
-                            if now - last_alert.get(symbol, 0) < alert_cooldown_sec:
+                            if now - last_alert.get((symbol, label), 0) < alert_cooldown_sec:
                                 continue
-                            last_alert[symbol] = now
+                            last_alert[(symbol, label)] = now
 
                             silence_min = silence_sec // 60
                             try:
                                 await self.alerts.send(
-                                    f"😴 <b>NO TRADES</b>\n"
+                                    f"😴 <b>NO TRADES</b>"
+                                    f"{(' · <b>' + label.upper() + '</b>') if label else ''}\n"
                                     f"Symbol: <code>{symbol}</code>\n"
                                     f"Silent for: <b>{silence_min} min</b>\n"
                                     f"Bot is alive but not trading. Check: kill switch? state? webkey?",
-                                    category=f"heartbeat:{symbol}",
+                                    category=f"heartbeat:{symbol}:{label}",
                                     throttle_sec=0,  # already throttled by last_alert dict
                                     suppress_during_quiet=False,
                                 )
@@ -827,6 +838,28 @@ class ShadowEngine:
                     f"{symbol} · спробуй іншу пару на слоті · виходи працюють")
         return (f"⏸ <b>Ліміт частоти MEXC</b> · <b>SLOT{sid}</b> ({code})\n"
                 f"1 угода / {int(hold)}с · {mode / 3600:.0f} год · виходи працюють")
+
+    def _heartbeat_keys(self, live_pairs) -> list:
+        """(symbol, account_label) pairs the heartbeat should watch.
+
+        One entry per live slot assigned to the pair, so a slot that stopped
+        trading is noticed even while its sibling keeps the pair busy. Falls
+        back to (symbol, None) when the slot map is unavailable — that is the
+        original symbol-wide behaviour.
+        """
+        keys: list = []
+        for symbol in live_pairs:
+            slots = []
+            if self.live_pool is not None:
+                try:
+                    slots = list(self.live_pool.find_slots_for_pair(symbol))
+                except Exception:
+                    slots = []
+            if slots:
+                keys.extend((symbol, f"slot{s}") for s in slots)
+            else:
+                keys.append((symbol, None))
+        return keys
 
     def _entry_slots(self, symbol: str) -> list:
         """Slots that act on a signal for this pair, each one independently.
@@ -1529,13 +1562,26 @@ class ShadowEngine:
                         _mode = self._env_float("OPEN_THROTTLE_MODE_SEC", 21600.0)
                         _was_on = _now < self._open_rl_mode_until.get(sid, 0.0)
                         self._open_rl_mode_until[sid] = _now + _mode
-                        if not _was_on:
+                        # A different limit class means a different problem and a
+                        # different remedy (pace vs pair), so it alerts again even
+                        # while the latch is already held.
+                        _new_class = self._open_rl_code.get(sid) != _lim_code
+                        self._open_rl_code[sid] = _lim_code
+                        _deadline_epoch = int(time.time() + _mode)
+                        # Refresh the stored deadline as the window keeps extending.
+                        # Persisting only on the FIRST refusal let the DB copy expire
+                        # under a still-active latch, so a restart resumed at full
+                        # speed into a limited account.
+                        if (_deadline_epoch
+                                - self._open_rl_persisted.get(sid, 0) > 300):
                             try:
                                 await self.live_pool.webkey_store.set_open_throttle_until(
-                                    sid, int(time.time() + _mode))
+                                    sid, _deadline_epoch)
+                                self._open_rl_persisted[sid] = _deadline_epoch
                             except Exception:
                                 logger.exception(
                                     "[OPEN THROTTLE] could not persist latch slot=%d", sid)
+                        if not _was_on or _new_class:
                             _hold = self._env_float("OPEN_THROTTLE_HOLD_SEC", 65.0)
                             logger.warning(
                                 "[OPEN THROTTLE] slot=%d limited by MEXC — holding "

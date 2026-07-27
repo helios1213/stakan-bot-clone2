@@ -1014,9 +1014,22 @@ class LiveExecutor:
             # "falls back to shadow" was not actually happening. _halted blocks
             # new entries instantly; this makes the demotion real + durable.
             try:
-                await self.webkey_store.demote_pair_to_shadow(
-                    to_binance(symbol), "fee detected — auto-shadow"
-                )
+                # A fee is a property of THIS account. live_enabled=0 above
+                # already stops this slot; demoting the pair would also stop a
+                # second account that never saw a fee, so only do it when no
+                # other slot is left to trade the pair.
+                _pair_b = to_binance(symbol)
+                if await self.webkey_store._pair_has_another_slot(
+                        _pair_b, self.slot_id):
+                    logger.warning(
+                        "fee guard: slot %d halted on %s — pair stays LIVE, "
+                        "another slot still trades it",
+                        self.slot_id, _pair_b,
+                    )
+                else:
+                    await self.webkey_store.demote_pair_to_shadow(
+                        _pair_b, "fee detected — auto-shadow"
+                    )
             except Exception:
                 logger.exception(
                     "fee guard: failed to demote %s to shadow", symbol

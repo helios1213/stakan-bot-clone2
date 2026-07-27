@@ -158,8 +158,11 @@ class ExecutionConfig:
     sl_grace_sec: float = 0.0
     max_hold_sec: int = 600
 
-    cooldown_after_loss_sec: int = 10
-    cooldown_after_win_sec: int = 5
+    # Fallback for a pair that does not set them. Every live pair does set
+    # them explicitly; keeping the fallback in step means a newly added pair
+    # starts on the same pacing instead of a much slower legacy one.
+    cooldown_after_loss_sec: int = 3
+    cooldown_after_win_sec: int = 2
 
     binance_reversal_ticks: float = 2.0
     gap_retrace_frac: float = 0.0          # >0 = gap-relative binance_reversal (cut on retrace of entry gap); 0 = fixed-tick

@@ -336,6 +336,10 @@ class TestAutoShadowRespectsOtherSlots:
     TAOUSDT while slot 1 was actively trading PEPE. The move demoted the whole
     pair to shadow and slot 1 went silent for 5.4 minutes while the detector
     kept emitting PEPE signals.
+
+    The sibling only counts if it can actually execute. An assigned-but-idle
+    slot (no webkey, or live trading switched off) would leave the pair LIVE
+    with nothing to run it — the same silent outage, inverted.
     """
 
     @staticmethod
@@ -349,9 +353,16 @@ class TestAutoShadowRespectsOtherSlots:
         store.demote_pair_to_shadow = _fake
         return seen
 
+    @staticmethod
+    async def _make_executing(store, slot_id, pair, webkey):
+        """A slot that could really trade `pair`: key, live on, assigned."""
+        await store.set_webkey(slot_id, webkey)
+        await store.set_live_enabled(slot_id, True)
+        await store.assign_pair(slot_id, pair)
+
     @pytest.mark.asyncio
-    async def test_reassign_keeps_pair_live_when_another_slot_holds_it(self, store):
-        await store.assign_pair(1, "1000PEPEUSDT")
+    async def test_reassign_keeps_pair_live_when_another_slot_can_execute(self, store):
+        await self._make_executing(store, 1, "1000PEPEUSDT", SAMPLE_WEBKEY)
         await store.assign_pair(2, "1000PEPEUSDT")
         seen = self._spy(store)
 
@@ -369,10 +380,32 @@ class TestAutoShadowRespectsOtherSlots:
         assert [p for p, _ in seen] == ["1000PEPEUSDT"]
 
     @pytest.mark.asyncio
-    async def test_delete_keeps_pair_live_when_another_slot_holds_it(self, store):
+    async def test_sibling_without_a_webkey_does_not_hold_the_pair_live(self, store):
+        """Assigned but unusable — demote, or the pair sits live with no executor."""
+        await store.set_live_enabled(1, True)
+        await store.assign_pair(1, "1000PEPEUSDT")      # slot 1: no webkey
+        await store.assign_pair(2, "1000PEPEUSDT")
+        seen = self._spy(store)
+
+        await store.assign_pair(2, "TAOUSDT")
+
+        assert [p for p, _ in seen] == ["1000PEPEUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_sibling_with_live_disabled_does_not_hold_the_pair_live(self, store):
         await store.set_webkey(1, SAMPLE_WEBKEY)
+        await store.assign_pair(1, "1000PEPEUSDT")      # slot 1: live_enabled=0
+        await store.assign_pair(2, "1000PEPEUSDT")
+        seen = self._spy(store)
+
+        await store.assign_pair(2, "TAOUSDT")
+
+        assert [p for p, _ in seen] == ["1000PEPEUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_delete_keeps_pair_live_when_another_slot_can_execute(self, store):
+        await self._make_executing(store, 1, "1000PEPEUSDT", SAMPLE_WEBKEY)
         await store.set_webkey(2, SAMPLE_WEBKEY_2)
-        await store.assign_pair(1, "1000PEPEUSDT")
         await store.assign_pair(2, "1000PEPEUSDT")
         seen = self._spy(store)
 
@@ -392,7 +425,33 @@ class TestAutoShadowRespectsOtherSlots:
 
     @pytest.mark.asyncio
     async def test_helper_ignores_the_slot_being_changed(self, store):
-        await store.assign_pair(2, "1000PEPEUSDT")
+        await self._make_executing(store, 2, "1000PEPEUSDT", SAMPLE_WEBKEY_2)
         assert await store._pair_has_another_slot("1000PEPEUSDT", 2) is False
-        await store.assign_pair(1, "1000PEPEUSDT")
+        await self._make_executing(store, 1, "1000PEPEUSDT", SAMPLE_WEBKEY)
         assert await store._pair_has_another_slot("1000PEPEUSDT", 2) is True
+
+
+class TestDuplicateWebkeyIsFlagged:
+    """The same account in two slots doubles exposure now that both slots act."""
+
+    @pytest.mark.asyncio
+    async def test_reused_key_is_reported(self, store):
+        await store.set_webkey(1, SAMPLE_WEBKEY)
+        assert await store._warn_if_key_reused(2, SAMPLE_WEBKEY) == [1]
+
+    @pytest.mark.asyncio
+    async def test_distinct_key_is_not_reported(self, store):
+        await store.set_webkey(1, SAMPLE_WEBKEY)
+        assert await store._warn_if_key_reused(2, SAMPLE_WEBKEY_2) == []
+
+    @pytest.mark.asyncio
+    async def test_the_slot_itself_is_never_its_own_duplicate(self, store):
+        await store.set_webkey(1, SAMPLE_WEBKEY)
+        assert await store._warn_if_key_reused(1, SAMPLE_WEBKEY) == []
+
+    @pytest.mark.asyncio
+    async def test_setting_a_reused_key_still_succeeds(self, store):
+        """Warn, never block — the operator may be mid-swap."""
+        await store.set_webkey(1, SAMPLE_WEBKEY)
+        await store.set_webkey(2, SAMPLE_WEBKEY)
+        assert await store._warn_if_key_reused(2, SAMPLE_WEBKEY) == [1]
