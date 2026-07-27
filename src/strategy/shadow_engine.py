@@ -808,6 +808,21 @@ class ShadowEngine:
                 logger.exception(
                     "[ENTRY] slot=%s %s raised", _s, symbol, exc_info=_r)
 
+    @staticmethod
+    def _al_text(sid: int, code: str, hold: float, mode: float, symbol: str) -> str:
+        """Alert body for an open refusal, worded for the code that arrived.
+
+        2036 ("Number of orders has exceeded the limit") is a per-CONTRACT
+        limit, not an account one: the same account kept trading normally after
+        the slot was simply moved to another pair. Calling it a frequency limit
+        would point the operator at the wrong lever.
+        """
+        if code == "2036":
+            return (f"⚠️ <b>Ліміт ордерів на парі</b> · <b>SLOT{sid}</b> ({code})\n"
+                    f"{symbol} · спробуй іншу пару на слоті · виходи працюють")
+        return (f"⏸ <b>Ліміт частоти MEXC</b> · <b>SLOT{sid}</b> ({code})\n"
+                f"1 угода / {int(hold)}с · {mode / 3600:.0f} год · виходи працюють")
+
     def _entry_slots(self, symbol: str) -> list:
         """Slots that act on a signal for this pair, each one independently.
 
@@ -1524,10 +1539,8 @@ class ShadowEngine:
                             if self.alerts is not None:
                                 try:
                                     await self.alerts.send(
-                                        f"⏸ <b>Ліміт частоти MEXC</b> · "
-                                        f"<b>SLOT{sid}</b> ({_lim_code})\n"
-                                        f"1 угода / {int(_hold)}с · "
-                                        f"{_mode / 3600:.0f} год · виходи працюють",
+                                        _al_text(sid, _lim_code, _hold, _mode,
+                                                 signal.symbol),
                                         category=f"open_throttle_{_lim_code}:{sid}",
                                         throttle_sec=1800,
                                     )
