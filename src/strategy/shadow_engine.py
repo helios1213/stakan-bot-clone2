@@ -86,7 +86,12 @@ def open_freq_limit_code(err_msg: str | None) -> str | None:
     if not err_msg:
         return None
     for code in OPEN_FREQ_CODES:
-        if f"api_error_{code}" in err_msg:
+        needle = f"api_error_{code}"
+        at = err_msg.find(needle)
+        # Right boundary: without it "api_error_2036" also matches
+        # "api_error_20360" and would arm a six-hour throttle for an
+        # unrelated code.
+        if at >= 0 and not err_msg[at + len(needle):at + len(needle) + 1].isdigit():
             return code
     if "position-opening frequency" in err_msg:
         return "unknown"
@@ -1603,7 +1608,7 @@ class ShadowEngine:
                 "api_error_10014",
                 "api_error_9082",
                 "api_error_2036",
-                "Number of orders has exceeded",
+                "number of orders has exceeded",   # err_msg is lowercased above
                 "position-opening frequency",
                 # Our OWN deliberate pacing, not an exchange failure: soft-start
                 # warm-up and the 10014/510 cooldowns skip the signal on purpose.
@@ -2388,7 +2393,12 @@ class ShadowEngine:
                 brk = rng.uniform(0.25, 1.0)     # coffee
             blocks.append((t, min(t + brk, SOFT_START_HOURS), None))
             t += brk
-        self._ss_plan = {key: blocks}            # only the current window matters
+        # Keep per (slot, window): assigning a fresh dict meant two warming
+        # slots evicted each other on every signal, rebuilding the plan — and
+        # re-logging it — each time. Prune so it cannot grow.
+        if len(self._ss_plan) > 8:
+            self._ss_plan.clear()
+        self._ss_plan[key] = blocks
         logger.info(
             "[SOFT START] slot=%d plan: %d blocks over %.0fh (%d breaks, longest %.1fh)",
             sid, len(blocks), SOFT_START_HOURS,

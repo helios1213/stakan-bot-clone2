@@ -249,6 +249,23 @@ async def startup_reconcile(live_pool, alerts) -> dict:
 # Periodic reconciliation
 # ────────────────────────────────────────────────────────────────────────
 
+def _slot_of(pos) -> int | None:
+    """Slot a live position belongs to, or None when it cannot be read.
+
+    The engine writes account_label as f"slot{sid}" immediately after a live
+    open succeeds. Anything else (shadow positions, a malformed label) means we
+    must not attribute the position to a slot — callers treat that as "unknown"
+    and fall back to the safer symbol-wide behaviour.
+    """
+    label = getattr(pos, "account_label", None)
+    if not isinstance(label, str) or not label.startswith("slot"):
+        return None
+    try:
+        return int(label[4:])
+    except ValueError:
+        return None
+
+
 async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     """Single reconciliation pass. Called both from periodic loop and tests.
 
@@ -313,9 +330,12 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
 
     # Set of mexc-symbols the engine considers live-active. Used by Case A
     # to decide "orphan vs known".
-    engine_live_mexc_symbols: set[str] = set()
-    # Map mexc_symbol → list of ShadowPosition (for Case B iteration).
-    engine_positions_by_mexc_sym: dict[str, list] = {}
+    engine_live_by_key: set[tuple] = set()
+    # Symbols whose live position could NOT be attributed to a slot. Those keep
+    # the old symbol-wide match: never close a position we cannot account for.
+    engine_unattributed_syms: set[str] = set()
+    # Map (slot | None, mexc_symbol) → list of ShadowPosition (Case B iteration).
+    engine_positions_by_key: dict[tuple, list] = {}
     open_positions = getattr(shadow_engine, "_open_positions", {})
     for sym, poss in open_positions.items():
         for pos in poss:
@@ -323,24 +343,32 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
                     and pos.is_open
                     and not getattr(pos, "is_closing", False)):
                 mexc_sym = to_mexc(sym)
-                engine_live_mexc_symbols.add(mexc_sym)
-                engine_positions_by_mexc_sym.setdefault(mexc_sym, []).append(pos)
+                pos_slot = _slot_of(pos)
+                if pos_slot is None:
+                    engine_unattributed_syms.add(mexc_sym)
+                else:
+                    engine_live_by_key.add((pos_slot, mexc_sym))
+                engine_positions_by_key.setdefault(
+                    (pos_slot, mexc_sym), []).append(pos)
     summary["engine_positions"] = sum(
-        len(v) for v in engine_positions_by_mexc_sym.values()
+        len(v) for v in engine_positions_by_key.values()
     )
 
     # ── Case A: MEXC has it, engine doesn't → ORPHAN
     # Iterate per-(slot, symbol) so multi-slot orphans on the same symbol
     # are each handled independently.
     for (slot_id, mexc_sym), mexc_pos in mexc_by_key.items():
-        if mexc_sym in engine_live_mexc_symbols:
-            # Engine has at least one live position for this symbol. We
-            # don't try to match per-slot here because we'd need to parse
-            # pos.account_label and we don't have a robust mapping back.
-            # The downside: if slot 1 has an orphan AND slot 2 has a live
-            # position in the same symbol, we'd skip closing slot 1's
-            # orphan. The current single-slot setup never hits this; when
-            # multi-slot truly arrives, add account_label-aware matching.
+        if (slot_id, mexc_sym) in engine_live_by_key:
+            # This very slot has a tracked position here — not an orphan.
+            continue
+        if mexc_sym in engine_unattributed_syms:
+            # A live position on this symbol whose slot we could not read.
+            # Fail safe: leave it alone rather than risk closing a real one.
+            logger.warning(
+                "[RECONCILE] slot=%d %s — a live position on this symbol has "
+                "no readable slot label; skipping orphan check",
+                slot_id, mexc_sym,
+            )
             continue
         # race protection now treats age==0
         # ("createTime unknown") as "apply grace, not bypass it". The old
@@ -479,8 +507,12 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     # Build the set of mexc-symbols present anywhere in MEXC across slots
     # for quick membership tests.
     mexc_symbols_present: set[str] = {sym for (_sid, sym) in mexc_by_key.keys()}
-    for mexc_sym, positions in engine_positions_by_mexc_sym.items():
-        if mexc_sym in mexc_symbols_present:
+    for (pos_slot, mexc_sym), positions in engine_positions_by_key.items():
+        if pos_slot is None:
+            # Unattributed: fall back to the symbol-wide test.
+            if mexc_sym in mexc_symbols_present:
+                continue
+        elif (pos_slot, mexc_sym) in mexc_by_key:
             continue
         for eng_pos in positions:
             # Race protection: skip just-opened engine positions

@@ -521,3 +521,104 @@ class TestMarkClosedExternally:
 
         await engine.mark_position_closed_externally(pos, reason="test")
         assert pos.exit_price == 0.009480
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Two slots on one pair — the sweep must match per (slot, symbol)
+# ──────────────────────────────────────────────────────────────────────
+
+class TestReconcileIsSlotAware:
+    """Regression for the slot-independence change (dfff235).
+
+    Matching engine state by SYMBOL was equivalent to matching by slot only
+    while one pair could hold one position across all slots. Once both slots
+    trade the same pair, slot 1's untracked position hides behind slot 2's
+    tracked one and the last-resort sweep skips it — leaving a real position
+    with no watcher, no stop and no trail.
+    """
+
+    @staticmethod
+    def _pos(symbol, slot_label, age_sec=60):
+        pos = MagicMock()
+        pos.symbol = symbol
+        pos.direction = "short"
+        pos.mode = "live"
+        pos.is_open = True
+        pos.is_closing = False
+        pos.elapsed_sec = age_sec
+        pos.entry_price = 0.00942
+        pos.qty = 13194
+        pos.account_label = slot_label
+        return pos
+
+    @staticmethod
+    def _engine(open_positions):
+        engine = MagicMock()
+        engine._open_positions = open_positions
+        engine._stop = asyncio.Event()
+        engine.mark_position_closed_externally = AsyncMock()
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_orphan_on_one_slot_closed_while_sibling_holds_the_pair(self):
+        ex1 = _mk_executor_with_positions([_mexc_pos(symbol="PENGU_USDT")])
+        ex2 = _mk_executor_with_positions([_mexc_pos(symbol="PENGU_USDT")])
+        pool = _mk_live_pool({1: ex1, 2: ex2})
+        # Only slot 2's position is tracked; slot 1's is an orphan.
+        engine = self._engine({"PENGUUSDT": [self._pos("PENGUUSDT", "slot2")]})
+
+        with patch("src.exchanges.mexc_rest.to_mexc",
+                   side_effect=lambda s: s.replace("USDT", "_USDT")):
+            summary = await reconcile_once(engine, pool, alerts=None)
+
+        assert summary["orphans_closed"] == 1, "slot 1's orphan was skipped"
+        ex1.market_close_position.assert_called_once()
+        ex2.market_close_position.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tracked_positions_on_both_slots_are_left_alone(self):
+        ex1 = _mk_executor_with_positions([_mexc_pos(symbol="PENGU_USDT")])
+        ex2 = _mk_executor_with_positions([_mexc_pos(symbol="PENGU_USDT")])
+        pool = _mk_live_pool({1: ex1, 2: ex2})
+        engine = self._engine({"PENGUUSDT": [self._pos("PENGUUSDT", "slot1"),
+                                             self._pos("PENGUUSDT", "slot2")]})
+
+        with patch("src.exchanges.mexc_rest.to_mexc",
+                   side_effect=lambda s: s.replace("USDT", "_USDT")):
+            summary = await reconcile_once(engine, pool, alerts=None)
+
+        assert summary["orphans_closed"] == 0
+        ex1.market_close_position.assert_not_called()
+        ex2.market_close_position.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_slot_label_is_left_alone(self):
+        """Fail safe: never close a position we cannot attribute to a slot."""
+        ex1 = _mk_executor_with_positions([_mexc_pos(symbol="PENGU_USDT")])
+        pool = _mk_live_pool({1: ex1})
+        engine = self._engine({"PENGUUSDT": [self._pos("PENGUUSDT", None)]})
+
+        with patch("src.exchanges.mexc_rest.to_mexc",
+                   side_effect=lambda s: s.replace("USDT", "_USDT")):
+            summary = await reconcile_once(engine, pool, alerts=None)
+
+        assert summary["orphans_closed"] == 0
+        ex1.market_close_position.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_engine_position_found_though_sibling_slot_holds_the_pair(self):
+        """Case B: slot 1's ghost must be cleared even while slot 2 is real."""
+        ex1 = _mk_executor_with_positions([])            # slot 1 flat on MEXC
+        ex2 = _mk_executor_with_positions([_mexc_pos(symbol="PENGU_USDT")])
+        pool = _mk_live_pool({1: ex1, 2: ex2})
+        ghost = self._pos("PENGUUSDT", "slot1")
+        engine = self._engine({"PENGUUSDT": [ghost,
+                                             self._pos("PENGUUSDT", "slot2")]})
+
+        with patch("src.exchanges.mexc_rest.to_mexc",
+                   side_effect=lambda s: s.replace("USDT", "_USDT")):
+            summary = await reconcile_once(engine, pool, alerts=None)
+
+        assert summary["stale_engine_marked"] == 1
+        marked = [c.args[0] for c in engine.mark_position_closed_externally.await_args_list]
+        assert marked == [ghost]
