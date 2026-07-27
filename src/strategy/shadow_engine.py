@@ -67,6 +67,31 @@ logger = logging.getLogger(__name__)
 # died within their first 15-21h, so the plan spans a day and a half.
 SOFT_START_HOURS = 36.0
 
+# Three MEXC codes all mean "this account is opening positions too fast".
+# 10014 and 9082 carry the SAME human text under different numbers; 2036
+# ("Number of orders has exceeded the limit") behaves identically from our
+# side. Matching the literal "10014" left the other two unlatched, so the bot
+# kept firing into them: 3,266 refusals in five hours on one account (27.07),
+# and 3,811 in 3.5h on another (20.07) — both silent.
+OPEN_FREQ_CODES = ("10014", "9082", "2036")
+
+
+def open_freq_limit_code(err_msg: str | None) -> str | None:
+    """Which open-rate limit MEXC just returned, or None.
+
+    Matched on `api_error_<code>` so a bare number inside some other message
+    cannot trigger a six-hour throttle by accident. The text fallback catches
+    a future code that reuses the same wording.
+    """
+    if not err_msg:
+        return None
+    for code in OPEN_FREQ_CODES:
+        if f"api_error_{code}" in err_msg:
+            return code
+    if "position-opening frequency" in err_msg:
+        return "unknown"
+    return None
+
 # Hardcoded upper bound on position age, independent of strategy config.
 # If a position lives this long, force-close it regardless of strategy
 # state (phase exits, trailing stops, etc.). Catches scenarios where the
@@ -1411,10 +1436,12 @@ class ShadowEngine:
                         # Through _arm_open_hold: writing the deadline directly
                         # SHORTENED the 65s hold taken a few lines above to 15s.
                         self._arm_open_hold(sid, 15.0, "510 rate-limit")
-                    elif live_result.error_msg and "10014" in live_result.error_msg:
-                        # First 10014 latches this slot into throttled mode; from
-                        # then on it holds after every accepted open instead of
-                        # firing hundreds of doomed requests between fills.
+                    elif open_freq_limit_code(_err):
+                        # The first open-rate refusal latches this slot into
+                        # throttled mode; from then on it holds after every
+                        # accepted open instead of firing hundreds of doomed
+                        # requests between fills.
+                        _lim_code = open_freq_limit_code(_err)
                         _now = time.monotonic()
                         # Probe interval. The hold below only arms after a request
                         # that MEXC actually processed — so while every request is
@@ -1444,10 +1471,11 @@ class ShadowEngine:
                             if self.alerts is not None:
                                 try:
                                     await self.alerts.send(
-                                        f"⏸ MEXC обмежив частоту відкриттів (10014)\n"
+                                        f"⏸ MEXC обмежив частоту відкриттів "
+                                        f"({_lim_code})\n"
                                         f"SLOT{sid}: перехожу на 1 угоду / {int(_hold)}с\n"
                                         f"Виходи з позицій працюють як звичайно.",
-                                        category=f"open_throttle_10014:{sid}",
+                                        category=f"open_throttle_{_lim_code}:{sid}",
                                         throttle_sec=1800,
                                     )
                                 except Exception:
@@ -1507,6 +1535,9 @@ class ShadowEngine:
                 # repeat count) — the generic "Unknown error" copy of the very
                 # same event is pure duplication.
                 "api_error_10014",
+                "api_error_9082",
+                "api_error_2036",
+                "Number of orders has exceeded",
                 "position-opening frequency",
                 # Our OWN deliberate pacing, not an exchange failure: soft-start
                 # warm-up and the 10014/510 cooldowns skip the signal on purpose.
