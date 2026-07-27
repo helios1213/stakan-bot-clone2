@@ -1524,10 +1524,10 @@ class ShadowEngine:
                             if self.alerts is not None:
                                 try:
                                     await self.alerts.send(
-                                        f"⏸ MEXC обмежив частоту відкриттів "
+                                        f"🚨 <b>SLOT{sid} · ЛІМІТ MEXC</b> "
                                         f"({_lim_code})\n"
-                                        f"SLOT{sid}: перехожу на 1 угоду / {int(_hold)}с\n"
-                                        f"Виходи з позицій працюють як звичайно.",
+                                        f"🐌 1 угода / {int(_hold)}с · {_mode / 3600:.0f} год\n"
+                                        f"✅ виходи працюють",
                                         category=f"open_throttle_{_lim_code}:{sid}",
                                         throttle_sec=1800,
                                     )
