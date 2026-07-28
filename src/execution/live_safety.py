@@ -41,6 +41,7 @@ class SafetyState:
     avg_notional_usdt: float = 0.0
     _logged_dd_step: int = 0        # deepest quarter-of-limit already logged
     _logged_peak: float = 0.0
+    _closes_since_log: int = 0
     kill_active: bool = False
     kill_reason: str = ""
     kill_until_ts: int = 0  # 0 = indefinite
@@ -237,6 +238,17 @@ class LiveSafetyController:
         time the drawdown deepens past another quarter of it. At ~2,000 trades a
         day a line per close would be unreadable.
         """
+        # Heartbeat: the step thresholds below only fire at 25% of the limit,
+        # which at ordinary PnL is once in hours. This keeps the peak visible.
+        self.state._closes_since_log += 1
+        if self.state._closes_since_log >= 100:
+            self.state._closes_since_log = 0
+            logger.info(
+                "[EQUITY] %d угод: PnL $%+.2f, пік $%+.2f, просадка $%.2f з $%.2f "
+                "(позиція ~$%.0f)",
+                self.state.today_trades, self.state.today_pnl, self.state.peak_pnl,
+                drawdown, dd_limit, self.state.avg_notional_usdt)
+
         step = int(drawdown / dd_limit * 4) if dd_limit > 0 else 0
         if step > self.state._logged_dd_step:
             self.state._logged_dd_step = step
