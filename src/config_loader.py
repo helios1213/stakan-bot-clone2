@@ -181,6 +181,8 @@ class ExecutionConfig:
     # (mid-gap < 0.5bps → ~9% win in the 1093-trade study). Re-introduces the
     # filter removed 2026-05-29. 0 = disabled (default; behaviour-preserving).
     min_mexc_lag_pct: float = 0.0
+    # Upper bound on the same gap. 0 = no cap (prior behaviour).
+    max_mexc_lag_pct: float = 0.0
 
 
 @dataclass
@@ -315,6 +317,7 @@ def _parse_execution(raw: dict | None, defaults: ExecutionConfig) -> ExecutionCo
         momentum_threshold_bps=float(raw.get(
             "momentum_threshold_bps", defaults.momentum_threshold_bps)),
         min_mexc_lag_pct=float(raw.get("min_mexc_lag_pct", defaults.min_mexc_lag_pct)),
+        max_mexc_lag_pct=float(raw.get("max_mexc_lag_pct", defaults.max_mexc_lag_pct)),
     )
 
 

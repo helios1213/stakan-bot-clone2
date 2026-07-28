@@ -297,6 +297,7 @@ class PairExecConfig:
     momentum_tau_sec: float = 2.0
     momentum_threshold_bps: float = 2.0
     min_mexc_lag_pct: float = 0.0
+    max_mexc_lag_pct: float = 0.0
 
 
 class ShadowEngine:
@@ -826,6 +827,17 @@ class ShadowEngine:
         # the signed mid-to-mid percent (static_gap_detector). 0=off. Cuts small-
         # mid-gap dead entries (PEPE/ONDO: <3bps loses, >=4bps wins).
         if cfg.min_mexc_lag_pct > 0 and abs(signal.mexc_lag_pct) < cfg.min_mexc_lag_pct:
+            self.signals_skipped_lag_out_of_range += 1
+            return
+
+        # UPPER bound on the same gap. Measured on 15,868 live PEPE trades: the
+        # 2-3 bps band lost $210 at -0.39 bps and a 31% win rate while 1-2 bps
+        # earned +0.32 at 52%, and its dead-on-arrival share jumps 22% -> 35% —
+        # we arrive and the move is already over. Negative on 11 of 14 days and
+        # reproduced on the clone at -0.35 bps. Same signal-time number as the
+        # minimum above, so it is available before we submit.
+        # cfg.max_mexc_lag_pct=0 disables (default; behaviour-preserving).
+        if cfg.max_mexc_lag_pct > 0 and abs(signal.mexc_lag_pct) > cfg.max_mexc_lag_pct:
             self.signals_skipped_lag_out_of_range += 1
             return
 
@@ -3355,6 +3367,7 @@ class ShadowEngine:
                 momentum_tau_sec=e.momentum_tau_sec,
                 momentum_threshold_bps=e.momentum_threshold_bps,
                 min_mexc_lag_pct=e.min_mexc_lag_pct,
+                max_mexc_lag_pct=e.max_mexc_lag_pct,
             )
         self._pair_configs = cache
         self._configs_loaded_at = int(time.time())

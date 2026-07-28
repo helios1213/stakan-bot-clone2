@@ -48,7 +48,8 @@ def _engine(slots: list[int] | None, *, in_live: bool = True) -> ShadowEngine:
     eng.live_pool = (None if slots is None
                      else SimpleNamespace(find_slots_for_pair=lambda s: list(slots)))
     eng._momentum_ok = lambda *a, **k: True
-    eng._get_pair_config = AsyncMock(return_value=SimpleNamespace(min_mexc_lag_pct=0))
+    eng._get_pair_config = AsyncMock(
+        return_value=SimpleNamespace(min_mexc_lag_pct=0, max_mexc_lag_pct=0))
     eng._try_enter = AsyncMock()
     return eng
 
@@ -424,3 +425,38 @@ def test_open_limit_alert_is_reachable_from_the_engine_source():
     src = inspect.getsource(ShadowEngine._open_position)
     assert "self._al_text(" in src
     assert "\n" + " " * 40 + "_al_text(" not in src
+
+
+# ── upper bound on the entry gap ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_gap_above_the_cap_is_skipped():
+    """The 2-3 bps band lost $210 over 1,302 live trades at a 31% win rate."""
+    eng = _engine([1])
+    eng._get_pair_config = AsyncMock(
+        return_value=SimpleNamespace(min_mexc_lag_pct=0, max_mexc_lag_pct=0.02))
+    sig = _sig(); sig.mexc_lag_pct = 0.025          # 2.5 bps — inside the bad band
+    await eng.on_signal(sig)
+    assert eng._try_enter.await_count == 0
+    assert eng.signals_skipped_lag_out_of_range == 1
+
+
+@pytest.mark.asyncio
+async def test_gap_below_the_cap_passes():
+    eng = _engine([1])
+    eng._get_pair_config = AsyncMock(
+        return_value=SimpleNamespace(min_mexc_lag_pct=0, max_mexc_lag_pct=0.02))
+    sig = _sig(); sig.mexc_lag_pct = -0.015         # 1.5 bps, sign follows direction
+    await eng.on_signal(sig)
+    assert eng._try_enter.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_zero_cap_disables_the_gate():
+    """Every other pair must behave exactly as before."""
+    eng = _engine([1])
+    eng._get_pair_config = AsyncMock(
+        return_value=SimpleNamespace(min_mexc_lag_pct=0, max_mexc_lag_pct=0.0))
+    sig = _sig(); sig.mexc_lag_pct = 0.60           # 60 bps
+    await eng.on_signal(sig)
+    assert eng._try_enter.await_count == 1
