@@ -871,7 +871,7 @@ class ShadowEngine:
         if code == "2036":
             return (f"⚠️ <b>Ліміт ордерів на парі</b> · <b>SLOT{sid}</b> ({code})\n"
                     f"{symbol} · спробуй іншу пару на слоті · виходи працюють")
-        return (f"⏸ <b>Ліміт частоти MEXC</b> · <b>SLOT{sid}</b> ({code})\n"
+        return (f"⚠️ <b>Ліміт частоти MEXC</b> · <b>SLOT{sid}</b> ({code})\n"
                 f"1 угода / {int(hold)}с · {mode / 3600:.0f} год · виходи працюють")
 
     def _note_slot_skip(self, slot, reason: str) -> None:
@@ -1685,7 +1685,7 @@ class ShadowEngine:
                 "no_bbo",
                 "orderbook_not_synced",
                 "no_slot_config",       # pair in live state but slot not yet assigned
-                # 10014 already sends its own "⏸ MEXC обмежив частоту" alert
+                # 10014 already sends its own rate-limit alert (see _al_text)
                 # from the throttle handler (with the slot, the hold and the
                 # repeat count) — the generic "Unknown error" copy of the very
                 # same event is pure duplication.
