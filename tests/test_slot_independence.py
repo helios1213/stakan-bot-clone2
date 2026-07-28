@@ -402,3 +402,25 @@ class TestDrawdownScalesWithSize:
         c.record_close("X", 0.0, notional_usdt=1000.0)
         c.record_close("X", 0.0, notional_usdt=2000.0)
         assert 1000 < c.state.avg_notional_usdt < 1200
+
+
+def test_open_limit_alert_text_is_actually_callable():
+    """It was called as a bare name inside a try/except, so the alert silently
+    never sent — the one thing the throttle feature exists to do."""
+    from src.strategy.shadow_engine import ShadowEngine
+    eng = ShadowEngine.__new__(ShadowEngine)
+    freq = eng._al_text(2, "9082", 65.0, 21600.0, "1000PEPEUSDT")
+    assert "SLOT2" in freq and "9082" in freq and "65" in freq
+    assert "частоти" in freq
+    pair = eng._al_text(1, "2036", 65.0, 21600.0, "1000PEPEUSDT")
+    assert "2036" in pair and "1000PEPEUSDT" in pair
+    assert "ордер" in pair, "2036 must name the pair, not the pace"
+
+
+def test_open_limit_alert_is_reachable_from_the_engine_source():
+    """Guard against the bare-name form coming back."""
+    import inspect
+    from src.strategy.shadow_engine import ShadowEngine
+    src = inspect.getsource(ShadowEngine._open_position)
+    assert "self._al_text(" in src
+    assert "\n" + " " * 40 + "_al_text(" not in src

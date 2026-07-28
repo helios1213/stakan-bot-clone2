@@ -1612,8 +1612,8 @@ class ShadowEngine:
                             if self.alerts is not None:
                                 try:
                                     await self.alerts.send(
-                                        _al_text(sid, _lim_code, _hold, _mode,
-                                                 signal.symbol),
+                                        self._al_text(sid, _lim_code, _hold,
+                                                      _mode, signal.symbol),
                                         category=f"open_throttle_{_lim_code}:{sid}",
                                         throttle_sec=1800,
                                     )
