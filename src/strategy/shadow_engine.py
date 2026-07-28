@@ -473,6 +473,10 @@ class ShadowEngine:
         # memory and reported per slot; deliberately NOT rows in
         # live_open_misses, which every fill-rate query reads.
         self._slot_skips: dict[tuple, int] = {}
+        # (symbol, slot) -> (message fingerprint, last logged ts). A standing
+        # sizing mismatch is a fact, not an event — reloads happen every
+        # 30-50s and repeating it that often buries the log.
+        self._sizing_warned: dict[tuple, tuple] = {}
 
         self.signals_skipped_no_book = 0
         self.signals_skipped_lag_out_of_range = 0
@@ -3359,6 +3363,16 @@ class ShadowEngine:
         except Exception as e:
             logger.warning("Background pair_config reload failed: %s", e)
 
+    def _sizing_should_warn(self, symbol: str, slot_id: int, fingerprint: str) -> bool:
+        """True on a new or changed mismatch, otherwise at most twice an hour."""
+        key = (symbol, slot_id)
+        prev = self._sizing_warned.get(key)
+        now = time.time()
+        if prev is not None and prev[0] == fingerprint and now - prev[1] < 1800:
+            return False
+        self._sizing_warned[key] = (fingerprint, now)
+        return True
+
     async def _warn_on_sizing_drift(self) -> None:
         """Shout when a live pair's YAML sizing is not what its slots use.
 
@@ -3387,17 +3401,20 @@ class ShadowEngine:
                     lmin = slot_cfg.get("slot_leverage_min")
                     lmax = slot_cfg.get("slot_leverage_max")
                     if mmin is None and mmax is None and lmin is None and lmax is None:
-                        logger.warning(
-                            "[SIZING] %s slot=%d has NO per-slot override — it "
-                            "sizes straight from the YAML ($%.0f notional). "
-                            "Check that is intended.",
-                            symbol, sid, yaml_n)
+                        if self._sizing_should_warn(symbol, sid, f"noovr:{yaml_n:.0f}"):
+                            logger.warning(
+                                "[SIZING] %s slot=%d has NO per-slot override — it "
+                                "sizes straight from the YAML ($%.0f notional). "
+                                "Check that is intended.",
+                                symbol, sid, yaml_n)
                         continue
                     eff = (((mmin if mmin is not None else cfg.margin_min_usdt)
                             + (mmax if mmax is not None else cfg.margin_max_usdt)) / 2
                            * ((lmin if lmin is not None else cfg.leverage_min)
                               + (lmax if lmax is not None else cfg.leverage_max)) / 2)
-                    if yaml_n > 0 and abs(eff - yaml_n) / yaml_n > 0.25:
+                    if (yaml_n > 0 and abs(eff - yaml_n) / yaml_n > 0.25
+                            and self._sizing_should_warn(
+                                symbol, sid, f"{eff:.0f}/{yaml_n:.0f}")):
                         logger.warning(
                             "[SIZING] %s slot=%d trades $%.0f but the YAML says "
                             "$%.0f (%.1fx). Dropping the override would jump the "
