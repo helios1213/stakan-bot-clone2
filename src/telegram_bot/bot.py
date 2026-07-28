@@ -543,6 +543,22 @@ async def cmd_unkill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if safety is not None and safety.is_killed():
             if safety.release_kill()[0]:
                 released.append(sid)
+    # 💀 KILL ALL flips shadow_engine.cfg.enabled and nothing else ever flips it
+    # back — the engine stayed dead until the container restarted, while this
+    # command happily answered "no kill active". Undo it here too.
+    engine = context.bot_data.get("shadow_engine")
+    engine_was_off = engine is not None and not engine.cfg.enabled
+    if engine_was_off:
+        engine.cfg.enabled = True
+        logger.warning("KILL ALL undone via /unkill — signal processing resumed")
+    if engine_was_off:
+        await update.message.reply_text(
+            "▶️ <b>Торгівлю відновлено</b> — знято 💀 KILL ALL"
+            + (f"\nSafety-халт знято на слот(ах): "
+               + ", ".join(f"#{s}" for s in released) if released else "")
+            + "\n<i>Позиції НЕ відкриваються самі — бот знову обробляє сигнали.</i>",
+            parse_mode=ParseMode.HTML)
+        return
     if released:
         msg = (
             "♻️ <b>Kill-switch ЗНЯТО</b> на слот(ах): "

@@ -492,7 +492,14 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
                 try:
                     _safety = live_pool.get_safety(slot_id)
                     if _safety is not None:
-                        _safety.record_close(symbol, _pnl)
+                        # INTERNAL format: record_open keyed the counter with
+                        # signal.symbol ("1000PEPEUSDT"), so passing the MEXC
+                        # form here decremented nothing and left the pair stuck
+                        # on "max_concurrent_per_symbol reached" until a restart.
+                        # Converted locally — internal_sym above is only bound
+                        # inside the live_db branch.
+                        from src.exchanges.mexc_rest import to_binance as _to_int
+                        _safety.record_close(_to_int(symbol), _pnl)
                 except Exception:
                     logger.exception(
                         "[RECONCILE] failed to record orphan %s in safety", symbol,

@@ -622,3 +622,46 @@ class TestReconcileIsSlotAware:
         assert summary["stale_engine_marked"] == 1
         marked = [c.args[0] for c in engine.mark_position_closed_externally.await_args_list]
         assert marked == [ghost]
+
+
+class TestOrphanCloseFeedsSafetyCorrectly:
+    """record_open keys the per-symbol counter with the INTERNAL symbol.
+
+    The orphan path passed the MEXC form, so the decrement missed and the pair
+    stayed blocked on "max_concurrent_per_symbol reached" until a restart —
+    silently, because the surrounding except swallowed everything.
+    """
+
+    @pytest.mark.asyncio
+    async def test_record_close_gets_the_internal_symbol(self):
+        ex = _mk_executor_with_positions([_mexc_pos(symbol="PENGU_USDT")])
+        pool = _mk_live_pool({1: ex})
+        safety = MagicMock()
+        pool.get_safety = MagicMock(return_value=safety)
+        engine = MagicMock()
+        engine._open_positions = {}
+        engine._stop = asyncio.Event()
+        engine.mark_position_closed_externally = AsyncMock()
+        engine.live_db = None
+
+        with patch("src.exchanges.mexc_rest.to_mexc",
+                   side_effect=lambda s: s.replace("USDT", "_USDT")):
+            await reconcile_once(engine, pool, alerts=None)
+
+        assert safety.record_close.called, "safety was never told about the orphan"
+        got = safety.record_close.call_args.args[0]
+        assert "_" not in got, f"MEXC format leaked into the counter: {got}"
+        assert got == "PENGUUSDT"
+
+    @pytest.mark.asyncio
+    async def test_counter_actually_returns_to_zero(self):
+        """End to end on the real controller, not a mock."""
+        from src.execution.live_safety import LiveSafetyController
+        c = LiveSafetyController()
+        c.record_open("PENGUUSDT")
+        assert c.state.open_live_positions["PENGUUSDT"] == 1
+        allowed, why = c.can_open_live("PENGUUSDT", margin_usdt=5.0)
+        assert allowed is False and "max_concurrent_per_symbol" in why
+        c.record_close("PENGUUSDT", -0.10)
+        allowed, _ = c.can_open_live("PENGUUSDT", margin_usdt=5.0)
+        assert allowed is True, "the pair stayed blocked after its close"

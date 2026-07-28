@@ -14,7 +14,6 @@ slot for an hour each time. Three kills writing one flag also made a halt hard
 to attribute. Do not add them back without new evidence.
 
 The remaining guards are not kills, they are admission checks:
-  * manual /kill — instant halt + force close all positions
   * per-symbol max position count — one live position per symbol at a time
   * margin sanity — refuse to open if margin exceeds the per-trade cap
 
@@ -203,10 +202,10 @@ class LiveSafetyController:
         now = int(time.time())
         candidate = (now + duration_sec) if duration_sec > 0 else 0  # 0 = indefinite
         # Only ever EXTEND an active halt, never shorten it. With one automatic
-        # kill left this can no longer collide with itself, but the manual /kill
-        # is indefinite and must not be downgraded to a 4h drawdown halt that
-        # happens to fire after it. Keep whichever halt reaches further into the
-        # future (indefinite always wins).
+        # kill left nothing here collides today, but the rule is what makes a
+        # second engage_kill during an active halt safe: a later, shorter
+        # deadline must not resume trading early. Keep whichever reaches further
+        # into the future (0 = indefinite always wins).
         if self.state.kill_active:
             cur = self.state.kill_until_ts
             if cur == 0:
