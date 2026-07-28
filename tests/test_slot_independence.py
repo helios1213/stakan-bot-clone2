@@ -346,3 +346,59 @@ class TestKillSwitchReset:
         got = c.release_kill()
         assert isinstance(got, tuple) and len(got) == 2
         assert got[0] is False
+
+
+class TestDrawdownScalesWithSize:
+    """A dollar limit is stale the moment sizing changes — and it changed 2.5x.
+
+    Every historical drawdown was measured at ~$1,400 of notional, so $20 was
+    silently equivalent to $8 once PEPE moved to $2,755 — inside ordinary
+    variance, which is why it fired on profitable days. The two live slots also
+    differ ninefold ($2,755 vs $292), so no single number fits both.
+    """
+
+    @staticmethod
+    def _ctl():
+        from src.execution.live_safety import LiveSafetyController
+        return LiveSafetyController()
+
+    def test_limit_is_the_dollar_fallback_until_size_is_known(self):
+        c = self._ctl()
+        assert c.state.avg_notional_usdt == 0.0
+        assert c.drawdown_limit() == c.max_drawdown_usdt
+
+    def test_limit_tracks_the_position_size(self):
+        c = self._ctl()
+        c.record_close("1000PEPEUSDT", 0.0, notional_usdt=2755.0)
+        assert abs(c.drawdown_limit() - 68.9) < 0.5      # 2.5% of 2,755
+        d = self._ctl()
+        d.record_close("LINKUSDT", 0.0, notional_usdt=292.0)
+        assert abs(d.drawdown_limit() - 7.3) < 0.5       # 2.5% of 292
+
+    def test_a_big_slot_survives_what_would_have_killed_it_before(self):
+        """$25 of drawdown at $2,755 notional is ordinary; the old $20 killed it."""
+        c = self._ctl()
+        c.record_close("1000PEPEUSDT", +30.0, notional_usdt=2755.0)
+        c.record_close("1000PEPEUSDT", -25.0, notional_usdt=2755.0)
+        assert c.state.kill_active is False
+        c.record_close("1000PEPEUSDT", -45.0, notional_usdt=2755.0)   # 70 below peak
+        assert c.state.kill_active is True
+
+    def test_a_small_slot_is_protected_proportionally(self):
+        """The same $25 on a $292 position IS an emergency."""
+        c = self._ctl()
+        c.record_close("LINKUSDT", +2.0, notional_usdt=292.0)
+        c.record_close("LINKUSDT", -25.0, notional_usdt=292.0)
+        assert c.state.kill_active is True
+
+    def test_floor_stops_a_bad_notional_making_a_penny_limit(self):
+        c = self._ctl()
+        c.record_close("X", 0.0, notional_usdt=1.0)
+        assert c.drawdown_limit() == c.min_drawdown_usdt
+
+    def test_size_is_smoothed_not_snapped(self):
+        """Margin and leverage are randomised ~15% per trade."""
+        c = self._ctl()
+        c.record_close("X", 0.0, notional_usdt=1000.0)
+        c.record_close("X", 0.0, notional_usdt=2000.0)
+        assert 1000 < c.state.avg_notional_usdt < 1200

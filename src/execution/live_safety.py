@@ -36,6 +36,11 @@ class SafetyState:
     peak_pnl: float = 0.0        # session high-water mark (for the drawdown kill)
     today_trades: int = 0
     consecutive_losses: int = 0
+    # Smoothed notional of a position on this slot — the drawdown limit
+    # is a percentage of it, so a resize retunes the kill automatically.
+    avg_notional_usdt: float = 0.0
+    _logged_dd_step: int = 0        # deepest quarter-of-limit already logged
+    _logged_peak: float = 0.0
     kill_active: bool = False
     kill_reason: str = ""
     kill_until_ts: int = 0  # 0 = indefinite
@@ -56,7 +61,13 @@ class LiveSafetyController:
         # the session high-water mark, which catches a genuine bleed even inside
         # a net-positive day. SINGLE SOURCE = env LIVE_MAX_DRAWDOWN
         # (main.py → LivePool → here); this is only the unset-env fallback.
-        max_drawdown_usdt: float = 20.0,
+        max_drawdown_usdt: float = 20.0,       # fallback until size is known
+        # Fraction of ONE position's notional. The worst drawdown in 21 days
+        # of live trading was $29.72 at ~$1,400 notional = 2.1%; 2.5% sits
+        # just above everything observed at any size.
+        drawdown_pct_of_notional: float = 0.025,
+        min_drawdown_usdt: float = 5.0,        # a bad notional must not
+                                               # produce a limit of pennies
         kill_pause_sec: int = 14400,                    # 4h pause
 
         # Per-symbol limits
@@ -67,6 +78,8 @@ class LiveSafetyController:
         max_margin_per_trade_usdt: float = 10.0,        # never risk more than this
     ) -> None:
         self.max_drawdown_usdt = max_drawdown_usdt
+        self.drawdown_pct_of_notional = drawdown_pct_of_notional
+        self.min_drawdown_usdt = min_drawdown_usdt
         self.kill_pause_sec = kill_pause_sec
         self.max_concurrent_per_symbol = max_concurrent_per_symbol
         self.max_concurrent_total = max_concurrent_total
@@ -100,6 +113,8 @@ class LiveSafetyController:
             self.state.peak_pnl = 0.0
             self.state.today_trades = 0
             self.state.consecutive_losses = 0
+            self.state._logged_dd_step = 0
+            self.state._logged_peak = 0.0
             # Don't reset kill_active here — kill persists until kill_until_ts
             self._daily_reset_at_ts = self._next_reset_ts()
 
@@ -158,10 +173,25 @@ class LiveSafetyController:
             self.state.open_live_positions.get(symbol, 0) + 1
         )
 
+    def drawdown_limit(self) -> float:
+        """Dollars of drawdown this slot may take, at its CURRENT position size.
+
+        A fixed dollar limit is stale the moment sizing changes — and the two
+        slots differ ninefold today, so no single number fits both. Falls back
+        to the configured dollar value until the first close reveals the size.
+        """
+        if self.state.avg_notional_usdt <= 0:
+            return self.max_drawdown_usdt
+        return max(self.min_drawdown_usdt,
+                   self.drawdown_pct_of_notional * self.state.avg_notional_usdt)
+
     def record_close(self, symbol: str, pnl_usdt: float,
-                     max_drawdown_usdt: float | None = None) -> None:
-        """Note that a live position was closed. max_drawdown_usdt lets the
-        caller pass a per-pair drawdown limit; None uses the controller default."""
+                     notional_usdt: float | None = None) -> None:
+        """Note that a live position was closed.
+
+        notional_usdt teaches the controller this slot's position size, which
+        sets the drawdown limit. Omitting it leaves the previous estimate.
+        """
         # Decrement counter
         if symbol in self.state.open_live_positions:
             self.state.open_live_positions[symbol] = max(
@@ -183,14 +213,46 @@ class LiveSafetyController:
         # PRIMARY kill — PEAK DRAWDOWN: PnL fell >= limit below the session high.
         # The real "bleed" catch: fires even inside a net-positive day, is not
         # masked by earlier profit, and does not depend on the UTC-midnight reset.
-        dd_limit = max_drawdown_usdt if max_drawdown_usdt is not None else self.max_drawdown_usdt
+        # Learn the size. EMA because margin and leverage are randomised per
+        # trade by ~15% and the limit should not jitter with them.
+        if notional_usdt and notional_usdt > 0:
+            a = self.state.avg_notional_usdt
+            self.state.avg_notional_usdt = (
+                notional_usdt if a <= 0 else 0.9 * a + 0.1 * notional_usdt)
+
+        dd_limit = self.drawdown_limit()
         drawdown = self.state.peak_pnl - self.state.today_pnl
+        self._log_equity(drawdown, dd_limit)
         if dd_limit > 0 and drawdown >= dd_limit:
             self.engage_kill(
                 reason=(f"drawdown ${drawdown:.2f} from session peak "
                         f"${self.state.peak_pnl:.2f} (limit ${dd_limit:.2f})"),
                 duration_sec=self.kill_pause_sec,
             )
+
+    def _log_equity(self, drawdown: float, dd_limit: float) -> None:
+        """Make the peak and the drawdown visible without spamming the log.
+
+        One line when the peak advances by a quarter of the limit, and one each
+        time the drawdown deepens past another quarter of it. At ~2,000 trades a
+        day a line per close would be unreadable.
+        """
+        step = int(drawdown / dd_limit * 4) if dd_limit > 0 else 0
+        if step > self.state._logged_dd_step:
+            self.state._logged_dd_step = step
+            logger.info(
+                "[EQUITY] slot PnL $%+.2f, peak $%+.2f, drawdown $%.2f of $%.2f "
+                "(%.0f%%, position ~$%.0f)",
+                self.state.today_pnl, self.state.peak_pnl, drawdown, dd_limit,
+                100 * drawdown / dd_limit, self.state.avg_notional_usdt)
+        elif self.state.peak_pnl >= self.state._logged_peak + dd_limit / 4:
+            self.state._logged_peak = self.state.peak_pnl
+            self.state._logged_dd_step = 0
+            logger.info(
+                "[EQUITY] slot new peak $%+.2f (limit $%.2f, position ~$%.0f)",
+                self.state.peak_pnl, dd_limit, self.state.avg_notional_usdt)
+        elif step == 0:
+            self.state._logged_dd_step = 0
 
     def engage_kill(self, reason: str, duration_sec: int = 0) -> None:
         """
@@ -251,6 +313,8 @@ class LiveSafetyController:
         self.state.kill_reason = ""
         self.state.kill_until_ts = 0
         self.state.peak_pnl = self.state.today_pnl
+        self.state._logged_dd_step = 0
+        self.state._logged_peak = self.state.today_pnl
         if was_active:
             logger.warning(
                 "Kill switch RELEASED by operator (was: %s) — drawdown baseline "

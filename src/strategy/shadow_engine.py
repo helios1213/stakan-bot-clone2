@@ -2876,7 +2876,9 @@ class ShadowEngine:
         # fees in daily_pnl and trip the kill switch with real PnL
         # nowhere near the threshold.
         if safety_for_close is not None:
-            safety_for_close.record_close(pos.symbol, pos.net_pnl_usdt)
+            safety_for_close.record_close(
+                pos.symbol, pos.net_pnl_usdt,
+                notional_usdt=(pos.margin_usdt or 0) * (pos.leverage or 0))
             ss = safety_for_close.state_summary()
             if ss["kill_active"]:
                 logger.warning(
@@ -3057,6 +3059,7 @@ class ShadowEngine:
                     try:
                         safety_for_close.record_close(
                             pos.symbol, pos.net_pnl_usdt or 0.0,
+                            notional_usdt=(pos.margin_usdt or 0) * (pos.leverage or 0),
                         )
                         logger.info(
                             "[EXTERNAL CLOSE] safety counter decremented "

@@ -499,7 +499,13 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
                         # Converted locally — internal_sym above is only bound
                         # inside the live_db branch.
                         from src.exchanges.mexc_rest import to_binance as _to_int
-                        _safety.record_close(_to_int(symbol), _pnl)
+                        # Computed here, not reused from the live_db branch
+                        # above: `notional` is bound only inside it, and the
+                        # NameError would be swallowed by the except below.
+                        from src.execution.live_executor import CONTRACT_SIZES as _CS
+                        _notional = _exit * qty * _CS.get(symbol, 1.0)
+                        _safety.record_close(_to_int(symbol), _pnl,
+                                             notional_usdt=_notional)
                 except Exception:
                     logger.exception(
                         "[RECONCILE] failed to record orphan %s in safety", symbol,
