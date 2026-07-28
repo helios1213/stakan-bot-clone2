@@ -291,8 +291,7 @@ class TestKillSwitchReset:
         c.clear_kill()
         assert c.state.peak_pnl == -8.0
 
-    def test_clear_kill_does_not_grant_a_fresh_day(self):
-        """today_pnl and the loss streak stay — the -$10 backstop must still fire."""
+    def test_clear_kill_keeps_the_days_real_pnl_on_the_record(self):
         c = self._ctl()
         c.state.today_pnl = -9.5
         c.state.consecutive_losses = 4
@@ -300,6 +299,32 @@ class TestKillSwitchReset:
         c.clear_kill()
         assert c.state.today_pnl == -9.5
         assert c.state.consecutive_losses == 4
+
+    def test_clear_kill_stops_the_backstop_re_firing_on_the_next_close(self):
+        """Without a moving baseline the button bought exactly one trade."""
+        c = self._ctl()
+        c.state.today_pnl = -12.0          # already past the -$10 backstop
+        c.state.kill_active = True
+        c.clear_kill()
+        assert c.state.daily_loss_baseline == -12.0
+        c.record_close("1000PEPEUSDT", -0.20)
+        assert c.state.kill_active is False, "backstop re-fired immediately"
+
+    def test_backstop_still_fires_once_the_new_allowance_is_spent(self):
+        c = self._ctl()
+        c.state.today_pnl = -12.0
+        c.state.kill_active = True
+        c.clear_kill()
+        c.record_close("1000PEPEUSDT", -10.5)   # spends the fresh $10
+        assert c.state.kill_active is True
+
+    def test_midnight_clears_the_backstop_baseline(self):
+        import time as _t
+        c = self._ctl()
+        c.state.daily_loss_baseline = -12.0
+        c._daily_reset_at_ts = int(_t.time()) - 1
+        c._maybe_reset_daily()
+        assert c.state.daily_loss_baseline == 0.0
 
     def test_clear_kill_is_safe_when_nothing_is_active(self):
         c = self._ctl()

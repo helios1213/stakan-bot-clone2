@@ -239,7 +239,7 @@ def _kb_slot_config(slot) -> InlineKeyboardMarkup:
         # the other, healthy slot.
         rows.append([
             InlineKeyboardButton(
-                "🛡 Reset kill switch",
+                "🔓 Reset kill switch",
                 callback_data=f"m:slot:{slot.slot_id}:kill_reset",
             ),
         ])

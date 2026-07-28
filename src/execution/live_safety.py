@@ -25,6 +25,10 @@ class SafetyState:
     """Per-day live trading state."""
     today_pnl: float = 0.0
     peak_pnl: float = 0.0        # session high-water mark (for the drawdown kill)
+    # Where the cumulative backstop measures from. Moves only when the
+    # operator clears a kill, so a reset grants another full allowance
+    # instead of re-firing on the next close.
+    daily_loss_baseline: float = 0.0
     today_trades: int = 0
     consecutive_losses: int = 0
     kill_active: bool = False
@@ -103,6 +107,7 @@ class LiveSafetyController:
             )
             self.state.today_pnl = 0.0
             self.state.peak_pnl = 0.0
+            self.state.daily_loss_baseline = 0.0
             self.state.today_trades = 0
             self.state.consecutive_losses = 0
             # Don't reset kill_active here — kill persists until kill_until_ts
@@ -166,9 +171,11 @@ class LiveSafetyController:
         next losing close instantly re-crosses the drawdown limit and kills
         again, turning the button into a no-op.
 
-        today_pnl and consecutive_losses are deliberately NOT reset — the
-        cumulative -$10 backstop must still be able to fire on a genuinely bad
-        day. This lifts one kill, it does not grant a fresh day.
+        today_pnl and consecutive_losses are NOT reset — the day's real PnL
+        stays on the record. What moves are the two BASELINES the kills
+        measure from, so each one gets a full allowance again from here.
+        That is an override: pressing it repeatedly through a real bleed will
+        keep letting the slot trade.
         """
         was = self.state.kill_active
         reason = self.state.kill_reason
@@ -176,9 +183,13 @@ class LiveSafetyController:
         self.state.kill_reason = ""
         self.state.kill_until_ts = 0
         self.state.peak_pnl = self.state.today_pnl
+        # Same for the cumulative backstop: without this, a day already at
+        # or below the threshold re-kills on the very next close and the
+        # button buys exactly one trade.
+        self.state.daily_loss_baseline = self.state.today_pnl
         if was:
             logger.warning(
-                "Kill switch cleared by operator (was: %s) — drawdown baseline "
+                "Kill switch cleared by operator (was: %s) — both baselines "
                 "reset to $%.2f", reason, self.state.today_pnl)
         return was, reason
 
@@ -224,9 +235,12 @@ class LiveSafetyController:
 
         # BACKSTOP kill — absolute cumulative daily loss (rarely binds for a
         # profitable pair, but catches a bad-from-open day fast).
-        if self.state.today_pnl <= self.daily_loss_kill_threshold_usdt:
+        _since_reset = self.state.today_pnl - self.state.daily_loss_baseline
+        if _since_reset <= self.daily_loss_kill_threshold_usdt:
             self.engage_kill(
-                reason=f"daily PnL ${self.state.today_pnl:.2f} hit threshold",
+                reason=(f"daily PnL ${self.state.today_pnl:.2f} hit threshold"
+                        + (f" (${_since_reset:.2f} since reset)"
+                           if self.state.daily_loss_baseline else "")),
                 duration_sec=self.daily_loss_kill_duration_sec,
             )
 
