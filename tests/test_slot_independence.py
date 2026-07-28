@@ -171,3 +171,22 @@ async def test_gate_skips_never_exceed_slot_passes():
              + eng.signals_skipped_max_positions
              + eng.signals_skipped_pending_submit)
     assert drops <= eng.signals_fanned_out
+
+
+# ── one open alert per position actually opened ───────────────────────
+
+@pytest.mark.asyncio
+async def test_open_position_returns_what_it_created():
+    """The alert wrapper announces the RETURNED position.
+
+    Reading _open_positions[symbol][-1] announced the previous, still-open
+    position whenever a call opened nothing (clone, 28.07 08:20: two identical
+    [LIVE OPEN] messages for one trade).
+    """
+    from src.strategy.shadow_engine import ShadowEngine
+    import inspect
+
+    src = inspect.getsource(ShadowEngine._open_position)
+    assert "return pos" in src, "_open_position must return the position it created"
+    # Every early exit must yield None so the wrapper stays silent.
+    assert src.count("return pos") == 1

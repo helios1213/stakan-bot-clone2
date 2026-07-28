@@ -894,15 +894,15 @@ async def main() -> None:
     _original_close = shadow_engine._close_position
 
     async def _open_position_with_alert(*args, **kwargs):
-        await _original_open(*args, **kwargs)
-        # Alert about the latest opened position
+        # The engine returns the position IT created, or None. Reading
+        # _open_positions[symbol][-1] instead announced the previous, still-open
+        # position whenever this call opened nothing — two identical
+        # [LIVE OPEN] messages for one trade — and could not be made correct
+        # anyway once two slots open concurrently on the same signal.
+        opened = await _original_open(*args, **kwargs)
         try:
-            sig = args[0] if args else kwargs.get("signal")
-
-            # Find the position we just opened (last appended)
-            positions = shadow_engine._open_positions.get(sig.symbol, [])
-            if positions:
-                pos = positions[-1]
+            if opened is not None:
+                pos = opened
                 # Telegram alerts limited to LIVE trades only.
                 # Shadow can fire 50+ trades/min on bursty markets which
                 # exceeds Telegram's per-chat rate limit (~20 msg/min),

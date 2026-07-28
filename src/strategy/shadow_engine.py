@@ -1203,8 +1203,11 @@ class ShadowEngine:
         chosen_margin: float = 25.0,
         chosen_leverage: int = 50,
         pin_slot=None,
-    ) -> None:
-        """Create ShadowPosition + start watcher task."""
+    ):
+        """Create ShadowPosition + start watcher task.
+
+        Returns the ShadowPosition on success, None when nothing was opened.
+        """
         # latency tracking: signal_to_pickup_ms.
         # signal.created_at_ms = when the detector emitted the signal.
         # now_ms = when we (the engine) picked it up for execution.
@@ -1883,6 +1886,11 @@ class ShadowEngine:
                 "[peak-listener] failed to register for %s — falling back to polling",
                 pos.symbol,
             )
+
+        # The caller announces THIS position. Returning it is the only
+        # unambiguous answer once two slots can open concurrently on one
+        # signal — reading the list afterwards cannot tell whose is whose.
+        return pos
 
     # ============================================================
     # Position watcher
