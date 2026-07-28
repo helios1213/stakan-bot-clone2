@@ -41,14 +41,10 @@ class LiveExecutorPool:
         webkey_store,       # WebkeyStore
         alerts=None,        # Optional[TelegramAlerts]
         private_ws_pool=None,  # Optional[MexcPrivateWSPool] — push-based fills
-        # Default safety params (per slot, can be overridden per slot later).
-        # SINGLE SOURCE OF TRUTH = env LIVE_DAILY_LOSS_KILL (read in main.py
-        # and passed in here). This -10.0 is ONLY the fallback if env is unset;
-        # keep it aligned with main.py's env-default so there's no divergent
-        # value floating around. To change the threshold, edit the .env file.
-        default_daily_loss_kill_usdt: float = -10.0,
-        default_max_drawdown_usdt: float = 30.0,
-        default_max_consec_losses: int = 5,
+        # Default safety params (per slot). SINGLE SOURCE OF TRUTH = env
+        # LIVE_MAX_DRAWDOWN (read in main.py and passed in here); this is
+        # ONLY the fallback if env is unset. To change it, edit .env.
+        default_max_drawdown_usdt: float = 20.0,
         default_max_per_symbol: int = 1,
         default_max_total: int = 1,
         default_max_margin_usdt: float = 10.0,
@@ -57,9 +53,7 @@ class LiveExecutorPool:
         self.webkey_store = webkey_store
         self.alerts = alerts
         self.private_ws_pool = private_ws_pool
-        self.default_daily_loss_kill_usdt = default_daily_loss_kill_usdt
         self.default_max_drawdown_usdt = default_max_drawdown_usdt
-        self.default_max_consec_losses = default_max_consec_losses
         self.default_max_per_symbol = default_max_per_symbol
         self.default_max_total = default_max_total
         self.default_max_margin_usdt = default_max_margin_usdt
@@ -103,9 +97,7 @@ class LiveExecutorPool:
                     private_ws_pool=self.private_ws_pool,
                 )
                 self._safety_controllers[sid] = LiveSafetyController(
-                    daily_loss_kill_threshold_usdt=self.default_daily_loss_kill_usdt,
                     max_drawdown_usdt=self.default_max_drawdown_usdt,
-                    max_consecutive_losses=self.default_max_consec_losses,
                     max_concurrent_per_symbol=self.default_max_per_symbol,
                     max_concurrent_total=self.default_max_total,
                     max_margin_per_trade_usdt=self.default_max_margin_usdt,

@@ -300,31 +300,40 @@ class TestKillSwitchReset:
         assert c.state.today_pnl == -9.5
         assert c.state.consecutive_losses == 4
 
-    def test_clear_kill_stops_the_backstop_re_firing_on_the_next_close(self):
-        """Without a moving baseline the button bought exactly one trade."""
+    def test_drawdown_is_the_only_kill(self):
+        """A deep cumulative loss with no drawdown from the peak must NOT kill."""
         c = self._ctl()
-        c.state.today_pnl = -12.0          # already past the -$10 backstop
-        c.state.kill_active = True
-        c.clear_kill()
-        assert c.state.daily_loss_baseline == -12.0
-        c.record_close("1000PEPEUSDT", -0.20)
-        assert c.state.kill_active is False, "backstop re-fired immediately"
+        c.state.today_pnl = -50.0      # would have tripped the old -$10 backstop
+        c.state.peak_pnl = -50.0       # but never fell below its own high-water mark
+        c.record_close("1000PEPEUSDT", 0.0)
+        assert c.state.kill_active is False
 
-    def test_backstop_still_fires_once_the_new_allowance_is_spent(self):
+    def test_a_long_losing_streak_no_longer_kills(self):
+        """5-in-a-row used to pause the slot for an hour on ordinary variance."""
         c = self._ctl()
-        c.state.today_pnl = -12.0
-        c.state.kill_active = True
-        c.clear_kill()
-        c.record_close("1000PEPEUSDT", -10.5)   # spends the fresh $10
+        for _ in range(12):
+            c.record_close("1000PEPEUSDT", -0.05)
+        assert c.state.consecutive_losses == 12   # still counted, for the alert
+        assert c.state.kill_active is False
+
+    def test_drawdown_fires_at_twenty(self):
+        c = self._ctl()
+        c.record_close("1000PEPEUSDT", +5.0)      # peak = 5
+        assert c.state.kill_active is False
+        c.record_close("1000PEPEUSDT", -14.0)     # -9 total, 14 below peak
+        assert c.state.kill_active is False
+        c.record_close("1000PEPEUSDT", -6.0)      # -15 total, 20 below peak
         assert c.state.kill_active is True
 
-    def test_midnight_clears_the_backstop_baseline(self):
-        import time as _t
+    def test_clear_kill_gives_the_full_room_back(self):
         c = self._ctl()
-        c.state.daily_loss_baseline = -12.0
-        c._daily_reset_at_ts = int(_t.time()) - 1
-        c._maybe_reset_daily()
-        assert c.state.daily_loss_baseline == 0.0
+        c.state.peak_pnl = 5.0
+        c.state.today_pnl = -16.0
+        c.state.kill_active = True
+        c.clear_kill()
+        assert c.state.peak_pnl == -16.0
+        c.record_close("1000PEPEUSDT", -1.0)      # only $1 below the new mark
+        assert c.state.kill_active is False
 
     def test_clear_kill_is_safe_when_nothing_is_active(self):
         c = self._ctl()

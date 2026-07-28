@@ -25,10 +25,6 @@ class SafetyState:
     """Per-day live trading state."""
     today_pnl: float = 0.0
     peak_pnl: float = 0.0        # session high-water mark (for the drawdown kill)
-    # Where the cumulative backstop measures from. Moves only when the
-    # operator clears a kill, so a reset grants another full allowance
-    # instead of re-firing on the next close.
-    daily_loss_baseline: float = 0.0
     today_trades: int = 0
     consecutive_losses: int = 0
     kill_active: bool = False
@@ -47,22 +43,12 @@ class LiveSafetyController:
 
     def __init__(
         self,
-        # Daily loss limits. Threshold SINGLE SOURCE = env LIVE_DAILY_LOSS_KILL
-        # (main.py → LivePool → here); this -10.0 is only the unset-env fallback.
-        daily_loss_kill_threshold_usdt: float = -10.0,  # halt if daily PnL <= this
-        daily_loss_kill_duration_sec: int = 14400,      # 4h pause (was 24h)
-
-        # Peak-drawdown kill = the REAL bleed detector. Halt if PnL falls this
-        # far BELOW the session high-water mark. Catches a genuine bleed even
-        # inside a net-positive day (the cumulative threshold above cannot — a
-        # profitable day masks a late bleed, and the UTC-midnight reset splits
-        # it). Set ABOVE normal recoverable drawdown (PEPE ~$27, TAO ~$17 max);
-        # $30 default fires only on a worse-than-ever regime, not normal vol.
-        max_drawdown_usdt: float = 30.0,
-
-        # Consecutive losses
-        max_consecutive_losses: int = 5,
-        consecutive_loss_pause_sec: int = 3600,         # 1h pause
+        # THE kill switch — peak drawdown. Halt if PnL falls this far BELOW
+        # the session high-water mark, which catches a genuine bleed even inside
+        # a net-positive day. SINGLE SOURCE = env LIVE_MAX_DRAWDOWN
+        # (main.py → LivePool → here); this is only the unset-env fallback.
+        max_drawdown_usdt: float = 20.0,
+        kill_pause_sec: int = 14400,                    # 4h pause
 
         # Per-symbol limits
         max_concurrent_per_symbol: int = 1,
@@ -71,11 +57,8 @@ class LiveSafetyController:
         # Margin sanity
         max_margin_per_trade_usdt: float = 10.0,        # never risk more than this
     ) -> None:
-        self.daily_loss_kill_threshold_usdt = daily_loss_kill_threshold_usdt
-        self.daily_loss_kill_duration_sec = daily_loss_kill_duration_sec
         self.max_drawdown_usdt = max_drawdown_usdt
-        self.max_consecutive_losses = max_consecutive_losses
-        self.consecutive_loss_pause_sec = consecutive_loss_pause_sec
+        self.kill_pause_sec = kill_pause_sec
         self.max_concurrent_per_symbol = max_concurrent_per_symbol
         self.max_concurrent_total = max_concurrent_total
         self.max_margin_per_trade_usdt = max_margin_per_trade_usdt
@@ -84,10 +67,9 @@ class LiveSafetyController:
         self._daily_reset_at_ts = self._next_reset_ts()
 
         logger.info(
-            "LiveSafetyController initialized: max_drawdown=$%.2f (primary), "
-            "daily_loss_kill=$%.2f (backstop), max_concurrent=%d, max_margin/trade=$%.2f",
+            "LiveSafetyController initialized: max_drawdown=$%.2f (the only "
+            "kill), max_concurrent=%d, max_margin/trade=$%.2f",
             max_drawdown_usdt,
-            daily_loss_kill_threshold_usdt,
             max_concurrent_total,
             max_margin_per_trade_usdt,
         )
@@ -107,7 +89,6 @@ class LiveSafetyController:
             )
             self.state.today_pnl = 0.0
             self.state.peak_pnl = 0.0
-            self.state.daily_loss_baseline = 0.0
             self.state.today_trades = 0
             self.state.consecutive_losses = 0
             # Don't reset kill_active here — kill persists until kill_until_ts
@@ -172,8 +153,8 @@ class LiveSafetyController:
         again, turning the button into a no-op.
 
         today_pnl and consecutive_losses are NOT reset — the day's real PnL
-        stays on the record. What moves are the two BASELINES the kills
-        measure from, so each one gets a full allowance again from here.
+        stays on the record. What moves is the high-water mark the drawdown
+        is measured from, so the slot gets a full $20 of room again from here.
         That is an override: pressing it repeatedly through a real bleed will
         keep letting the slot trade.
         """
@@ -183,13 +164,9 @@ class LiveSafetyController:
         self.state.kill_reason = ""
         self.state.kill_until_ts = 0
         self.state.peak_pnl = self.state.today_pnl
-        # Same for the cumulative backstop: without this, a day already at
-        # or below the threshold re-kills on the very next close and the
-        # button buys exactly one trade.
-        self.state.daily_loss_baseline = self.state.today_pnl
         if was:
             logger.warning(
-                "Kill switch cleared by operator (was: %s) — both baselines "
+                "Kill switch cleared by operator (was: %s) — drawdown baseline "
                 "reset to $%.2f", reason, self.state.today_pnl)
         return was, reason
 
@@ -230,25 +207,7 @@ class LiveSafetyController:
             self.engage_kill(
                 reason=(f"drawdown ${drawdown:.2f} from session peak "
                         f"${self.state.peak_pnl:.2f} (limit ${dd_limit:.2f})"),
-                duration_sec=self.daily_loss_kill_duration_sec,
-            )
-
-        # BACKSTOP kill — absolute cumulative daily loss (rarely binds for a
-        # profitable pair, but catches a bad-from-open day fast).
-        _since_reset = self.state.today_pnl - self.state.daily_loss_baseline
-        if _since_reset <= self.daily_loss_kill_threshold_usdt:
-            self.engage_kill(
-                reason=(f"daily PnL ${self.state.today_pnl:.2f} hit threshold"
-                        + (f" (${_since_reset:.2f} since reset)"
-                           if self.state.daily_loss_baseline else "")),
-                duration_sec=self.daily_loss_kill_duration_sec,
-            )
-
-        # Check consecutive losses
-        if self.state.consecutive_losses >= self.max_consecutive_losses:
-            self.engage_kill(
-                reason=f"{self.state.consecutive_losses} consecutive losses",
-                duration_sec=self.consecutive_loss_pause_sec,
+                duration_sec=self.kill_pause_sec,
             )
 
     def engage_kill(self, reason: str, duration_sec: int = 0) -> None:

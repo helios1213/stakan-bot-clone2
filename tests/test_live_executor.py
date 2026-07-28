@@ -216,10 +216,7 @@ class TestLiveExecutorClose:
 
 class TestLiveSafety:
     def test_default_allows_open(self):
-        ctl = LiveSafetyController(
-            daily_loss_kill_threshold_usdt=-3.0,
-            max_margin_per_trade_usdt=10.0,
-        )
+        ctl = LiveSafetyController(max_margin_per_trade_usdt=10.0)
         allowed, reason = ctl.can_open_live("ZECUSDT", margin_usdt=5.0)
         assert allowed is True
 
@@ -236,26 +233,28 @@ class TestLiveSafety:
         assert allowed is False
         assert "kill_active" in reason
 
-    def test_consecutive_losses_engage_kill(self):
-        ctl = LiveSafetyController(max_consecutive_losses=3)
-        for _ in range(3):
-            ctl.record_close("ZECUSDT", pnl_usdt=-1.0)
-        assert ctl.is_killed() is True
+    def test_consecutive_losses_no_longer_kill(self):
+        """The 5-in-a-row pause fired on ordinary variance, not on a bleed."""
+        ctl = LiveSafetyController()
+        for _ in range(10):
+            ctl.record_close("ZECUSDT", pnl_usdt=-0.01)
+        assert ctl.state.consecutive_losses == 10   # still counted for the alert
+        assert ctl.is_killed() is False
 
     def test_winning_trade_resets_consec_losses(self):
-        ctl = LiveSafetyController(max_consecutive_losses=3)
+        ctl = LiveSafetyController()
         ctl.record_close("ZECUSDT", pnl_usdt=-1.0)
         ctl.record_close("ZECUSDT", pnl_usdt=-1.0)
         ctl.record_close("ZECUSDT", pnl_usdt=2.0)  # win — reset
-        ctl.record_close("ZECUSDT", pnl_usdt=-1.0)
-        ctl.record_close("ZECUSDT", pnl_usdt=-1.0)
-        assert ctl.is_killed() is False  # only 2 losses in a row after win
+        assert ctl.state.consecutive_losses == 0
 
-    def test_daily_loss_kill_threshold(self):
-        ctl = LiveSafetyController(daily_loss_kill_threshold_usdt=-3.0)
-        ctl.record_close("ZECUSDT", pnl_usdt=-2.0)
+    def test_cumulative_loss_alone_no_longer_kills(self):
+        """Only a fall from the session high-water mark halts a slot now."""
+        ctl = LiveSafetyController(max_drawdown_usdt=20.0)
+        for _ in range(6):
+            ctl.record_close("ZECUSDT", pnl_usdt=-2.0)   # -12 total, peak 0
         assert ctl.is_killed() is False
-        ctl.record_close("ZECUSDT", pnl_usdt=-2.0)
+        ctl.record_close("ZECUSDT", pnl_usdt=-9.0)       # -21 below the peak
         assert ctl.is_killed() is True
 
     def test_per_symbol_concurrent_limit(self):

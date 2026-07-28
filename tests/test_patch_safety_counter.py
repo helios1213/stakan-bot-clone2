@@ -24,7 +24,6 @@ async def test_mark_position_closed_externally_decrements_safety_counter():
     decremented to 0 (i.e. the key removed)."""
     # Build the safety controller and pre-load it with an open position
     safety = LiveSafetyController(
-        daily_loss_kill_threshold_usdt=-100.0,
         max_concurrent_per_symbol=1,
         max_concurrent_total=1,
         max_margin_per_trade_usdt=100.0,
