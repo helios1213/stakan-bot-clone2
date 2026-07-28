@@ -234,3 +234,74 @@ def test_adverse_snapshot_is_optional():
     p.record_peak_snapshot(1000, 2.0)
     assert p.adverse_ticks_at_1000ms is None
     assert p.peak_ticks_at_1000ms == 2.0
+
+
+# ── the open-rate throttle must survive the soft-start removal ─────────
+
+def test_throttle_machinery_intact():
+    """Soft start only CALLED these; removing it must not have taken them.
+
+    Losing any of them silently disables the hold between opens, and the bot
+    then hammers a rate-limited account at ~1,600 requests/hour — the path that
+    has already cost two banned accounts.
+    """
+    from src.strategy import shadow_engine as se
+    for name in ("_arm_open_hold", "_humanize", "_env_float", "open_freq_limit_code"):
+        assert hasattr(se.ShadowEngine, name) or hasattr(se, name), name
+    assert se.OPEN_FREQ_CODES == ("10014", "9082", "2036")
+    assert not hasattr(se, "SOFT_START_HOURS")
+    for gone in ("_soft_start_plan", "_soft_start_now", "_arm_soft_start"):
+        assert not hasattr(se.ShadowEngine, gone), f"{gone} survived"
+
+
+def test_slot_config_still_carries_the_throttle_deadline():
+    """live_pool's soft-start comment headed THREE keys; the third is the latch."""
+    import inspect
+    from src.execution import live_pool
+    src = inspect.getsource(live_pool.LiveExecutorPool.get_slot_config)
+    assert '"open_throttle_until"' in src
+    assert "soft_start" not in src
+
+
+class TestKillSwitchReset:
+    """The kill lives only in memory, so a restart was the only way to lift it."""
+
+    @staticmethod
+    def _ctl():
+        from src.execution.live_safety import LiveSafetyController
+        return LiveSafetyController()
+
+    def test_clear_kill_reports_and_lifts(self):
+        c = self._ctl()
+        c.state.kill_active = True
+        c.state.kill_reason = "drawdown $31.00 from session peak"
+        c.state.kill_until_ts = 2 ** 31
+        was, why = c.clear_kill()
+        assert was is True and "drawdown" in why
+        assert c.state.kill_active is False and c.state.kill_until_ts == 0
+        allowed, _ = c.can_open_live("1000PEPEUSDT", 10.0)
+        assert allowed is True
+
+    def test_clear_kill_rebaselines_the_high_water_mark(self):
+        """Without this the next losing close instantly re-kills."""
+        c = self._ctl()
+        c.state.peak_pnl = 25.0
+        c.state.today_pnl = -8.0
+        c.state.kill_active = True
+        c.clear_kill()
+        assert c.state.peak_pnl == -8.0
+
+    def test_clear_kill_does_not_grant_a_fresh_day(self):
+        """today_pnl and the loss streak stay — the -$10 backstop must still fire."""
+        c = self._ctl()
+        c.state.today_pnl = -9.5
+        c.state.consecutive_losses = 4
+        c.state.kill_active = True
+        c.clear_kill()
+        assert c.state.today_pnl == -9.5
+        assert c.state.consecutive_losses == 4
+
+    def test_clear_kill_is_safe_when_nothing_is_active(self):
+        c = self._ctl()
+        was, why = c.clear_kill()
+        assert was is False and why == ""

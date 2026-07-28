@@ -130,13 +130,6 @@ def _fmt_slot_config(slot, whitelist_lookup: dict | None = None,
     else:
         lines.append("💱 Pair: not assigned")
 
-    _ss = getattr(slot, "soft_start_until", None) or 0
-    if _ss > time.time():
-        _rate = int(getattr(slot, "soft_start_max_per_hour", 0) or 12)
-        lines.append(
-            f"🐣 Soft start: human-like plan "
-            f"({(_ss - time.time()) / 3600:.1f}h left)"
-        )
     if slot.live_enabled:
         if slot.is_live_active:
             lines.append("🟢 Live: ENABLED — real orders will be placed")
@@ -241,14 +234,13 @@ def _kb_slot_config(slot) -> InlineKeyboardMarkup:
         ])
 
     if not slot.is_empty:
-        # Warm-up pacing for a freshly added account: MEXC 30-day-banned both
-        # accounts we lost within their FIRST DAY of use.
-        _ss = getattr(slot, "soft_start_until", None) or 0
+        # The kill switch lives only in the engine's memory, so without this the
+        # only way to lift one is restarting the container — which also stops
+        # the other, healthy slot.
         rows.append([
             InlineKeyboardButton(
-                "✖ Cancel soft start" if _ss > time.time()
-                else "🐣 Soft start (36h)",
-                callback_data=f"m:slot:{slot.slot_id}:soft_start",
+                "🛡 Reset kill switch",
+                callback_data=f"m:slot:{slot.slot_id}:kill_reset",
             ),
         ])
     rows.append([
@@ -448,28 +440,23 @@ async def handle_slot_callback(query, context, data: str) -> None:
             await query.message.reply_text(text, reply_markup=kb)
         return
 
-    if action == "soft_start":
-        # Toggle the account warm-up. While armed, each successful open arms
-        # the slot cooldown for 3600/rate seconds, so the slot paces itself.
-        _cur = await store.get(slot_id)
-        if _cur is None:
+    if action == "kill_reset":
+        # Lift an active safety kill on THIS slot only. The state is in-memory,
+        # so it is reached through the live pool rather than the store.
+        live_pool = context.bot_data.get("live_pool")
+        _was, _why = False, ""
+        if live_pool is not None:
             try:
-                await query.answer("Slot not found")
+                _safety = live_pool.get_safety(slot_id)
+                if _safety is not None:
+                    _was, _why = _safety.clear_kill()
             except Exception:
                 pass
-            return
-        _active = (getattr(_cur, "soft_start_until", None) or 0) > time.time()
-        if _active:
-            await store.set_soft_start(slot_id, None, None)
-            # The hold already armed for the current interval keeps running —
-            # it lives in the engine, not the DB.
-            _msg = "Soft start cancelled — full speed from the next trade"
-        else:
-            _until = int(time.time()) + 36 * 3600
-            await store.set_soft_start(slot_id, _until, 12)
-            _msg = "Soft start ON — human-like 36h plan (8-26 req/h + breaks)"
         try:
-            await query.answer(_msg)
+            await query.answer(
+                f"Kill switch cleared ✅ ({_why[:60]})" if _was
+                else "No kill was active — drawdown baseline re-set anyway"
+            )
         except Exception:
             pass
         slot = await store.get(slot_id)

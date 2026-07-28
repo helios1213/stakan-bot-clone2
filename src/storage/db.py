@@ -611,14 +611,15 @@ async def init_db(db_path: str) -> None:
             ("slot_leverage_min",     "INTEGER"),
             ("slot_leverage_max",     "INTEGER"),
         ])
-        # 2026-07-25: per-slot "soft start" warm-up. MEXC 30-day-banned both
-        # accounts we lost within their FIRST DAY of use, while accounts that
-        # survived day one then ran for weeks at a higher rate. A fresh key can
-        # be capped to N opens/hour until `soft_start_until`; the cap then lifts
-        # by itself. NULL/absent = no cap (exact prior behaviour).
+        # 2026-07-28: the soft-start warm-up columns were removed. The premise
+        # — that MEXC restricts accounts which open too fast in their first day
+        # — did not survive measurement across 11 key installations: at first
+        # restriction, trade counts ranged 0 to 10,735, PnL $0 to ~$900, peak
+        # request rate 2 to 1,425/h and age 0.0h to 131.9h; one key arrived
+        # already limited (0 trades, 2 req/h). Existing databases keep the two
+        # columns orphaned — SQLite has no cheap DROP COLUMN and webkey_slots
+        # holds the encrypted keys. Do NOT add them back.
         await _add_columns_idempotent(db, "webkey_slots", [
-            ("soft_start_until",        "INTEGER"),
-            ("soft_start_max_per_hour", "INTEGER"),
             # Epoch until which MEXC has this account under a 10014 open-rate
             # limit. Persisted because the in-memory latch died on every
             # restart, and a restart is routine (deploy, WS re-warm) — the

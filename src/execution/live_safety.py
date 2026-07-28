@@ -157,6 +157,31 @@ class LiveSafetyController:
 
         return True, ""
 
+    def clear_kill(self) -> tuple[bool, str]:
+        """Operator override: lift an active kill on this slot.
+
+        Returns (was_active, reason_it_had). peak_pnl is re-baselined to the
+        current PnL for the same reason the expiry path does it (see
+        can_open_live): leaving the pre-kill high-water mark standing means the
+        next losing close instantly re-crosses the drawdown limit and kills
+        again, turning the button into a no-op.
+
+        today_pnl and consecutive_losses are deliberately NOT reset — the
+        cumulative -$10 backstop must still be able to fire on a genuinely bad
+        day. This lifts one kill, it does not grant a fresh day.
+        """
+        was = self.state.kill_active
+        reason = self.state.kill_reason
+        self.state.kill_active = False
+        self.state.kill_reason = ""
+        self.state.kill_until_ts = 0
+        self.state.peak_pnl = self.state.today_pnl
+        if was:
+            logger.warning(
+                "Kill switch cleared by operator (was: %s) — drawdown baseline "
+                "reset to $%.2f", reason, self.state.today_pnl)
+        return was, reason
+
     def record_open(self, symbol: str) -> None:
         """Note that a live position was opened (after successful API call)."""
         self.state.open_live_positions[symbol] = (
