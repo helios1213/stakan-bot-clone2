@@ -528,9 +528,9 @@ async def cmd_kill_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_unkill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Release the AUTO kill-switch (daily-loss / consecutive-loss halt) on all
-    live slots. The kill engages automatically but otherwise only clears on a
-    restart — this lifts it without one. It does NOT re-open positions or
+    """Release the automatic peak-drawdown halt on all live slots. The kill
+    engages by itself but otherwise only clears on a restart — this lifts it
+    without one, and hands each slot its full drawdown allowance back. It does NOT re-open positions or
     re-enable a manually disabled slot; it only clears the safety halt so the
     slot can trade live again."""
     live_pool = context.bot_data.get("live_pool")
@@ -541,7 +541,7 @@ async def cmd_unkill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for sid in sorted(getattr(live_pool, "_safety_controllers", {})):
         safety = live_pool.get_safety(sid)
         if safety is not None and safety.is_killed():
-            if safety.release_kill():
+            if safety.release_kill()[0]:
                 released.append(sid)
     if released:
         msg = (

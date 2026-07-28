@@ -26,8 +26,8 @@ class LiveExecutorPool:
     """
     Map slot_id → LiveExecutor instance.
 
-    Each slot ALSO has its own SafetyController (isolated kill switches,
-    isolated daily loss tracking).
+    Each slot ALSO has its own SafetyController, so one account's drawdown
+    halt never stops the other.
 
     Lifecycle:
       - Created at boot (empty)

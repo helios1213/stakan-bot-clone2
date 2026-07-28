@@ -484,10 +484,10 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
                     "[RECONCILE] failed to persist orphan %s to live_trades", symbol,
                 )
 
-            # Count the orphan toward the per-slot daily-loss-kill (in-memory
-            # safety). record_close adds to today_pnl + checks the kill threshold
-            # + consecutive-loss breaker; the open-position decrement is a no-op
-            # for an untracked orphan. Gated on _exit>0 (realised known).
+            # Count the orphan toward the per-slot safety state (in-memory).
+            # record_close adds to today_pnl and re-checks the peak-drawdown
+            # kill; the open-position decrement is a no-op for an untracked
+            # orphan. Gated on _exit>0 (realised known).
             if _exit > 0:
                 try:
                     _safety = live_pool.get_safety(slot_id)

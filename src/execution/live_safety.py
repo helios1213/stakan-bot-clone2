@@ -1,12 +1,22 @@
 """
 Live Safety Controller — protect real capital from runaway bugs and bad markets.
 
-Multiple layers of safety:
-  1. Daily loss kill switch — pause all live trading if daily PnL < threshold
-  2. Consecutive losses pause — pause if N losses in a row
-  3. Manual /kill command — instant halt + force close all positions
-  4. Per-symbol max position count — only 1 live pos per symbol at a time
-  5. Margin sanity check — refuse open if margin exceeds the per-trade cap
+ONE automatic kill, on purpose: PEAK DRAWDOWN. Halt the slot when PnL falls
+LIVE_MAX_DRAWDOWN below the session high-water mark. Measuring from the peak
+rather than from zero is what lets it catch a real bleed inside a day that is
+still net-positive.
+
+A cumulative daily-loss threshold and a consecutive-loss pause used to sit
+alongside it. Both were removed 2026-07-28: a profitable day masked the first
+and the UTC-midnight reset split it, while the second fired on ordinary variance
+(~19 times per 1,330 trades at the observed ~43% losing rate) and paused the
+slot for an hour each time. Three kills writing one flag also made a halt hard
+to attribute. Do not add them back without new evidence.
+
+The remaining guards are not kills, they are admission checks:
+  * manual /kill — instant halt + force close all positions
+  * per-symbol max position count — one live position per symbol at a time
+  * margin sanity — refuse to open if margin exceeds the per-trade cap
 
 All checks are evaluated BEFORE every live entry. State is in-memory
 (no DB persistence — restart resets state, which is intentional for safety).
@@ -143,33 +153,6 @@ class LiveSafetyController:
 
         return True, ""
 
-    def clear_kill(self) -> tuple[bool, str]:
-        """Operator override: lift an active kill on this slot.
-
-        Returns (was_active, reason_it_had). peak_pnl is re-baselined to the
-        current PnL for the same reason the expiry path does it (see
-        can_open_live): leaving the pre-kill high-water mark standing means the
-        next losing close instantly re-crosses the drawdown limit and kills
-        again, turning the button into a no-op.
-
-        today_pnl and consecutive_losses are NOT reset — the day's real PnL
-        stays on the record. What moves is the high-water mark the drawdown
-        is measured from, so the slot gets a full $20 of room again from here.
-        That is an override: pressing it repeatedly through a real bleed will
-        keep letting the slot trade.
-        """
-        was = self.state.kill_active
-        reason = self.state.kill_reason
-        self.state.kill_active = False
-        self.state.kill_reason = ""
-        self.state.kill_until_ts = 0
-        self.state.peak_pnl = self.state.today_pnl
-        if was:
-            logger.warning(
-                "Kill switch cleared by operator (was: %s) — drawdown baseline "
-                "reset to $%.2f", reason, self.state.today_pnl)
-        return was, reason
-
     def record_open(self, symbol: str) -> None:
         """Note that a live position was opened (after successful API call)."""
         self.state.open_live_positions[symbol] = (
@@ -219,13 +202,11 @@ class LiveSafetyController:
         """
         now = int(time.time())
         candidate = (now + duration_sec) if duration_sec > 0 else 0  # 0 = indefinite
-        # Only ever EXTEND an active halt, never shorten it. Several kill
-        # conditions can fire on the same close (a real bleed is BOTH a >$30
-        # drawdown AND, usually, a 5-loss streak). The checks run in order and
-        # the last one (consecutive, 1h) would otherwise overwrite the earlier
-        # 4h drawdown halt with its shorter deadline — resuming into the worst
-        # regime 3h early. Keep whichever halt reaches further into the future
-        # (indefinite always wins).
+        # Only ever EXTEND an active halt, never shorten it. With one automatic
+        # kill left this can no longer collide with itself, but the manual /kill
+        # is indefinite and must not be downgraded to a 4h drawdown halt that
+        # happens to fire after it. Keep whichever halt reaches further into the
+        # future (indefinite always wins).
         if self.state.kill_active:
             cur = self.state.kill_until_ts
             if cur == 0:
@@ -248,15 +229,34 @@ class LiveSafetyController:
             "🚨 KILL SWITCH ENGAGED: %s (duration=%ss)", reason, duration_sec or "indefinite"
         )
 
-    def release_kill(self) -> bool:
-        """Manually release kill switch. Returns True if was active."""
+    def release_kill(self) -> tuple[bool, str]:
+        """Operator override: lift the halt on this slot.
+
+        Returns (was_active, the_reason_it_had).
+
+        peak_pnl is re-baselined to the current PnL for the same reason the
+        expiry path in can_open_live does it: leaving the pre-kill high-water
+        mark standing means the next losing close instantly re-crosses the
+        drawdown limit and kills again, so lifting the halt would buy exactly
+        one trade. The slot gets its full LIVE_MAX_DRAWDOWN of room back from
+        where it now stands.
+
+        today_pnl and consecutive_losses are NOT reset — the day's real PnL
+        stays on the record and in the halt alert. This is an override:
+        pressing it repeatedly through a genuine bleed will keep the slot
+        trading.
+        """
         was_active = self.state.kill_active
+        reason = self.state.kill_reason
         self.state.kill_active = False
         self.state.kill_reason = ""
         self.state.kill_until_ts = 0
+        self.state.peak_pnl = self.state.today_pnl
         if was_active:
-            logger.info("Kill switch RELEASED manually")
-        return was_active
+            logger.warning(
+                "Kill switch RELEASED by operator (was: %s) — drawdown baseline "
+                "reset to $%.2f", reason, self.state.today_pnl)
+        return was_active, reason
 
     def is_killed(self) -> bool:
         self._maybe_reset_daily()

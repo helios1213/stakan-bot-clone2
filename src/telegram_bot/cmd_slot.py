@@ -449,7 +449,7 @@ async def handle_slot_callback(query, context, data: str) -> None:
             try:
                 _safety = live_pool.get_safety(slot_id)
                 if _safety is not None:
-                    _was, _why = _safety.clear_kill()
+                    _was, _why = _safety.release_kill()
             except Exception:
                 pass
         try:

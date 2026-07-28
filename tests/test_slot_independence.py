@@ -264,39 +264,39 @@ def test_slot_config_still_carries_the_throttle_deadline():
 
 
 class TestKillSwitchReset:
-    """The kill lives only in memory, so a restart was the only way to lift it."""
+    """One method lifts the halt; it must also hand the drawdown room back."""
 
     @staticmethod
     def _ctl():
         from src.execution.live_safety import LiveSafetyController
         return LiveSafetyController()
 
-    def test_clear_kill_reports_and_lifts(self):
+    def test_release_kill_reports_and_lifts(self):
         c = self._ctl()
         c.state.kill_active = True
         c.state.kill_reason = "drawdown $31.00 from session peak"
         c.state.kill_until_ts = 2 ** 31
-        was, why = c.clear_kill()
+        was, why = c.release_kill()
         assert was is True and "drawdown" in why
         assert c.state.kill_active is False and c.state.kill_until_ts == 0
         allowed, _ = c.can_open_live("1000PEPEUSDT", 10.0)
         assert allowed is True
 
-    def test_clear_kill_rebaselines_the_high_water_mark(self):
+    def test_release_kill_rebaselines_the_high_water_mark(self):
         """Without this the next losing close instantly re-kills."""
         c = self._ctl()
         c.state.peak_pnl = 25.0
         c.state.today_pnl = -8.0
         c.state.kill_active = True
-        c.clear_kill()
+        c.release_kill()
         assert c.state.peak_pnl == -8.0
 
-    def test_clear_kill_keeps_the_days_real_pnl_on_the_record(self):
+    def test_release_kill_keeps_the_days_real_pnl_on_the_record(self):
         c = self._ctl()
         c.state.today_pnl = -9.5
         c.state.consecutive_losses = 4
         c.state.kill_active = True
-        c.clear_kill()
+        c.release_kill()
         assert c.state.today_pnl == -9.5
         assert c.state.consecutive_losses == 4
 
@@ -325,17 +325,24 @@ class TestKillSwitchReset:
         c.record_close("1000PEPEUSDT", -6.0)      # -15 total, 20 below peak
         assert c.state.kill_active is True
 
-    def test_clear_kill_gives_the_full_room_back(self):
+    def test_release_kill_gives_the_full_room_back(self):
         c = self._ctl()
         c.state.peak_pnl = 5.0
         c.state.today_pnl = -16.0
         c.state.kill_active = True
-        c.clear_kill()
+        c.release_kill()
         assert c.state.peak_pnl == -16.0
         c.record_close("1000PEPEUSDT", -1.0)      # only $1 below the new mark
         assert c.state.kill_active is False
 
-    def test_clear_kill_is_safe_when_nothing_is_active(self):
+    def test_release_kill_is_safe_when_nothing_is_active(self):
         c = self._ctl()
-        was, why = c.clear_kill()
+        was, why = c.release_kill()
         assert was is False and why == ""
+
+    def test_release_kill_returns_a_pair_not_a_bool(self):
+        """bot.py used `if safety.release_kill():` — a tuple is always truthy."""
+        c = self._ctl()
+        got = c.release_kill()
+        assert isinstance(got, tuple) and len(got) == 2
+        assert got[0] is False
