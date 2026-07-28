@@ -234,9 +234,13 @@ class TelegramAlerts:
             f"{size_line}\n"
             f"Detector: <i>{detector_source}</i> gap={gap_ticks:.1f}t"
         )
-        # Per-pair throttle so two slots opening different pairs within 1s
+        # Throttle key carries BOTH the pair and the account: two live slots
+        # now fan out onto the SAME pair, so a per-pair key made two genuine
+        # opens one category and silently dropped one of them.
         # don't drop each other's alert (a shared "trade_open" did).
-        await self.send(text, category=f"trade_open_{symbol}", throttle_sec=1)
+        await self.send(
+            text, category=f"trade_open_{symbol}_{account_label or '-'}",
+            throttle_sec=1)
 
     async def trade_close(
         self,
@@ -335,9 +339,17 @@ class TelegramAlerts:
             f"{reason_emoji} {exit_reason} | duration <b>{duration_str}</b>\n"
             f"{mfe_mae_str}"
         )
-        # Per-pair throttle (was a shared "trade_close" — two slots closing
-        # within 1s dropped one close alert, e.g. BCH close lost behind PENGU's).
-        await self.send(text, category=f"trade_close_{symbol}", throttle_sec=1)
+        # Throttle key carries BOTH the pair and the account. History: it was
+        # once a bare "trade_close" and lost closes across different pairs (BCH
+        # behind PENGU), which the symbol fixed; then signals fanned out to both
+        # live slots on the SAME pair and the same collision returned inside one
+        # symbol. Measured on the clone 2026-07-28 22:07:43 — slot1 and slot2
+        # both closed 1000PEPEUSDT in the same second and only slot2 alerted.
+        # Intermittent because _last_sent is written after the Telegram
+        # round-trip, so concurrent callers sometimes both pass the check.
+        await self.send(
+            text, category=f"trade_close_{symbol}_{account_label or '-'}",
+            throttle_sec=1)
 
     async def error(self, error_text: str, error_category: str = "general") -> None:
         """Fire on errors. Throttled to 1/min per category."""
