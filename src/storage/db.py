@@ -204,6 +204,10 @@ SHADOW_TRADES_V2_COLUMNS = [
     ("peak_ticks_at_1000ms", "REAL"),
     ("peak_ticks_at_1500ms", "REAL"),
     ("peak_ticks_at_2000ms", "REAL"),
+    # Instantaneous adverse excursion at 1000ms (ticks, positive = against
+    # us). _persist_trade shares one INSERT across both tables, so this
+    # MUST stay in step with db_live.py.
+    ("adverse_ticks_at_1000ms", "REAL"),
 ]
 
 
