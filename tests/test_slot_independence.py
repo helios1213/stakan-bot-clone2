@@ -190,3 +190,47 @@ async def test_open_position_returns_what_it_created():
     assert "return pos" in src, "_open_position must return the position it created"
     # Every early exit must yield None so the wrapper stays silent.
     assert src.count("return pos") == 1
+
+
+# ── observability: per-slot skips, adverse snapshot ───────────────────
+
+@pytest.mark.asyncio
+async def test_skips_are_attributed_to_their_slot():
+    """The global counters mix two accounts; the per-slot map must not."""
+    eng = _engine([1, 2])
+    eng._slot_skips = {}
+    eng._cooldown_until[(1, SYM)] = 2 ** 31
+    eng._pending_submissions.add((2, SYM))
+    await eng.on_signal(_sig())
+    assert eng._slot_skips.get((1, "cooldown")) == 1
+    assert eng._slot_skips.get((2, "pending_submit")) == 1
+
+
+def test_adverse_snapshot_records_the_instant_not_the_maximum():
+    """nevergreen_cut tests the instantaneous excursion, not terminal mae_pct."""
+    from src.strategy.shadow_position import ShadowPosition
+    p = ShadowPosition(
+        symbol=SYM, direction="long", detector_source="static_gap",
+        confidence=0.5, leverage=50, margin_usdt=5.0, notional_usdt=250.0,
+        entry_price=0.003, entry_target_price=0.003,
+    )
+    assert p.adverse_ticks_at_1000ms is None
+    p.record_peak_snapshot(500, 0.0, 9.0)       # too early — not recorded
+    assert p.adverse_ticks_at_1000ms is None
+    p.record_peak_snapshot(1000, 0.0, 3.5)
+    assert p.adverse_ticks_at_1000ms == 3.5
+    p.record_peak_snapshot(1500, 0.0, 7.0)      # first cross wins
+    assert p.adverse_ticks_at_1000ms == 3.5
+
+
+def test_adverse_snapshot_is_optional():
+    """Callers that pass no adverse value must not crash or write garbage."""
+    from src.strategy.shadow_position import ShadowPosition
+    p = ShadowPosition(
+        symbol=SYM, direction="short", detector_source="static_gap",
+        confidence=0.5, leverage=50, margin_usdt=5.0, notional_usdt=250.0,
+        entry_price=0.003, entry_target_price=0.003,
+    )
+    p.record_peak_snapshot(1000, 2.0)
+    assert p.adverse_ticks_at_1000ms is None
+    assert p.peak_ticks_at_1000ms == 2.0

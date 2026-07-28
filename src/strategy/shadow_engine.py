@@ -467,6 +467,12 @@ class ShadowEngine:
         # Slot passes: one per (signal, live slot). The per-slot gates are
         # counted against THIS, not against signals_received.
         self.signals_fanned_out = 0
+        # (slot, reason) -> count. The global skip counters mix two accounts
+        # as soon as both trade one pair, which makes the funnel line
+        # uninterpretable exactly when a slot A/B needs it most. Kept in
+        # memory and reported per slot; deliberately NOT rows in
+        # live_open_misses, which every fill-rate query reads.
+        self._slot_skips: dict[tuple, int] = {}
 
         self.signals_skipped_no_book = 0
         self.signals_skipped_lag_out_of_range = 0
@@ -708,6 +714,21 @@ class ShadowEngine:
                     d["max_positions"], d["pending_submit"],
                     d["no_book"], d["latency_drift"],
                 )
+
+                # Per-slot breakdown: without it the line above averages two
+                # accounts together and a stalled slot hides behind a busy one.
+                if self._slot_skips:
+                    per_slot: dict = {}
+                    for (slot, reason), n in self._slot_skips.items():
+                        per_slot.setdefault(slot, []).append((reason, n))
+                    for slot in sorted(per_slot, key=lambda s: (s is None, s)):
+                        items = sorted(per_slot[slot], key=lambda kv: -kv[1])
+                        logger.info(
+                            "[FUNNEL 60s]   %s skips: %s",
+                            f"slot{slot}" if slot is not None else "shadow",
+                            " ".join(f"{r}={n}" for r, n in items),
+                        )
+                    self._slot_skips.clear()
         except asyncio.CancelledError:
             return
         except Exception:
@@ -845,6 +866,11 @@ class ShadowEngine:
         return (f"⏸ <b>Ліміт частоти MEXC</b> · <b>SLOT{sid}</b> ({code})\n"
                 f"1 угода / {int(hold)}с · {mode / 3600:.0f} год · виходи працюють")
 
+    def _note_slot_skip(self, slot, reason: str) -> None:
+        """Count a skip against the slot it belongs to (None = shadow pass)."""
+        key = (slot, reason)
+        self._slot_skips[key] = self._slot_skips.get(key, 0) + 1
+
     def _heartbeat_keys(self, live_pairs) -> list:
         """(symbol, account_label) pairs the heartbeat should watch.
 
@@ -898,11 +924,13 @@ class ShadowEngine:
         now_ms = int(time.time() * 1000)
         if now_ms < self._cooldown_until.get(_gk, 0) * 1000:
             self.signals_skipped_cooldown += 1
+            self._note_slot_skip(pin_slot, "cooldown")
             return
 
         # Funding cutoff
         if self.funding_guard.is_too_close_for_entry():
             self.signals_skipped_funding += 1
+            self._note_slot_skip(pin_slot, "funding")
             return
 
         # Max positions per symbol — for THIS account only. account_label is
@@ -910,6 +938,7 @@ class ShadowEngine:
         if sum(1 for p in self._open_positions[symbol]
                if (p.account_label or None) == _label) >= self.max_positions_per_symbol:
             self.signals_skipped_max_positions += 1
+            self._note_slot_skip(pin_slot, "max_positions")
             return
 
         # Slot-lock single-flight guard:
@@ -918,6 +947,7 @@ class ShadowEngine:
         # between). Python's GIL guarantees this for single statements.
         if _gk in self._pending_submissions:
             self.signals_skipped_pending_submit += 1
+            self._note_slot_skip(pin_slot, "pending_submit")
             logger.debug(
                 "[SLOT_LOCK] %s slot=%s skip — submission already in-flight",
                 symbol, pin_slot,
@@ -1623,6 +1653,10 @@ class ShadowEngine:
         # of a bare "Raw: ?". The dominant case is an active 510 slot-cooldown.
         if chosen_slot_id is None and pos.live_open_error is None and _skip_reason is not None:
             pos.live_open_error = _skip_reason
+            # Attribute it: these skips (slot cooldown, throttle hold, soft
+            # start break, safety block, busy slot) left no trace anywhere,
+            # so a silent slot looked identical to an idle market.
+            self._note_slot_skip(_skip_sid, _skip_reason.split(':')[0])
 
         try:
             ps = self.state_manager.get_state(signal.symbol)
@@ -2056,8 +2090,16 @@ class ShadowEngine:
                         peak_ticks_now = (pos.peak_price_favorable - pos.entry_price) / tick_scaled
                     else:
                         peak_ticks_now = (pos.entry_price - pos.peak_price_favorable) / tick_scaled
+                    # Instantaneous adverse at the same instant, in ticks and
+                    # positive when against us — the exact quantity nevergreen_cut
+                    # compares. Terminal mae_pct cannot answer for it.
+                    if pos.direction == "long":
+                        adverse_ticks_now = (pos.entry_price - current_price) / tick_scaled
+                    else:
+                        adverse_ticks_now = (current_price - pos.entry_price) / tick_scaled
                     elapsed_ms = int(pos.elapsed_sec * 1000)
-                    pos.record_peak_snapshot(elapsed_ms, peak_ticks_now)
+                    pos.record_peak_snapshot(elapsed_ms, peak_ticks_now,
+                                             adverse_ticks_now)
 
                 exit_reason = self._check_exit(
                     pos, cfg, mid_gap_ticks,
@@ -3237,7 +3279,8 @@ class ShadowEngine:
                     latency_signal_to_pickup_ms, latency_submit_ms, latency_response_ms,
                     latency_fill_poll_ms, latency_close_submit_ms, latency_close_response_ms,
                     peak_ticks_at_500ms, peak_ticks_at_1000ms,
-                    peak_ticks_at_1500ms, peak_ticks_at_2000ms)
+                    peak_ticks_at_1500ms, peak_ticks_at_2000ms,
+                    adverse_ticks_at_1000ms)
                    VALUES (?,?,?,?,?,?,?, ?,?,?, ?,?,?,?,
                            ?,?,?,?, ?,?,?,?, ?,?,?,?,
                            ?,?, ?,?,?,
@@ -3246,7 +3289,7 @@ class ShadowEngine:
                            ?,?,
                            ?,?,?,
                            ?,?,?,
-                           ?,?,?,?)""",
+                           ?,?,?,?,?)""",
                 (
                     pos.signal_id, pos.signal_uid, pos.symbol, pos.direction, pos.leverage,
                     pos.margin_usdt, pos.notional_usdt,
@@ -3278,6 +3321,7 @@ class ShadowEngine:
                     pos.peak_ticks_at_1000ms,
                     pos.peak_ticks_at_1500ms,
                     pos.peak_ticks_at_2000ms,
+                    pos.adverse_ticks_at_1000ms,
                 ),
             )
             if pos.mode == "live":
@@ -3314,6 +3358,53 @@ class ShadowEngine:
             await self._reload_pair_configs()
         except Exception as e:
             logger.warning("Background pair_config reload failed: %s", e)
+
+    async def _warn_on_sizing_drift(self) -> None:
+        """Shout when a live pair's YAML sizing is not what its slots use.
+
+        The pair YAML is the real fallback for any slot without a
+        slot_pair_sizing row, but nobody re-reads it once per-slot overrides
+        exist: on 2026-07-28 PEPE declared $5,231 while its slots ran
+        $2,491-$2,755, so deleting one override would have silently doubled the
+        position. Freezing the YAML to today's number would only move the
+        staleness — the operator retunes size from Telegram — so instead make
+        the divergence impossible to miss on every config reload.
+        """
+        if self.live_pool is None or self.state_manager is None:
+            return
+        try:
+            for symbol, cfg in list(self._pair_configs.items()):
+                if not self.state_manager.is_in_live(symbol):
+                    continue
+                yaml_n = ((cfg.margin_min_usdt + cfg.margin_max_usdt) / 2
+                          * (cfg.leverage_min + cfg.leverage_max) / 2)
+                for sid in self.live_pool.find_slots_for_pair(symbol):
+                    slot_cfg = await self.live_pool.get_slot_config(sid, symbol=symbol)
+                    if slot_cfg is None:
+                        continue
+                    mmin = slot_cfg.get("slot_margin_min_usdt")
+                    mmax = slot_cfg.get("slot_margin_max_usdt")
+                    lmin = slot_cfg.get("slot_leverage_min")
+                    lmax = slot_cfg.get("slot_leverage_max")
+                    if mmin is None and mmax is None and lmin is None and lmax is None:
+                        logger.warning(
+                            "[SIZING] %s slot=%d has NO per-slot override — it "
+                            "sizes straight from the YAML ($%.0f notional). "
+                            "Check that is intended.",
+                            symbol, sid, yaml_n)
+                        continue
+                    eff = (((mmin if mmin is not None else cfg.margin_min_usdt)
+                            + (mmax if mmax is not None else cfg.margin_max_usdt)) / 2
+                           * ((lmin if lmin is not None else cfg.leverage_min)
+                              + (lmax if lmax is not None else cfg.leverage_max)) / 2)
+                    if yaml_n > 0 and abs(eff - yaml_n) / yaml_n > 0.25:
+                        logger.warning(
+                            "[SIZING] %s slot=%d trades $%.0f but the YAML says "
+                            "$%.0f (%.1fx). Dropping the override would jump the "
+                            "position to the YAML figure.",
+                            symbol, sid, eff, yaml_n, yaml_n / eff if eff else 0)
+        except Exception:
+            logger.exception("[SIZING] drift check failed")
 
     async def _reload_pair_configs(self) -> None:
         # The DB pair_configs table defines only WHICH symbols exist (+ a few
@@ -3362,6 +3453,11 @@ class ShadowEngine:
             )
         self._pair_configs = cache
         self._configs_loaded_at = int(time.time())
+        # Best-effort: a stale YAML sizing must never be able to fail a reload.
+        try:
+            await self._warn_on_sizing_drift()
+        except Exception:
+            logger.exception("[SIZING] drift check raised")
 
     # ============================================================
     # Public introspection (for stats logger)

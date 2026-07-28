@@ -133,6 +133,11 @@ class ShadowPosition:
     peak_ticks_at_1000ms: float | None = None
     peak_ticks_at_1500ms: float | None = None
     peak_ticks_at_2000ms: float | None = None
+    # Instantaneous adverse excursion at 1000ms, in ticks (positive =
+    # against us). nevergreen_cut tests exactly this quantity once a
+    # position is 900ms old; mae_pct is the terminal maximum and cannot
+    # stand in for it.
+    adverse_ticks_at_1000ms: float | None = None
 
     # is_closing flag:
     # Set to True at start of _close_position to prevent concurrent close calls.
@@ -175,13 +180,20 @@ class ShadowPosition:
     def elapsed_sec(self) -> float:
         return (time.time() * 1000 - self.opened_at_ms) / 1000
 
-    def record_peak_snapshot(self, elapsed_ms: int, peak_ticks: float) -> None:
+    def record_peak_snapshot(self, elapsed_ms: int, peak_ticks: float,
+                             adverse_ticks: float | None = None) -> None:
         """Record peak_ticks at a fixed elapsed-time milestone.
 
         Called from ShadowEngine._watch_position when elapsed_ms crosses
         one of [500, 1000, 1500, 2000]. Subsequent calls for the same
         milestone are no-ops (first-cross wins, no overwrite).
+
+        `adverse_ticks` is the INSTANTANEOUS excursion against us at the same
+        moment — the quantity nevergreen_cut actually tests.
         """
+        if (adverse_ticks is not None and elapsed_ms >= 1000
+                and self.adverse_ticks_at_1000ms is None):
+            self.adverse_ticks_at_1000ms = adverse_ticks
         if elapsed_ms >= 500 and self.peak_ticks_at_500ms is None:
             self.peak_ticks_at_500ms = peak_ticks
         if elapsed_ms >= 1000 and self.peak_ticks_at_1000ms is None:

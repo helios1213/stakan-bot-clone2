@@ -225,6 +225,9 @@ LIVE_TRADES_LATENCY_COLUMNS = [
     ("peak_ticks_at_1000ms", "REAL"),
     ("peak_ticks_at_1500ms", "REAL"),
     ("peak_ticks_at_2000ms", "REAL"),
+    # Instantaneous adverse excursion at 1000ms (ticks, positive =
+    # against us) — what nevergreen_cut tests, unlike terminal mae_pct.
+    ("adverse_ticks_at_1000ms", "REAL"),
 ]
 
 
