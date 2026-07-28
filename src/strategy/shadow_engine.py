@@ -379,6 +379,10 @@ class ShadowEngine:
         # keeps its persisted copy in step.
         self._open_rl_code: dict[int, str] = {}
         self._open_rl_persisted: dict[int, int] = {}
+        # Last webkey_refreshed_at seen per slot. A change means the
+        # account underneath was swapped, so its predecessor's open-rate
+        # latch must not carry over.
+        self._open_rl_wk_seen: dict[int, int | None] = {}
         if self.live_pool is not None:
             logger.info("LIVE TRADING ENABLED (multi-slot mode) — pair routing via LiveExecutorPool")
         else:
@@ -1361,6 +1365,36 @@ class ShadowEngine:
                 # Validate the slot↔pair has a config row (admission control).
                 slot_cfg = await self.live_pool.get_slot_config(sid, symbol=signal.symbol)
                 if slot_cfg is not None:
+                    # A replaced webkey is a DIFFERENT MEXC account, and the
+                    # open-rate limit is enforced per account. Dropping the latch
+                    # here is what stops a fresh key inheriting the old one's
+                    # six-hour throttle (measured: 5 requests/hour against an
+                    # unthrottled slot's 104, because a spent request costs ~72s
+                    # even when the IOC never fills).
+                    _wk = slot_cfg.get("webkey_refreshed_at")
+                    _ot_db = slot_cfg.get("open_throttle_until") or 0
+                    # Two independent ways to learn the latch should go:
+                    #   1. the webkey stamp moved (delete -> NULL, add -> now);
+                    #   2. a deadline we persisted is no longer stored, which
+                    #      only happens because delete() wiped it.
+                    # (2) exists because (1) is a whole-second stamp: deleting
+                    # and re-adding inside one second leaves it unchanged.
+                    # (2) requires _open_rl_persisted to be set, so a failed DB
+                    # write leaves the latch standing instead of releasing a
+                    # limited account — a 10014 costs 30 days of opens.
+                    _cleared_in_db = (self._open_rl_persisted.get(sid) is not None
+                                      and _ot_db <= time.time())
+                    if self._open_rl_wk_seen.get(sid, _wk) != _wk or _cleared_in_db:
+                        if time.monotonic() < self._open_rl_mode_until.get(sid, 0.0):
+                            logger.info(
+                                "[OPEN THROTTLE] slot=%d webkey replaced — "
+                                "latch dropped with the old account", sid)
+                        self._open_rl_mode_until.pop(sid, None)
+                        self._open_rl_code.pop(sid, None)
+                        self._open_rl_persisted.pop(sid, None)
+                        self._slot_cooldown_until.pop(sid, None)
+                    self._open_rl_wk_seen[sid] = _wk
+
                     # Restore a throttled latch that outlived the process. Stored
                     # as an epoch, used as monotonic — convert, never compare
                     # the two clocks directly.

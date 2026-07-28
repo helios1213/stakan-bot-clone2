@@ -358,6 +358,10 @@ class WebkeyStore:
                    last_error=NULL,
                    webkey_refreshed_at=NULL,
                    label=NULL,
+                   -- An open-rate limit belongs to the ACCOUNT, not the slot.
+                   -- Leaving it behind made the next webkey inherit the
+                   -- previous account's six-hour throttle.
+                   open_throttle_until=NULL,
                    updated_at=?
              WHERE slot_id=?
             """,

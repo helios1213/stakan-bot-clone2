@@ -188,6 +188,9 @@ class LiveExecutorPool:
             "slot_leverage_min": ovr.get("leverage_min"),
             "slot_leverage_max": ovr.get("leverage_max"),
             "open_throttle_until": getattr(slot, "open_throttle_until", None),
+            # Changes on webkey delete (-> NULL) and add (-> now); the
+            # engine uses it to notice the account underneath changed.
+            "webkey_refreshed_at": getattr(slot, "webkey_refreshed_at", None),
         }
 
     def get_slot_lock(self, slot_id: int) -> asyncio.Lock:
