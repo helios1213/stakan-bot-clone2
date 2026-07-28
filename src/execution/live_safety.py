@@ -42,6 +42,7 @@ class SafetyState:
     _logged_dd_step: int = 0        # deepest quarter-of-limit already logged
     _logged_peak: float = 0.0
     _closes_since_log: int = 0
+    _last_log_ts: float = 0.0
     kill_active: bool = False
     kill_reason: str = ""
     kill_until_ts: int = 0  # 0 = indefinite
@@ -241,8 +242,13 @@ class LiveSafetyController:
         # Heartbeat: the step thresholds below only fire at 25% of the limit,
         # which at ordinary PnL is once in hours. This keeps the peak visible.
         self.state._closes_since_log += 1
-        if self.state._closes_since_log >= 100:
+        _now = time.time()
+        if self.state._last_log_ts <= 0:
+            self.state._last_log_ts = _now
+        if (self.state._closes_since_log >= 100
+                or _now - self.state._last_log_ts >= 900):
             self.state._closes_since_log = 0
+            self.state._last_log_ts = _now
             logger.info(
                 "[EQUITY] %d угод: PnL $%+.2f, пік $%+.2f, просадка $%.2f з $%.2f "
                 "(позиція ~$%.0f)",
