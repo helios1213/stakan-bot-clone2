@@ -48,6 +48,14 @@ class DetectorConfig:
     long_only: bool = False
     short_only: bool = False
     max_spread_bps: float = 0.0   # >0 = reject signals when MEXC book spread exceeds this (bps); 0=off
+    # >0 = reject signals whose BINANCE<->MEXC MID gap is below this many
+    # ticks. Distinct from min_ticks, which reads the same-side quote gap
+    # and so is also satisfied by a wide MEXC book:
+    #     gap_ticks = mid_gap_ticks + (mexc_spread - binance_spread)/2
+    # Ticks rather than bps because the mid sits on a half-tick grid, and
+    # a bps threshold slides across those cohorts as the price moves.
+    # 0 = off.
+    min_mid_gap_ticks: float = 0.0
 
 
 @dataclass
@@ -228,6 +236,7 @@ def _parse_detector(raw: dict | None, defaults: DetectorConfig) -> DetectorConfi
         long_only=bool(raw.get("long_only", defaults.long_only)),
         short_only=bool(raw.get("short_only", defaults.short_only)),
         max_spread_bps=float(raw.get("max_spread_bps", defaults.max_spread_bps)),
+        min_mid_gap_ticks=float(raw.get("min_mid_gap_ticks", defaults.min_mid_gap_ticks)),
     )
 
 

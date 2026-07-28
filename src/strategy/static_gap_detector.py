@@ -68,6 +68,7 @@ class PerPairDetectorOverride:
     long_only: bool = False
     short_only: bool = False
     max_spread_bps: float = 0.0
+    min_mid_gap_ticks: float = 0.0
 
 
 @dataclass
@@ -135,6 +136,7 @@ class StaticGapDetector:
         self.signals_skip_no_ob = 0
         self.signals_skip_below_threshold = 0
         self.signals_skip_wide_spread = 0
+        self.signals_skip_narrow_mid_gap = 0
         self.signals_skip_reference_only = 0
 
         # ─── event-driven scan loop ─────────────────────────────────────
@@ -252,6 +254,7 @@ class StaticGapDetector:
                 long_only=d.long_only,
                 short_only=d.short_only,
                 max_spread_bps=d.max_spread_bps,
+                min_mid_gap_ticks=d.min_mid_gap_ticks,
             )
             new_overrides[symbol] = ovr
 
@@ -643,6 +646,22 @@ class StaticGapDetector:
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
+        # Mid-gap floor, in TICKS. min_ticks above reads the same-side quote
+        # gap, which equals this plus half the excess MEXC spread — so it also
+        # admits signals whose real dislocation is a tick smaller than it looks.
+        # Measured on 2,831 TAO trades: the 4.0-tick mid cohort is 18.2% of the
+        # flow, loses $29.80 at a 38% win rate and dies on arrival 51% of the
+        # time, while every wider cohort earns and DOA falls monotonically to
+        # 27%. Ticks, not bps: the mid lands on a half-tick grid and a bps
+        # threshold would cut a different cohort as the price drifts.
+        # 0 = off (default; behaviour-preserving).
+        _ovr_mg = self._pair_overrides.get(symbol)
+        if _ovr_mg is not None and _ovr_mg.min_mid_gap_ticks > 0 and tick_scaled > 0:
+            if abs(b_mid - m_mid) / tick_scaled < _ovr_mg.min_mid_gap_ticks - gap_eps:
+                self.signals_skip_narrow_mid_gap += 1
+                self._last_emitted_direction.pop(symbol, None)
+                return
+
         # ─── ONLY FILTER: cooldown (anti-duplicate guard) ──────────────
         cooldown_until = self._cooldown_until.get(symbol, 0)
         last_dir = self._last_emitted_direction.get(symbol)
@@ -676,6 +695,8 @@ class StaticGapDetector:
                 "long_gap_ticks":  round(long_gap_ticks, 2),
                 "short_gap_ticks": round(short_gap_ticks, 2),
                 "min_gap_ticks": eff_min_gap_ticks,
+                "mid_gap_ticks": round(abs(b_mid - m_mid) / tick_scaled, 2)
+                                 if tick_scaled > 0 else 0.0,
                 "binance_bid": b_bid_p,
                 "binance_ask": b_ask_p,
                 "mexc_bid":    m_bid_p,
