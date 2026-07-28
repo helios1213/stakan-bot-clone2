@@ -3,7 +3,7 @@
 
 meta:
   symbol: PENGUUSDT
-  behavioral_epoch: 1785171760
+  behavioral_epoch: 1785267390
   note: behavioral_epoch = unix time the TUNING last changed; bump ONLY on a real
     config change, NOT on re-materialization. Analyze only trades with opened_at >=
     this.
@@ -13,6 +13,17 @@ detector:
   long_only: false
   short_only: false
   max_spread_bps: 0.0
+  # 2026-07-28: floor on the BINANCE<->MEXC MID gap, in ticks. min_ticks reads
+  # the same-side quote gap, so with the spread gate off a wide MEXC book
+  # carries a 2-tick dislocation over this 3-tick gate. Measured on 1,082 live
+  # trades over 14 days: 1.5t loses $16.09 at WR 3% / DOA 81%, 2.0t loses $13.80
+  # at WR 16% / DOA 73%, while 3.0t earns $144.03 at WR 78% / DOA 20%. Cutting
+  # below 2.25 costs 8.4% of the flow and adds $42.67 (+41% of the pair's PnL);
+  # best threshold on the 7d, 14d and 30d windows alike. 2.75 is worse — it also
+  # cuts the mildly profitable 2.5t cohort. Ticks not bps: PENGU's price moved
+  # 0.008 -> 0.006 in this window, which shifts a bps floor across cohorts.
+  # Revert=0.0
+  min_mid_gap_ticks: 2.25
 exit_strategy:
   min_hold_ms: 500
   stop_adverse_bps: 10.0
