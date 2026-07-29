@@ -3,7 +3,7 @@
 
 meta:
   symbol: PENGUUSDT
-  behavioral_epoch: 1785267390
+  behavioral_epoch: 1785317387
   note: behavioral_epoch = unix time the TUNING last changed; bump ONLY on a real
     config change, NOT on re-materialization. Analyze only trades with opened_at >=
     this.
@@ -36,7 +36,14 @@ exit_strategy:
   nevergreen_peak_ticks: 1.0
   binance_reversal_max_ms: 1500
 execution:
-  ioc_offset_ticks: 0
+  # 2026-07-29: cross by one tick. At-touch filled only 34% live (1202 of
+  # 3508 attempts, 1804 ioc_expired_no_fill) while signal_features called
+  # 84% of gate-passing signals fillable — the 2.5x gap is the touch moving
+  # inside our ~150ms submit. Cost is bounded: an IOC still matches the best
+  # resting level, so the extra tick is only paid when the touch has already
+  # moved. WATCH IT: PENGU tick = 1.622 bps against a +1.399 bps edge, so a
+  # converted trade that really pays a full tick is net negative. Revert=0
+  ioc_offset_ticks: 1
   ioc_max_attempts: 1
   ioc_attempt_interval_ms: 0
   margin_min_usdt: 13.0
