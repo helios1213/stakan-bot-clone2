@@ -1384,6 +1384,18 @@ class ShadowEngine:
                     # limited account — a 10014 costs 30 days of opens.
                     _cleared_in_db = (self._open_rl_persisted.get(sid) is not None
                                       and _ot_db <= time.time())
+                    # Stateless check, and the one that actually holds across a
+                    # restart: the latch runs OPEN_THROTTLE_MODE_SEC from the
+                    # refusal, so it was earned at (_ot_db - mode). A key
+                    # refreshed AFTER that moment sits on a different account and
+                    # did not earn it. Needed because the seen-map above only
+                    # reacts to a CHANGE it witnessed, and a slot that was
+                    # disabled and came back after a restart is seen for the
+                    # FIRST time — which by design clears nothing. Measured:
+                    # latch 09:17:39, key replaced 10:38:39, 4.6h inherited.
+                    _mode_sec = self._env_float("OPEN_THROTTLE_MODE_SEC", 21600.0)
+                    _key_is_newer = (_wk is not None and _ot_db > 0
+                                     and _wk > _ot_db - _mode_sec)
                     # `_wk is not None` — release only once a REPLACEMENT key is
                     # in place. Deleting a key does not lift MEXC's limit (it is
                     # on the account), and the pool keeps the old credentials
@@ -1392,8 +1404,10 @@ class ShadowEngine:
                     # earns a fresh 6h latch — measured 12:17:38 -> 12:17:39 on
                     # 2026-07-29. With no key the slot must not trade anyway, so
                     # holding the latch costs nothing.
+                    _released = False
                     if _wk is not None and (self._open_rl_wk_seen.get(sid, _wk) != _wk
-                                            or _cleared_in_db):
+                                            or _cleared_in_db or _key_is_newer):
+                        _released = True
                         if time.monotonic() < self._open_rl_mode_until.get(sid, 0.0):
                             logger.info(
                                 "[OPEN THROTTLE] slot=%d new webkey in place — "
@@ -1402,12 +1416,26 @@ class ShadowEngine:
                         self._open_rl_code.pop(sid, None)
                         self._open_rl_persisted.pop(sid, None)
                         self._slot_cooldown_until.pop(sid, None)
+                        # Clear the STORED deadline too. Dropping only the
+                        # in-memory copy let the next restart restore the very
+                        # latch we just decided was not ours.
+                        if _ot_db > 0:
+                            try:
+                                await self.live_pool.webkey_store\
+                                    .set_open_throttle_until(sid, None)
+                            except Exception:
+                                logger.exception(
+                                    "[OPEN THROTTLE] could not clear stored "
+                                    "latch slot=%d", sid)
                     self._open_rl_wk_seen[sid] = _wk
 
                     # Restore a throttled latch that outlived the process. Stored
                     # as an epoch, used as monotonic — convert, never compare
                     # the two clocks directly.
-                    _ot = slot_cfg.get("open_throttle_until") or 0
+                    # `not _released` — slot_cfg was read BEFORE the release
+                    # wrote NULL, so without this the stale deadline re-arms the
+                    # latch we just dropped (seen 2026-07-29 13:54:28).
+                    _ot = 0 if _released else (slot_cfg.get("open_throttle_until") or 0)
                     _now_w = time.time()
                     if (_ot > _now_w
                             and time.monotonic() >= self._open_rl_mode_until.get(sid, 0.0)):
