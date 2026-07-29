@@ -1384,10 +1384,19 @@ class ShadowEngine:
                     # limited account — a 10014 costs 30 days of opens.
                     _cleared_in_db = (self._open_rl_persisted.get(sid) is not None
                                       and _ot_db <= time.time())
-                    if self._open_rl_wk_seen.get(sid, _wk) != _wk or _cleared_in_db:
+                    # `_wk is not None` — release only once a REPLACEMENT key is
+                    # in place. Deleting a key does not lift MEXC's limit (it is
+                    # on the account), and the pool keeps the old credentials
+                    # cached for seconds afterwards, so releasing on the delete
+                    # half of a swap just re-probes a still-limited account and
+                    # earns a fresh 6h latch — measured 12:17:38 -> 12:17:39 on
+                    # 2026-07-29. With no key the slot must not trade anyway, so
+                    # holding the latch costs nothing.
+                    if _wk is not None and (self._open_rl_wk_seen.get(sid, _wk) != _wk
+                                            or _cleared_in_db):
                         if time.monotonic() < self._open_rl_mode_until.get(sid, 0.0):
                             logger.info(
-                                "[OPEN THROTTLE] slot=%d webkey replaced — "
+                                "[OPEN THROTTLE] slot=%d new webkey in place — "
                                 "latch dropped with the old account", sid)
                         self._open_rl_mode_until.pop(sid, None)
                         self._open_rl_code.pop(sid, None)
