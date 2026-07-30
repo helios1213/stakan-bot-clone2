@@ -30,6 +30,7 @@ drift risk if we leave it untracked.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from typing import Optional
@@ -205,6 +206,27 @@ async def startup_reconcile(live_pool, alerts) -> dict:
                 continue
 
             try:
+                # Last check before touching the account. rebuild_from_store runs
+                # on a timer, so a key deleted seconds ago may still look active in
+                # the pool. Closing a position on an account the operator has
+                # deliberately disconnected is the one outcome worth an extra
+                # round-trip to avoid.
+                _keyed = True
+                _chk = getattr(live_pool, "slot_has_key", None)
+                if callable(_chk):
+                    try:
+                        _r = _chk(slot_id)
+                        if inspect.isawaitable(_r):
+                            _keyed = bool(await _r)
+                    except Exception:
+                        # Cannot verify. active_executors() already vetted this
+                        # slot, so trust that rather than stranding a real orphan.
+                        _keyed = True
+                if not _keyed:
+                    logger.warning(
+                        "[RECONCILE] slot=%s без вебкея — залишаю %s недоторканим "
+                        "(позиція відкрита вручну, не наша)", slot_id, symbol)
+                    continue
                 result = await executor.market_close_position(
                     symbol=symbol,
                     direction=direction,
@@ -291,7 +313,21 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     if live_pool is None:
         return summary
 
+    # active_executors(), NOT _executors: the latter keeps deactivated slots for
+    # their stats, and using it meant a slot whose webkey had been deleted was
+    # still reconciled — closing positions the operator had opened by hand.
     executors = getattr(live_pool, "_executors", {})
+    _active = getattr(live_pool, "active_executors", None)
+    if callable(_active):
+        try:
+            _res = _active()
+            # Only a real mapping counts. A test double answers callable() and
+            # returns something dict-shaped only by accident.
+            if isinstance(_res, dict):
+                executors = _res
+        except Exception:
+            logger.exception("[RECONCILE] active_executors() кинуло — "
+                             "працюю зі старим списком")
     if not executors:
         return summary
 
@@ -400,6 +436,27 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
             continue
 
         try:
+            # Last check before touching the account. rebuild_from_store runs
+            # on a timer, so a key deleted seconds ago may still look active in
+            # the pool. Closing a position on an account the operator has
+            # deliberately disconnected is the one outcome worth an extra
+            # round-trip to avoid.
+            _keyed = True
+            _chk = getattr(live_pool, "slot_has_key", None)
+            if callable(_chk):
+                try:
+                    _r = _chk(slot_id)
+                    if inspect.isawaitable(_r):
+                        _keyed = bool(await _r)
+                except Exception:
+                    # Cannot verify. active_executors() already vetted this
+                    # slot, so trust that rather than stranding a real orphan.
+                    _keyed = True
+            if not _keyed:
+                logger.warning(
+                    "[RECONCILE] slot=%s без вебкея — залишаю %s недоторканим "
+                    "(позиція відкрита вручну, не наша)", slot_id, symbol)
+                continue
             result = await executor.market_close_position(
                 symbol=symbol,
                 direction=direction,

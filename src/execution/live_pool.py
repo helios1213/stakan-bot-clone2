@@ -64,6 +64,11 @@ class LiveExecutorPool:
         # Mapping: pair symbol → list of slot_ids configured for it
         # (Multiple slots can be assigned to the same pair for parallel positions)
         self._pair_to_slots: dict[str, list[int]] = {}
+        # Slots that are live-active as of the last rebuild. Executors
+        # for deactivated slots are deliberately KEPT in _executors so
+        # their stats stay readable — this set is what says which of
+        # them may still be used to touch an account.
+        self._active_slot_ids: set[int] = set()
 
     async def rebuild_from_store(self) -> None:
         """
@@ -107,18 +112,45 @@ class LiveExecutorPool:
                     sid, slot.assigned_pair,
                 )
 
-        # Remove executors for slots that are no longer live-active
-        # (We keep stats but mark as unused)
+        # Deactivate slots that are no longer live-active. The executor
+        # object stays so its stats remain readable, but the slot leaves
+        # _active_slot_ids and nothing may reach the exchange through it again.
+        # It previously only left pair routing, which meant reconcile — reading
+        # _executors directly — kept closing positions on an account whose key
+        # had been deleted.
         stale = [sid for sid in self._executors if sid not in active_slot_ids]
         for sid in stale:
-            logger.info(
-                "LiveExecutorPool: deactivating slot %d (no longer live)",
-                sid,
-            )
-            # Don't actually delete — keep stats accessible
-            # Just remove from pair routing
+            if sid in self._active_slot_ids:
+                logger.warning(
+                    "LiveExecutorPool: slot %d deactivated — bot will no longer "
+                    "touch this account", sid,
+                )
 
+        self._active_slot_ids = active_slot_ids
         self._pair_to_slots = new_pair_to_slots
+
+    def active_executors(self) -> dict[int, "LiveExecutor"]:
+        """Executors that may still act on an exchange account.
+
+        Anything reaching out to MEXC must use this, never _executors: the
+        latter deliberately retains deactivated slots for their statistics.
+        """
+        return {sid: ex for sid, ex in self._executors.items()
+                if sid in self._active_slot_ids}
+
+    async def slot_has_key(self, slot_id: int) -> bool:
+        """Live check straight against the store.
+
+        rebuild_from_store runs on a timer, so between a key deletion and the
+        next rebuild _active_slot_ids is stale. Anything about to close a
+        position asks this first.
+        """
+        try:
+            slot = await self.webkey_store.get(slot_id)
+        except Exception:
+            return False
+        return bool(slot and getattr(slot, "enabled", False)
+                    and getattr(slot, "webkey_blob", None) is not None)
 
     def get_executor(self, slot_id: int) -> LiveExecutor | None:
         return self._executors.get(slot_id)
