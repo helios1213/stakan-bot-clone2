@@ -83,6 +83,14 @@ def handle(req: dict) -> dict:
     if op == "assign_pair":
         data.assign_pair(int(req["slot_id"]), req.get("pair"))
         return {"ok": True}
+    if op == "trades":
+        # Read-only. Returns this bot's recent trades and its totals so the
+        # primary can merge them; `limit` is capped to keep one SSH payload
+        # small — the panel only ever renders the latest N anyway.
+        limit = min(int(req.get("limit", 100)), 500)
+        return {"ok": True,
+                "trades": data.live_trades(limit),
+                "summary": data.live_trades_summary()}
     if op == "kill_all":
         # Panel KILL ALL fans out here: demote every LIVE pair on THIS bot.
         return {"ok": True, "demoted": data.set_all_pairs_shadow()}
