@@ -3,7 +3,7 @@
 
 meta:
   symbol: 1000PEPEUSDT
-  behavioral_epoch: 1785252366
+  behavioral_epoch: 1785794816
   note: behavioral_epoch = unix time the TUNING last changed; bump ONLY on a real
     config change, NOT on re-materialization. Analyze only trades with opened_at >=
     this.
@@ -13,6 +13,18 @@ detector:
   long_only: false
   short_only: false
   max_spread_bps: 1.3
+  # Вхідні ворота по мід-гепу — у ТІКАХ, не в bps (2026-08-04).
+  # Раніше це були execution.min/max_mexc_lag_pct 0.013/0.02, тобто
+  # поріг у bps на інструменті з фіксованим тіком: у тіках він плив із
+  # ціною (0.00360 → [4.68t, 7.19t]; 0.00295 → [3.83t, 5.90t]) і різав
+  # поперек пів-тікових когорт, а не між ними.
+  # 11 258 угод поточної епохи: 4.0t −$273.68 (−0.392 bps, WR 34.9%,
+  # мінусова 6 із 6 повних днів, nevergreen_cut = 43.6% її виходів);
+  # 4.5t +$34.09; 5.0t +$845.01 (+0.555, WR 54.2%); 5.5t +$1.93.
+  # Потолок 5.5 інертний сьогодні — фіксує статус-кво, щоб +2% по ціні
+  # не завели неміряну 6.0t (у попередній епосі −$108.88, WR 32.2%).
+  min_mid_gap_ticks: 4.5
+  max_mid_gap_ticks: 5.5
 exit_strategy:
   min_hold_ms: 500
   stop_adverse_bps: 10.0
@@ -48,5 +60,7 @@ execution:
   momentum_filter: false
   momentum_tau_sec: 2.0
   momentum_threshold_bps: 2.0
-  min_mexc_lag_pct: 0.013
-  max_mexc_lag_pct: 0.02
+  # Замінені на detector.min/max_mid_gap_ticks — та сама величина, але в
+  # тіках. 0 = вимкнено; не вмикати назад, це дубль у гірших одиницях.
+  min_mexc_lag_pct: 0.0
+  max_mexc_lag_pct: 0.0
