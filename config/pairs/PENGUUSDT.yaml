@@ -3,7 +3,7 @@
 
 meta:
   symbol: PENGUUSDT
-  behavioral_epoch: 1785317387
+  behavioral_epoch: 1785776934
   note: behavioral_epoch = unix time the TUNING last changed; bump ONLY on a real
     config change, NOT on re-materialization. Analyze only trades with opened_at >=
     this.
@@ -24,6 +24,21 @@ detector:
   # 0.008 -> 0.006 in this window, which shifts a bps floor across cohorts.
   # Revert=0.0
   min_mid_gap_ticks: 2.25
+  # 2026-08-03: floor on the EXECUTABLE edge, in ticks. The detector already
+  # computes it and only logged it:
+  #   exec_buy  = (binance_bid - mexc_ask)/tick,  exec_sell mirrored.
+  # Both spreads are inside it, so this is the dislocation net of the cost of
+  # reaching the touch — min_ticks and min_mid_gap_ticks subtract neither, so a
+  # real gap through a wide MEXC book passes both and still cannot win.
+  # Verified in two regimes: primary pre-offset n=217 (exec-1 -7.06, exec0 -1.33,
+  # exec1 +1.52, exec2 +2.22 bps) and clone with offset 1 n=113 (exec0 -1.66,
+  # exec1 -0.42, exec2 +0.74). Cutting exec<=0 costs 8-18% of fills and moves
+  # +0.841 -> +1.680 bps / -0.050 -> +0.329 bps.
+  # 0.5 sits in empty space: the distribution is integer-tick, zero trades
+  # within +/-0.26. NOT 1.5 — exec=1 earns +1.52 on the primary and is 38% of
+  # the flow; whether the offset eats that level is a live question now.
+  # Revert=0.0
+  min_exec_ticks: 0.5
 exit_strategy:
   min_hold_ms: 500
   stop_adverse_bps: 10.0
