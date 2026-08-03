@@ -69,6 +69,7 @@ class PerPairDetectorOverride:
     short_only: bool = False
     max_spread_bps: float = 0.0
     min_mid_gap_ticks: float = 0.0
+    min_exec_ticks: float = 0.0
 
 
 @dataclass
@@ -137,6 +138,7 @@ class StaticGapDetector:
         self.signals_skip_below_threshold = 0
         self.signals_skip_wide_spread = 0
         self.signals_skip_narrow_mid_gap = 0
+        self.signals_skip_no_exec_edge = 0
         self.signals_skip_reference_only = 0
 
         # ─── event-driven scan loop ─────────────────────────────────────
@@ -255,6 +257,7 @@ class StaticGapDetector:
                 short_only=d.short_only,
                 max_spread_bps=d.max_spread_bps,
                 min_mid_gap_ticks=d.min_mid_gap_ticks,
+                min_exec_ticks=d.min_exec_ticks,
             )
             new_overrides[symbol] = ovr
 
@@ -662,6 +665,26 @@ class StaticGapDetector:
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
+        # Executable-edge floor, in TICKS. exec_buy/sell are computed above
+        # and were previously logged only. They are the dislocation net of BOTH
+        # spreads — what remains after crossing to the price we actually fill
+        # at — so a genuine gap through a wide book passes min_ticks and
+        # min_mid_gap_ticks and still has nothing left to catch.
+        # Measured on PENGU (231 primary / 115 clone fills joined to signals):
+        # exec -1 = -7.16/-8.07 bps, exec 0 = -1.74/-1.66, exec 1 = +1.35/-0.42,
+        # exec 2 = +2.26/+0.74. The distribution is strictly integer-tick, so a
+        # 0.5 floor sits in empty space (zero trades within +/-0.26 of it).
+        # Ticks, not bps: a bps threshold slides off its target as the price
+        # moves, which has already cost us twice.
+        # 0 = off (default; behaviour-preserving).
+        _ovr_ex = self._pair_overrides.get(symbol)
+        if _ovr_ex is not None and _ovr_ex.min_exec_ticks > 0:
+            _exec_t = exec_buy_ticks if direction == "long" else exec_sell_ticks
+            if _exec_t < _ovr_ex.min_exec_ticks - gap_eps:
+                self.signals_skip_no_exec_edge += 1
+                self._last_emitted_direction.pop(symbol, None)
+                return
+
         # ─── ONLY FILTER: cooldown (anti-duplicate guard) ──────────────
         cooldown_until = self._cooldown_until.get(symbol, 0)
         last_dir = self._last_emitted_direction.get(symbol)
@@ -703,6 +726,8 @@ class StaticGapDetector:
                 "mexc_ask":    m_ask_p,
                 "binance_mid": b_mid,
                 "mexc_mid":    m_mid,
+                "exec_ticks":      round(exec_buy_ticks if direction == "long"
+                                         else exec_sell_ticks, 2),
                 "exec_buy_ticks":  round(exec_buy_ticks, 2),
                 "exec_sell_ticks": round(exec_sell_ticks, 2),
                 "t_signal_created": t_signal_created,
