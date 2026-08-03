@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -235,6 +236,31 @@ def _as_bool(v, default: bool) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("1", "true", "yes", "on")
     return bool(v)
+
+
+def _warn_unknown_keys(raw: dict | None, dc, section: str, where: str) -> None:
+    """Попередити про ключ, якого ця збірка не знає.
+
+    Парсери читають поля через raw.get(...), тому ключ, якого немає в
+    датакласі, просто не читається — без помилки й без сліду. Небезпечно це
+    рівно в момент деплою: якщо конфіг поїхав раніше за код, стара збірка
+    ІГНОРУЄ новий ключ і при цьому слухається старих, які ти вже занулив, —
+    тобто працює зовсім без того гейту, який ти думаєш, що поставив.
+    Спіймано на PEPE 2026-08-03: ~4 хвилини без гейту по гепу.
+
+    Тільки WARNING: ямл із ключем із майбутньої версії мусить лишатись
+    завантажуваним, інакше відкат образу покладе бота.
+    """
+    if not raw:
+        return
+    known = {f.name for f in dataclasses.fields(dc)}
+    extra = sorted(set(raw) - known)
+    if extra:
+        logger.warning(
+            "[CONFIG] %s: секція %s містить ключі, яких ця збірка НЕ ЧИТАЄ: %s. "
+            "Вони не діють. Якщо це нові ключі — спершу деплой коду, потім конфіг.",
+            where, section, ", ".join(extra),
+        )
 
 
 def _parse_detector(raw: dict | None, defaults: DetectorConfig) -> DetectorConfig:
@@ -461,6 +487,11 @@ class ConfigLoader:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
         _validate_exit_strategy(raw.get("exit_strategy"), symbol)
+        _where = f"config/pairs/{symbol}.yaml"
+        _warn_unknown_keys(raw.get("detector"), DetectorConfig, "detector", _where)
+        _warn_unknown_keys(raw.get("exit_strategy"), ExitStrategyConfig,
+                           "exit_strategy", _where)
+        _warn_unknown_keys(raw.get("execution"), ExecutionConfig, "execution", _where)
         return PairConfig(
             symbol=symbol,
             detector=_parse_detector(raw.get("detector"), self._global_defaults),
