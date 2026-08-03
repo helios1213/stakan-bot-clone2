@@ -3,7 +3,7 @@
 
 meta:
   symbol: TAOUSDT
-  behavioral_epoch: 1785259889
+  behavioral_epoch: 1785796787
   note: behavioral_epoch = unix time the TUNING last changed; bump ONLY on a real
     config change, NOT on re-materialization. Analyze only trades with opened_at >=
     this.
@@ -12,7 +12,14 @@ detector:
   cooldown_sec: 3.0
   long_only: false
   short_only: false
-  max_spread_bps: 0.0
+  max_spread_bps: 2.0   # синхронізовано з основою 2026-08-04
+  # Підлога по МІД-гепу в тіках, дзеркало основи. min_ticks читає
+  # одностороннiй геп котирувань = це плюс (mexc_spread-binance_spread)/2,
+  # тож 3-тікова книга проносить 4-тікове зміщення через 5-тіковий гейт.
+  # Когорта 4.0t: 18.2% потоку, -$29.80, WR 38%, DOA 51%; 4.5/5.0/6.0t
+  # дають +0.100/+0.281/+0.625 bps і DOA падає до 30%. 4.25 стоїть у
+  # порожнечі: жодної угоди в межах +/-0.2 тіка. Revert=0.0
+  min_mid_gap_ticks: 4.25   # Revert=0.0
 exit_strategy:
   min_hold_ms: 500
   stop_adverse_bps: 10.0
@@ -48,4 +55,9 @@ execution:
   momentum_filter: false
   momentum_tau_sec: 2.0
   momentum_threshold_bps: 2.0
-  min_mexc_lag_pct: 0.02
+  # 2026-08-04: ПРИБРАНО (був 0.02). Дубль detector.min_mid_gap_ticks 4.25
+  # у гірших одиницях: тік TAO = $0.01, тож у тіках цей поріг = 0.02·price
+  # і вище $212.50 він перехоплював владу в тікового, починаючи різати
+  # прибуткову когорту 4.5t. При ціні нижче $212.50 видалення нейтральне.
+  # Не вмикати назад — гейтити мід-геп тільки в тіках.
+  min_mexc_lag_pct: 0.0
