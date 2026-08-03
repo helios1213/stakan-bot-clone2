@@ -339,8 +339,8 @@ class LiveSafetyController:
         expiry path in can_open_live does it: leaving the pre-kill high-water
         mark standing means the next losing close instantly re-crosses the
         drawdown limit and kills again, so lifting the halt would buy exactly
-        one trade. The slot gets its full LIVE_MAX_DRAWDOWN of room back from
-        where it now stands.
+        one trade. The slot gets its full drawdown allowance
+        (pct x avg_notional) back from where it now stands.
 
         today_pnl and consecutive_losses are NOT reset — the day's real PnL
         stays on the record and in the halt alert. This is an override:
