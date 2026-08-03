@@ -61,10 +61,16 @@ execution:
   ioc_offset_ticks: 1
   ioc_max_attempts: 1
   ioc_attempt_interval_ms: 0
-  margin_min_usdt: 13.0
-  margin_max_usdt: 17.0
-  leverage_min: 60
-  leverage_max: 70
+  # ⚠️ ФОЛБЕК, не істина. Розмір живої угоди задає таблиця slot_pair_sizing
+  # (slot_id, symbol) — вона виграє над цими чотирма ключами БЕЗУМОВНО.
+  # Редагувати розмір тут = no-op для будь-якого слота, у якого є рядок.
+  # Ці числа діють ЛИШЕ якщо рядок видалити (кнопка «↺ reset»), тому вони
+  # дорівнюють МІНІМУМУ по слотах — скидання не може підняти експозицію.
+  # Станом на аудит 2026-08-04: слот 1: 45-50 × 45-50
+  margin_min_usdt: 45
+  margin_max_usdt: 50
+  leverage_min: 45
+  leverage_max: 50
   stop_loss_ticks: 5
   sl_grace_sec: 1.5
   max_hold_sec: 60
