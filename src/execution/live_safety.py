@@ -60,21 +60,25 @@ class LiveSafetyController:
     def __init__(
         self,
         # Просадка від піку сесії — головний вимикач кровотечі.
-        # ⚠️ Це значення (env LIVE_MAX_DRAWDOWN → main.py → LivePool → сюди)
-        # діє ТІЛЬКИ поки слот не закрив жодної угоди в цьому процесі. Після
-        # першого закриття drawdown_limit() рахує межу як
-        #     max(min_drawdown_usdt, drawdown_pct_of_notional * avg_notional)
-        # і min() проти цього числа НЕМАЄ — тобто правка .env міняє поріг на
-        # одну угоду, далі його визначає розмір позиції. Наслідок: підняття
-        # маржі в slot_pair_sizing тихо піднімає і поріг зупинки.
-        # Обидві константи нижче не приходять ні з env, ні з yaml, ні з БД.
-        max_drawdown_usdt: float = 20.0,       # fallback until size is known
-        # Fraction of ONE position's notional. The worst drawdown in 21 days
-        # of live trading was $29.72 at ~$1,400 notional = 2.1%; 2.5% sits
-        # just above everything observed at any size.
-        drawdown_pct_of_notional: float = 0.025,
-        min_drawdown_usdt: float = 5.0,        # a bad notional must not
-                                               # produce a limit of pennies
+        # Ефективна межа = min(стеля, max(підлога, pct × avg_notional)),
+        # див. drawdown_limit(). Усі три приходять з .env через main.py →
+        # LivePool → сюди; значення тут — лише фолбек для тестів.
+        #
+        # СТЕЛЯ (env LIVE_MAX_DRAWDOWN). Захист від розгону розміру: без неї
+        # підняття маржі в slot_pair_sizing тихо піднімало й поріг зупинки
+        # (95-100 на PEPE підняли межу з $20 до $116, і жодної правки біля
+        # цього файлу не було). До 2026-08-04 min() проти неї не існувало.
+        max_drawdown_usdt: float = 150.0,
+        # МНОЖНИК (env LIVE_DRAWDOWN_PCT_OF_NOTIONAL). Фіксована сума
+        # застаріває тієї ж миті, коли міняється сайзинг, тому основне правило
+        # розмір-відносне. 1.0% заміряно по 22 слото-днях: просадка як частка
+        # нотіоналу має медіану 0.46%, p90 0.99%, максимум 1.05%. Попередні
+        # 2.5% стояли у 2.4x вище за все спостережуване і не в'язали ніколи.
+        # При 1.0% спрацювало б 3 рази за 22 дні, з них 2 на прибуткових днях.
+        drawdown_pct_of_notional: float = 0.01,
+        # ПІДЛОГА (env LIVE_MIN_DRAWDOWN): дрібний нотіонал не має давати
+        # межу в копійках.
+        min_drawdown_usdt: float = 5.0,
         kill_pause_sec: int = 14400,                    # 4h pause
 
         # Per-symbol limits
@@ -96,10 +100,9 @@ class LiveSafetyController:
         self._daily_reset_at_ts = self._next_reset_ts()
 
         logger.info(
-            "LiveSafetyController initialized: max_drawdown=$%.2f ТІЛЬКИ до "
-            "першого закриття, далі %.1f%% від нотіоналу (мін $%.2f) — "
-            "ефективна межа буде в [EQUITY] і state_summary | "
-            "max_concurrent=%d, max_margin/trade=$%.2f",
+            "LiveSafetyController initialized: просадка = min(стеля $%.2f, "
+            "%.2f%% нотіоналу, підлога $%.2f) — ефективна межа в [EQUITY] і "
+            "state_summary | max_concurrent=%d, max_margin/trade=$%.2f",
             max_drawdown_usdt,
             drawdown_pct_of_notional * 100,
             min_drawdown_usdt,
@@ -185,16 +188,21 @@ class LiveSafetyController:
         )
 
     def drawdown_limit(self) -> float:
-        """Dollars of drawdown this slot may take, at its CURRENT position size.
+        """Скільки доларів просадки цей слот може взяти при ПОТОЧНОМУ розмірі.
 
-        A fixed dollar limit is stale the moment sizing changes — and the two
-        slots differ ninefold today, so no single number fits both. Falls back
-        to the configured dollar value until the first close reveals the size.
+            min(стеля, max(підлога, pct × avg_notional))
+
+        Розмір-відносне правило основне — фіксована сума застаріває тієї ж
+        миті, коли міняється сайзинг, а слоти відрізняються в рази. Стеля
+        згори не дає підняттю маржі тихо підняти й поріг зупинки.
+
+        До першого закриття в процесі розмір ще невідомий, тож діє сама стеля.
         """
         if self.state.avg_notional_usdt <= 0:
             return self.max_drawdown_usdt
-        return max(self.min_drawdown_usdt,
-                   self.drawdown_pct_of_notional * self.state.avg_notional_usdt)
+        return min(self.max_drawdown_usdt,
+                   max(self.min_drawdown_usdt,
+                       self.drawdown_pct_of_notional * self.state.avg_notional_usdt))
 
     def record_close(self, symbol: str, pnl_usdt: float,
                      notional_usdt: float | None = None) -> None:
@@ -372,11 +380,17 @@ class LiveSafetyController:
             "peak_pnl": round(self.state.peak_pnl, 4),
             "drawdown": round(self.state.peak_pnl - self.state.today_pnl, 4),
             "drawdown_limit_usdt": round(self.drawdown_limit(), 2),
-            "drawdown_limit_basis": ("env LIVE_MAX_DRAWDOWN (до першого закриття)"
-                                     if self.state.avg_notional_usdt <= 0
-                                     else f"{self.drawdown_pct_of_notional*100:.1f}%"
-                                          f" від нотіоналу"
-                                          f" ${self.state.avg_notional_usdt:.0f}"),
+            "drawdown_limit_basis": (
+                "стеля LIVE_MAX_DRAWDOWN (розмір ще невідомий)"
+                if self.state.avg_notional_usdt <= 0 else
+                f"стеля ${self.max_drawdown_usdt:.0f}"
+                if (self.drawdown_pct_of_notional * self.state.avg_notional_usdt
+                    >= self.max_drawdown_usdt) else
+                f"підлога ${self.min_drawdown_usdt:.0f}"
+                if (self.drawdown_pct_of_notional * self.state.avg_notional_usdt
+                    <= self.min_drawdown_usdt) else
+                f"{self.drawdown_pct_of_notional*100:.2f}% від нотіоналу "
+                f"${self.state.avg_notional_usdt:.0f}"),
             "avg_notional_usdt": round(self.state.avg_notional_usdt, 2),
             "today_trades": self.state.today_trades,
             "consecutive_losses": self.state.consecutive_losses,

@@ -317,8 +317,12 @@ class TestKillSwitchReset:
         assert c.state.consecutive_losses == 12   # still counted, for the alert
         assert c.state.kill_active is False
 
-    def test_drawdown_fires_at_twenty(self):
-        c = self._ctl()
+    def test_drawdown_fires_at_the_configured_ceiling(self):
+        """Поріг береться ЯВНО: до першого закриття розмір невідомий, тож діє
+        стеля. Раніше тест спирався на дефолт конструктора (тоді 20) — тобто
+        мовчки перевіряв дефолт, а не механізм."""
+        from src.execution.live_safety import LiveSafetyController
+        c = LiveSafetyController(max_drawdown_usdt=20.0)
         c.record_close("1000PEPEUSDT", +5.0)      # peak = 5
         assert c.state.kill_active is False
         c.record_close("1000PEPEUSDT", -14.0)     # -9 total, 14 below peak
@@ -350,12 +354,17 @@ class TestKillSwitchReset:
 
 
 class TestDrawdownScalesWithSize:
-    """A dollar limit is stale the moment sizing changes — and it changed 2.5x.
+    """Фіксована сума застаріває тієї ж миті, коли міняється сайзинг.
 
-    Every historical drawdown was measured at ~$1,400 of notional, so $20 was
-    silently equivalent to $8 once PEPE moved to $2,755 — inside ordinary
-    variance, which is why it fired on profitable days. The two live slots also
-    differ ninefold ($2,755 vs $292), so no single number fits both.
+    Кожна історична просадка мірялась при ~$1,400 нотіоналу, тож $20 тихо
+    перетворились на еквівалент $8, щойно PEPE переїхав на $2,755 — усередину
+    звичайної варіативності, через що кіл спрацьовував у прибуткові дні. Слоти
+    ще й відрізняються в рази ($2,755 проти $292), тож одне число не підходить
+    обом.
+
+    2026-08-04 множник 2.5% -> 1.0%: заміряно по 22 слото-днях, просадка як
+    частка нотіоналу має медіану 0.46%, p90 0.99%, МАКСИМУМ 1.05% — тобто 2.5%
+    стояли у 2.4x вище за все спостережуване і не в'язали ніколи.
     """
 
     @staticmethod
@@ -371,10 +380,10 @@ class TestDrawdownScalesWithSize:
     def test_limit_tracks_the_position_size(self):
         c = self._ctl()
         c.record_close("1000PEPEUSDT", 0.0, notional_usdt=2755.0)
-        assert abs(c.drawdown_limit() - 68.9) < 0.5      # 2.5% of 2,755
+        assert abs(c.drawdown_limit() - 27.55) < 0.5     # 1.0% від 2,755
         d = self._ctl()
         d.record_close("LINKUSDT", 0.0, notional_usdt=292.0)
-        assert abs(d.drawdown_limit() - 7.3) < 0.5       # 2.5% of 292
+        assert abs(d.drawdown_limit() - 5.0) < 0.5       # 1.0%=2.92 -> підлога $5
 
     def test_a_big_slot_survives_what_would_have_killed_it_before(self):
         """$25 of drawdown at $2,755 notional is ordinary; the old $20 killed it."""
