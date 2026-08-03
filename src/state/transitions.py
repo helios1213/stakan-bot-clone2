@@ -40,8 +40,13 @@ class TransitionCriteria:
     # fires on normal variance and interrupts live tuning/data-collection (ONDO
     # got paused at −$0.26 / WR 47.4%). Both triggers off; re-enable by setting
     # demotion_24h_pnl_negative=True and demotion_min_winrate_24h back to 0.48.
+    # ⚠️ Поки обидва нижче в цьому стані, колонка pair_configs.auto_demotion_enabled
+    # НЕ МОЖЕ нічого змінити: PnL-гілка загейчена False, а WR-гілка вимагає
+    # winrate_24h < 0.0, чого не буває. Виставлення колонки в 1 = no-op.
     demotion_24h_pnl_negative: bool = False
     demotion_min_winrate_24h: float = 0.0
+    # МЕРТВИЙ КЛЮЧ: перевірку DD6h прибрано (давала фолс-позитиви DD=244% на
+    # прибуткових парах). Лишений тільки щоб не ламати наявні конструктори.
     demotion_max_drawdown_6h_pct: float = 20.0
 
     # paused → shadow (auto-resume)
@@ -152,10 +157,13 @@ def evaluate_live(
 ) -> TransitionDecision:
     """live → paused: any single demotion criterion triggers.
 
-    auto_demotion_enabled=False bypasses all demotion checks. Used when a pair
-    is being actively tested with a new config and we don't want stale 24h
-    metrics (from old config) to demote it before new config produces enough
-    trades for fair evaluation.
+    auto_demotion_enabled=False bypasses all demotion checks.
+
+    ⚠️ Станом на 2026-07-21 обидва тригери вимкнені в TransitionCriteria, тому
+    ця функція повертає TransitionDecision(False) НЕЗАЛЕЖНО від прапорця —
+    і =1, і =0 у pair_configs.auto_demotion_enabled дають однакову поведінку.
+    Щоб прапорець знову щось означав, треба повернути demotion_24h_pnl_negative
+    і demotion_min_winrate_24h (див. коментар у TransitionCriteria).
     """
     # Per-pair override: skip demotion entirely when explicitly disabled
     if not auto_demotion_enabled:

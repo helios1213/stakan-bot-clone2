@@ -139,13 +139,11 @@ class WebkeySlot:
     # trade time — not stored on the slot, not from pair_configs.
     assigned_pair: str | None = None      # which pair this slot trades
     live_enabled: bool = False             # is live ON for this slot
-    # Per-slot sizing OVERRIDE (2026-07-19). None = inherit the pair YAML
-    # (ConfigLoader) at trade time. Lets two accounts on the SAME pair trade
-    # different margin/leverage (e.g. slot 1 lev 60-70, slot 2 lev 45-50).
-    slot_margin_min_usdt: float | None = None
-    slot_margin_max_usdt: float | None = None
-    slot_leverage_min: int | None = None
-    slot_leverage_max: int | None = None
+    # УВАГА: колонок slot_margin_*/slot_leverage_* тут БІЛЬШЕ НЕМАЄ.
+    # Вони існують у таблиці webkey_slots (2026-07-19), але були замінені тим
+    # самим днем на slot_pair_sizing і не читались ніде — при цьому мали ті
+    # самі імена, що й ключі, які реально сайзять угоду в shadow_engine.
+    # Розмір: slot_pair_sizing (slot_id, symbol) → live_pool.get_slot_config.
     # Epoch until which this account is under a MEXC 10014 open-rate limit.
     open_throttle_until: int | None = None
 
@@ -401,8 +399,6 @@ class WebkeyStore:
                    last_health_check, last_latency_ms, last_balance_usdt,
                    last_error, webkey_refreshed_at, created_at, updated_at,
                    assigned_pair, live_enabled,
-                   slot_margin_min_usdt, slot_margin_max_usdt,
-                   slot_leverage_min, slot_leverage_max,
                    open_throttle_until
               FROM webkey_slots
              WHERE slot_id=?
@@ -420,8 +416,6 @@ class WebkeyStore:
                    last_health_check, last_latency_ms, last_balance_usdt,
                    last_error, webkey_refreshed_at, created_at, updated_at,
                    assigned_pair, live_enabled,
-                   slot_margin_min_usdt, slot_margin_max_usdt,
-                   slot_leverage_min, slot_leverage_max,
                    open_throttle_until
               FROM webkey_slots
              ORDER BY slot_id
@@ -738,9 +732,5 @@ class WebkeyStore:
             updated_at=int(row["updated_at"]),
             assigned_pair=_safe("assigned_pair"),
             live_enabled=bool(_safe("live_enabled", 0)),
-            slot_margin_min_usdt=_safe("slot_margin_min_usdt"),
-            slot_margin_max_usdt=_safe("slot_margin_max_usdt"),
-            slot_leverage_min=_safe("slot_leverage_min"),
-            slot_leverage_max=_safe("slot_leverage_max"),
             open_throttle_until=_safe("open_throttle_until"),
         )

@@ -3344,6 +3344,60 @@ class ShadowEngine:
         self._sizing_warned[key] = (fingerprint, now)
         return True
 
+    def _log_stop_units(self) -> None:
+        """Який стоп в'яже зараз і за якого руху ціни це перемкнеться.
+
+        stop_loss_ticks і stop_adverse_bps — одна величина у двох одиницях, у
+        різних блоках YAML, з різним пріоритетом перевірки. Хто з них головний,
+        залежить від ЦІНИ, тому це не можна записати коментарем у файл: на PENGU
+        сьогодні різниця лише 1.2x, і рух ціни на ~19% міняє відповідь.
+        """
+        loader = getattr(self, "_config_loader", None)
+        if loader is None or self.state_manager is None:
+            return
+        seen = getattr(self, "_stop_units_seen", None)
+        if seen is None:
+            seen = self._stop_units_seen = {}
+        for symbol, cfg in list(self._pair_configs.items()):
+            try:
+                if not self.state_manager.is_in_live(symbol):
+                    continue
+                sl_t = float(getattr(cfg, "stop_loss_ticks", 0) or 0)
+                es = loader.get(symbol).exit_strategy
+                adv_bps = float(getattr(es, "stop_adverse_bps", 0) or 0)
+                if sl_t <= 0 or adv_bps <= 0:
+                    continue
+                ob = self.ob_manager.get("mexc", symbol)
+                bb = ob.best_bid() if ob else None
+                ba = ob.best_ask() if ob else None
+                if bb is None or ba is None:
+                    continue
+                mid = (float(bb.price) + float(ba.price)) / 2
+                mxsym = to_mexc(symbol)
+                tick = get_tick_size(mxsym) * get_binance_scale(mxsym)
+                if mid <= 0 or tick <= 0:
+                    continue
+                tick_bps = tick / mid * 1e4
+                adv_t = adv_bps / tick_bps          # bps-стоп у тіках
+                binds = "ticks" if sl_t <= adv_t else "bps"
+                # ціна, на якій два стопи зрівняються
+                flip = sl_t * tick * 1e4 / adv_bps
+                key = (binds, round(adv_t, 1))
+                if seen.get(symbol) == key:
+                    continue
+                seen[symbol] = key
+                logger.info(
+                    "[STOPS] %s: в'яже %s | stop_loss_ticks=%.0f (=%.2f bps) "
+                    "після sl_grace %.1fс; stop_adverse_bps=%.1f (=%.1ft) діє "
+                    "лише у вікні min_hold..sl_grace. Порівняються при ціні "
+                    "%.8g (%+.1f%% від %.8g).",
+                    symbol, "ТІКИ" if binds == "ticks" else "BPS",
+                    sl_t, sl_t * tick_bps, float(getattr(cfg, "sl_grace_sec", 0) or 0),
+                    adv_bps, adv_t, flip, (flip / mid - 1) * 100, mid,
+                )
+            except Exception:
+                continue
+
     async def _warn_on_sizing_drift(self) -> None:
         """Shout when a live pair's YAML sizing is not what its slots use.
 
@@ -3379,18 +3433,32 @@ class ShadowEngine:
                                 "Check that is intended.",
                                 symbol, sid, yaml_n)
                         continue
-                    eff = (((mmin if mmin is not None else cfg.margin_min_usdt)
-                            + (mmax if mmax is not None else cfg.margin_max_usdt)) / 2
-                           * ((lmin if lmin is not None else cfg.leverage_min)
-                              + (lmax if lmax is not None else cfg.leverage_max)) / 2)
-                    if (yaml_n > 0 and abs(eff - yaml_n) / yaml_n > 0.25
-                            and self._sizing_should_warn(
-                                symbol, sid, f"{eff:.0f}/{yaml_n:.0f}")):
+                    _em0 = mmin if mmin is not None else cfg.margin_min_usdt
+                    _em1 = mmax if mmax is not None else cfg.margin_max_usdt
+                    _el0 = lmin if lmin is not None else cfg.leverage_min
+                    _el1 = lmax if lmax is not None else cfg.leverage_max
+                    eff = (_em0 + _em1) / 2 * (_el0 + _el1) / 2
+                    # ПОЛЕ В ПОЛЕ, не середній нотіонал з допуском 25%.
+                    # Маржа вгору + плече вниз дають майже той самий нотіонал і
+                    # гасять одне одного, хоча дистанція до ліквідації міняється:
+                    # 97.5x47.5 проти ямлових 77.5x67.5 — це 11.5% по нотіоналу
+                    # (сторож мовчав) і 1.42x по плечу.
+                    _diff = [d for d in (
+                        ("margin_min", _em0, cfg.margin_min_usdt),
+                        ("margin_max", _em1, cfg.margin_max_usdt),
+                        ("leverage_min", _el0, cfg.leverage_min),
+                        ("leverage_max", _el1, cfg.leverage_max),
+                    ) if abs(float(d[1]) - float(d[2])) > 1e-9]
+                    if _diff and self._sizing_should_warn(
+                            symbol, sid, "|".join(f"{n}{a}/{b}" for n, a, b in _diff)):
                         logger.warning(
-                            "[SIZING] %s slot=%d trades $%.0f but the YAML says "
-                            "$%.0f (%.1fx). Dropping the override would jump the "
-                            "position to the YAML figure.",
-                            symbol, sid, eff, yaml_n, yaml_n / eff if eff else 0)
+                            "[SIZING] %s slot=%d: БД slot_pair_sizing розходиться з "
+                            "YAML по %s. Торгує $%.0f нотіоналу, YAML каже $%.0f. "
+                            "Видалення оверрайду (кнопка ↺ reset) перекине слот на "
+                            "ямлові числа.",
+                            symbol, sid,
+                            ", ".join(f"{n} {a:g}≠{b:g}" for n, a, b in _diff),
+                            eff, yaml_n)
         except Exception:
             logger.exception("[SIZING] drift check failed")
 
@@ -3447,6 +3515,10 @@ class ShadowEngine:
             await self._warn_on_sizing_drift()
         except Exception:
             logger.exception("[SIZING] drift check raised")
+        try:
+            self._log_stop_units()
+        except Exception:
+            logger.exception("[STOPS] unit check raised")
 
     # ============================================================
     # Public introspection (for stats logger)

@@ -231,6 +231,22 @@ class PairStateManager:
             )
             for r in rows:
                 demotion_enabled_map[r["symbol"]] = bool(r["auto_demotion_enabled"])
+            # Прапорець у БД виглядає живим, але поки обидва пороги в
+            # TransitionCriteria вимкнені, він не може нічого — скажемо це вголос
+            # один раз, щоб ніхто не розраховував на захист, якого немає.
+            if not getattr(self, "_demotion_noop_warned", False):
+                self._demotion_noop_warned = True
+                if (not self.criteria.demotion_24h_pnl_negative
+                        and self.criteria.demotion_min_winrate_24h <= 0):
+                    _on = sorted(s for s, v in demotion_enabled_map.items() if v)
+                    logger.warning(
+                        "[DEMOTION] авто-демоція вимкнена глобально "
+                        "(demotion_24h_pnl_negative=False, min_winrate_24h=%.2f) — "
+                        "pair_configs.auto_demotion_enabled=1 у %d пар (%s) "
+                        "НЕ ДІЄ. Грошові кіли (peak-drawdown, cumulative) окремі "
+                        "й не зачеплені.",
+                        self.criteria.demotion_min_winrate_24h, len(_on),
+                        ", ".join(_on) or "—")
         except Exception:
             # Column may not exist yet (pre-migration) — treat all as enabled
             pass

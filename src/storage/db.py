@@ -600,11 +600,14 @@ async def init_db(db_path: str) -> None:
         ])
         # 2026-07-19: per-slot margin/leverage OVERRIDE (NULL = inherit pair YAML).
         # Lets two accounts on the same pair trade different sizing.
-        # NOTE: SUPERSEDED same day by the per-(slot,pair) slot_pair_sizing table
-        # below — the per-slot columns are now unused (kept only to avoid a
-        # sqlite table rebuild; all NULL). Sizing overrides live in
-        # slot_pair_sizing keyed by (slot_id, symbol) so the Telegram flow is
-        # "pick pair -> pick slot -> set sizing FOR THAT PAIR on that slot".
+        # ⚠️ МЕРТВІ КОЛОНКИ. Замінені тим самим днем таблицею slot_pair_sizing;
+        # усі NULL, жоден код їх не читає, жоден UI не пише. Лишені тільки щоб
+        # не перебудовувати sqlite-таблицю з зашифрованими блобами.
+        # ПАСТКА: імена збігаються з ключами, які СПРАВДІ сайзять угоду
+        # (shadow_engine бере slot_margin_min_usdt із slot_pair_sizing через
+        # live_pool). UPDATE webkey_slots SET slot_margin_min_usdt=... запишеться
+        # чисто, переживе рестарт і не змінить розмір позиції.
+        # Розмір міняти ТІЛЬКИ через slot_pair_sizing (Telegram/панель).
         await _add_columns_idempotent(db, "webkey_slots", [
             ("slot_margin_min_usdt",  "REAL"),
             ("slot_margin_max_usdt",  "REAL"),

@@ -41,9 +41,10 @@ class LiveExecutorPool:
         webkey_store,       # WebkeyStore
         alerts=None,        # Optional[TelegramAlerts]
         private_ws_pool=None,  # Optional[MexcPrivateWSPool] — push-based fills
-        # Default safety params (per slot). SINGLE SOURCE OF TRUTH = env
-        # LIVE_MAX_DRAWDOWN (read in main.py and passed in here); this is
-        # ONLY the fallback if env is unset. To change it, edit .env.
+        # Стартове значення просадки з env LIVE_MAX_DRAWDOWN (main.py).
+        # УВАГА: воно діє тільки ДО першого закриття цього слота — далі
+        # LiveSafetyController рахує межу як 2.5% від середнього нотіоналу
+        # (live_safety.drawdown_limit). Правка .env міняє поріг на одну угоду.
         default_max_drawdown_usdt: float = 20.0,
         default_max_per_symbol: int = 1,
         default_max_total: int = 1,
@@ -182,12 +183,14 @@ class LiveExecutorPool:
         returns None if there is no row — the caller treats None as "pair not
         configured for live → skip the slot".
 
-        The returned dict carries BOTH the pair YAML base (margin_*/leverage_*)
-        AND this (slot, pair) override (slot_margin_*/slot_leverage_*, None =
-        inherit). shadow_engine's live-open MERGES them (override wins, YAML
-        fallback) and randomizes within that effective range to size the REAL
-        order — so the slot_* fields DO size the trade when set. It also gates
-        admission: None here = pair not configured for live → skip the slot.
+        Розмір несуть ТІЛЬКИ поля slot_* — вони приходять з таблиці
+        slot_pair_sizing (slot_id, symbol). shadow_engine бере їх, а якщо поле
+        None — падає на pair YAML через ConfigLoader (НЕ на pair_configs).
+
+        Рядок pair_configs читається лише як допуск: None = пара не
+        налаштована для live → пропустити слот. Його margin_*/leverage_*
+        колись теж клались у цей dict і не читались ніде (grep: нуль
+        звернень) — прибрані, щоб не було третьої копії тієї самої величини.
         """
         slot = await self.webkey_store.get(slot_id)
         if symbol is None:
@@ -211,10 +214,7 @@ class LiveExecutorPool:
         ovr = await self.webkey_store.get_slot_pair_sizing(slot_id, symbol) or {}
         return {
             "symbol": symbol,
-            "margin_min_usdt": sizing["margin_min_usdt"],
-            "margin_max_usdt": sizing["margin_max_usdt"],
-            "leverage_min": sizing["leverage_min"],
-            "leverage_max": sizing["leverage_max"],
+            # ЄДИНЕ джерело розміру. None = успадкувати pair YAML у двигуні.
             "slot_margin_min_usdt": ovr.get("margin_min_usdt"),
             "slot_margin_max_usdt": ovr.get("margin_max_usdt"),
             "slot_leverage_min": ovr.get("leverage_min"),

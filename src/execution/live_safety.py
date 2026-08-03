@@ -59,10 +59,15 @@ class LiveSafetyController:
 
     def __init__(
         self,
-        # THE kill switch — peak drawdown. Halt if PnL falls this far BELOW
-        # the session high-water mark, which catches a genuine bleed even inside
-        # a net-positive day. SINGLE SOURCE = env LIVE_MAX_DRAWDOWN
-        # (main.py → LivePool → here); this is only the unset-env fallback.
+        # Просадка від піку сесії — головний вимикач кровотечі.
+        # ⚠️ Це значення (env LIVE_MAX_DRAWDOWN → main.py → LivePool → сюди)
+        # діє ТІЛЬКИ поки слот не закрив жодної угоди в цьому процесі. Після
+        # першого закриття drawdown_limit() рахує межу як
+        #     max(min_drawdown_usdt, drawdown_pct_of_notional * avg_notional)
+        # і min() проти цього числа НЕМАЄ — тобто правка .env міняє поріг на
+        # одну угоду, далі його визначає розмір позиції. Наслідок: підняття
+        # маржі в slot_pair_sizing тихо піднімає і поріг зупинки.
+        # Обидві константи нижче не приходять ні з env, ні з yaml, ні з БД.
         max_drawdown_usdt: float = 20.0,       # fallback until size is known
         # Fraction of ONE position's notional. The worst drawdown in 21 days
         # of live trading was $29.72 at ~$1,400 notional = 2.1%; 2.5% sits
@@ -91,9 +96,13 @@ class LiveSafetyController:
         self._daily_reset_at_ts = self._next_reset_ts()
 
         logger.info(
-            "LiveSafetyController initialized: max_drawdown=$%.2f (the only "
-            "kill), max_concurrent=%d, max_margin/trade=$%.2f",
+            "LiveSafetyController initialized: max_drawdown=$%.2f ТІЛЬКИ до "
+            "першого закриття, далі %.1f%% від нотіоналу (мін $%.2f) — "
+            "ефективна межа буде в [EQUITY] і state_summary | "
+            "max_concurrent=%d, max_margin/trade=$%.2f",
             max_drawdown_usdt,
+            drawdown_pct_of_notional * 100,
+            min_drawdown_usdt,
             max_concurrent_total,
             max_margin_per_trade_usdt,
         )
@@ -348,6 +357,8 @@ class LiveSafetyController:
         return int(time.time()) < self.state.kill_until_ts
 
     def state_summary(self) -> dict:
+        # drawdown_limit_usdt — ЕФЕКТИВНА межа зараз, а не те, що в .env.
+        # Без неї жоден екран не показує число, за яким слот справді стане.
         from datetime import datetime
         kill_until_human = "indefinite"
         if self.state.kill_until_ts > 0:
@@ -360,6 +371,13 @@ class LiveSafetyController:
             "today_pnl": round(self.state.today_pnl, 4),
             "peak_pnl": round(self.state.peak_pnl, 4),
             "drawdown": round(self.state.peak_pnl - self.state.today_pnl, 4),
+            "drawdown_limit_usdt": round(self.drawdown_limit(), 2),
+            "drawdown_limit_basis": ("env LIVE_MAX_DRAWDOWN (до першого закриття)"
+                                     if self.state.avg_notional_usdt <= 0
+                                     else f"{self.drawdown_pct_of_notional*100:.1f}%"
+                                          f" від нотіоналу"
+                                          f" ${self.state.avg_notional_usdt:.0f}"),
+            "avg_notional_usdt": round(self.state.avg_notional_usdt, 2),
             "today_trades": self.state.today_trades,
             "consecutive_losses": self.state.consecutive_losses,
             "open_live_positions": dict(self.state.open_live_positions),

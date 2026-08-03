@@ -1,16 +1,18 @@
-"""Tests for source-of-truth consolidation (v6, May 2026).
+"""Хто саме сайзить живу угоду — і хто лише виглядає так, ніби сайзить.
 
-In v6, pair_configs is THE ONLY source for live and shadow sizing.
-Three previous sources have been removed:
-  - webkey_slots.live_margin_*/live_leverage_*
-  - live_pair_whitelist.margin_*/leverage_*
-  - pair_configs.margin_usdt/leverage (legacy single-value fields)
+Ланцюг рівно один:
 
-This test suite validates:
-  1. get_slot_config reads from pair_configs
-  2. get_pair_sizing returns the right data structure
-  3. get_slot_config returns None when the pair_configs row is missing
-     (no hardcoded fallback — pair_configs is the sole source of truth)
+    slot_pair_sizing(slot_id, symbol)  →  live_pool.get_slot_config → slot_*
+                                       →  shadow_engine live-open
+    поле None                          →  фолбек на pair YAML (ConfigLoader)
+
+Рядок pair_configs потрібен ТІЛЬКИ як допуск: немає рядка → get_slot_config
+віддає None → слот пропускається. Його margin_*/leverage_* колись теж клались
+у slot_cfg і не читались ніде — прибрані 2026-08-04, бо іменами збігались із
+живими ключами й створювали третю копію тієї самої величини.
+
+Історично тут було написано "pair_configs is THE ONLY source for live and
+shadow sizing" — це перестало бути правдою, коли зʼявилась slot_pair_sizing.
 """
 from __future__ import annotations
 
@@ -67,13 +69,18 @@ class TestPairConfigsAsOnlySource:
         pool = _mk_pool(store)
 
         cfg = await pool.get_slot_config(1)
-        assert cfg["margin_min_usdt"] == 2.0
-        assert cfg["margin_max_usdt"] == 7.0
-        assert cfg["leverage_min"] == 50
-        assert cfg["leverage_max"] == 100
-        # No per-(slot,pair) override → slot_* keys are None (inherit pair YAML).
+        # Рядок pair_configs = допуск. Є рядок → слот допущений.
+        assert cfg is not None
+        assert cfg["symbol"] == "PENGUUSDT"
+        # Без рядка slot_pair_sizing поля розміру None → двигун візьме pair YAML.
         assert cfg["slot_leverage_min"] is None
         assert cfg["slot_margin_min_usdt"] is None
+        # Числа з pair_configs у slot_cfg НЕ потрапляють: їх не читав ніхто, а
+        # імена збігались із живими ключами. Якщо цей асерт впав — хтось повернув
+        # третю копію розміру, і правка YAML/БД знову буде мовчазним no-op.
+        for _dead in ("margin_min_usdt", "margin_max_usdt",
+                      "leverage_min", "leverage_max"):
+            assert _dead not in cfg, f"{_dead} повернувся у slot_cfg — див. докстрінг"
 
     @pytest.mark.asyncio
     async def test_per_slot_pair_override_flows_into_cfg(self):
@@ -94,9 +101,7 @@ class TestPairConfigsAsOnlySource:
         pool = _mk_pool(store)
 
         cfg = await pool.get_slot_config(1)
-        # Pair (admission) values untouched…
-        assert cfg["leverage_min"] == 50
-        # …and the per-(slot,pair) override rides along for shadow_engine.
+        # Розмір приходить ТІЛЬКИ звідси — і виграє над pair YAML безумовно.
         assert cfg["slot_margin_min_usdt"] == 25.0
         assert cfg["slot_margin_max_usdt"] == 30.0
         assert cfg["slot_leverage_min"] == 45

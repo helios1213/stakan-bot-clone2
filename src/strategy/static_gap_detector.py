@@ -139,7 +139,11 @@ class StaticGapDetector:
         self.signals_skip_wide_spread = 0
         self.signals_skip_narrow_mid_gap = 0
         self.signals_skip_no_exec_edge = 0
+        # long_only/short_only — окремо від min_ticks, інакше три різні
+        # причини зливаються в один лічильник і атрибуції немає.
+        self.signals_skip_direction_filter = 0
         self.signals_skip_reference_only = 0
+        self._gate_skips_prev: dict[str, int] = {}
 
         # ─── event-driven scan loop ─────────────────────────────────────
         # OrderBook listeners on both Binance and MEXC books mark symbols
@@ -627,7 +631,7 @@ class StaticGapDetector:
         if direction == "short":
             ovr = self._pair_overrides.get(symbol)
             if ovr is not None and ovr.long_only:
-                self.signals_skip_below_threshold += 1
+                self.signals_skip_direction_filter += 1
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
@@ -635,7 +639,7 @@ class StaticGapDetector:
         if direction == "long":
             ovr = self._pair_overrides.get(symbol)
             if ovr is not None and getattr(ovr, "short_only", False):
-                self.signals_skip_below_threshold += 1
+                self.signals_skip_direction_filter += 1
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
@@ -822,8 +826,35 @@ class StaticGapDetector:
                     summary["count"], summary["p50_us"],
                     summary["p99_us"], summary["mean_us"],
                 )
+                self._log_gate_skips()
         except asyncio.CancelledError:
             return
+
+    def _log_gate_skips(self) -> None:
+        """Скільки сигналів відкинули ворота — кумулятивно і за останні 30с.
+
+        Без цього рядка налаштоване значення не має рантайм-підтвердження:
+        ворота, що ріже 100% потоку, виглядає точно як пара, що затихла.
+        Друкується тільки коли щось відкинуто, щоб не засмічувати лог.
+        """
+        cur = {
+            "wide_spread":      self.signals_skip_wide_spread,
+            "narrow_mid_gap":   self.signals_skip_narrow_mid_gap,
+            "no_exec_edge":     self.signals_skip_no_exec_edge,
+            "direction_filter": self.signals_skip_direction_filter,
+            "below_min_ticks":  self.signals_skip_below_threshold,
+            "cooldown":         self.signals_skip_cooldown,
+        }
+        prev = self._gate_skips_prev
+        self._gate_skips_prev = dict(cur)
+        if not any(cur.values()):
+            return
+        logger.info(
+            "[GATE_SKIPS] emitted=%d | %s",
+            self.signals_emitted,
+            " ".join(f"{k}={v}(+{v - prev.get(k, 0)})"
+                     for k, v in cur.items() if v),
+        )
 
     def stats(self) -> dict[str, Any]:
         return {
@@ -832,6 +863,10 @@ class StaticGapDetector:
             "signals_skip_cooldown": self.signals_skip_cooldown,
             "signals_skip_no_ob": self.signals_skip_no_ob,
             "signals_skip_below_threshold": self.signals_skip_below_threshold,
+            "signals_skip_wide_spread":      self.signals_skip_wide_spread,
+            "signals_skip_narrow_mid_gap":   self.signals_skip_narrow_mid_gap,
+            "signals_skip_no_exec_edge":     self.signals_skip_no_exec_edge,
+            "signals_skip_direction_filter": self.signals_skip_direction_filter,
             "signals_skip_reference_only": self.signals_skip_reference_only,
             "event_driven_checks":    self.event_driven_checks,
             "safety_scan_count":      self.safety_scan_count,
