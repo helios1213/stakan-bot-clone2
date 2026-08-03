@@ -69,6 +69,7 @@ class PerPairDetectorOverride:
     short_only: bool = False
     max_spread_bps: float = 0.0
     min_mid_gap_ticks: float = 0.0
+    max_mid_gap_ticks: float = 0.0
     min_exec_ticks: float = 0.0
 
 
@@ -138,6 +139,7 @@ class StaticGapDetector:
         self.signals_skip_below_threshold = 0
         self.signals_skip_wide_spread = 0
         self.signals_skip_narrow_mid_gap = 0
+        self.signals_skip_wide_mid_gap = 0
         self.signals_skip_no_exec_edge = 0
         # long_only/short_only — окремо від min_ticks, інакше три різні
         # причини зливаються в один лічильник і атрибуції немає.
@@ -261,6 +263,7 @@ class StaticGapDetector:
                 short_only=d.short_only,
                 max_spread_bps=d.max_spread_bps,
                 min_mid_gap_ticks=d.min_mid_gap_ticks,
+                max_mid_gap_ticks=d.max_mid_gap_ticks,
                 min_exec_ticks=d.min_exec_ticks,
             )
             new_overrides[symbol] = ovr
@@ -662,10 +665,20 @@ class StaticGapDetector:
         # 27%. Ticks, not bps: the mid lands on a half-tick grid and a bps
         # threshold would cut a different cohort as the price drifts.
         # 0 = off (default; behaviour-preserving).
+        # max_mid_gap_ticks — дзеркальний ПОТОЛОК тієї ж величини. Потрібен, щоб
+        # пару можна було зняти з bps-смуги (min/max_mexc_lag_pct) не втративши
+        # верхню межу: широкі геп-когорти PEPE (6.0-8.0t) стабільно програють,
+        # а bps-потолок ріже їх лише поки ціна низька — при 0.0030 когорта 6.0t
+        # заходить у смугу без жодної правки конфігу.
         _ovr_mg = self._pair_overrides.get(symbol)
         if _ovr_mg is not None and _ovr_mg.min_mid_gap_ticks > 0 and tick_scaled > 0:
             if abs(b_mid - m_mid) / tick_scaled < _ovr_mg.min_mid_gap_ticks - gap_eps:
                 self.signals_skip_narrow_mid_gap += 1
+                self._last_emitted_direction.pop(symbol, None)
+                return
+        if _ovr_mg is not None and _ovr_mg.max_mid_gap_ticks > 0 and tick_scaled > 0:
+            if abs(b_mid - m_mid) / tick_scaled > _ovr_mg.max_mid_gap_ticks + gap_eps:
+                self.signals_skip_wide_mid_gap += 1
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
@@ -840,6 +853,7 @@ class StaticGapDetector:
         cur = {
             "wide_spread":      self.signals_skip_wide_spread,
             "narrow_mid_gap":   self.signals_skip_narrow_mid_gap,
+            "wide_mid_gap":     self.signals_skip_wide_mid_gap,
             "no_exec_edge":     self.signals_skip_no_exec_edge,
             "direction_filter": self.signals_skip_direction_filter,
             "below_min_ticks":  self.signals_skip_below_threshold,
@@ -865,6 +879,7 @@ class StaticGapDetector:
             "signals_skip_below_threshold": self.signals_skip_below_threshold,
             "signals_skip_wide_spread":      self.signals_skip_wide_spread,
             "signals_skip_narrow_mid_gap":   self.signals_skip_narrow_mid_gap,
+            "signals_skip_wide_mid_gap":     self.signals_skip_wide_mid_gap,
             "signals_skip_no_exec_edge":     self.signals_skip_no_exec_edge,
             "signals_skip_direction_filter": self.signals_skip_direction_filter,
             "signals_skip_reference_only": self.signals_skip_reference_only,

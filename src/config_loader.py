@@ -56,6 +56,11 @@ class DetectorConfig:
     # a bps threshold slides across those cohorts as the price moves.
     # 0 = off.
     min_mid_gap_ticks: float = 0.0
+    # >0 = reject signals whose MID gap is ABOVE this many ticks.
+    # Парний до min_mid_gap_ticks: без нього пару не можна зняти з
+    # bps-смуги (min/max_mexc_lag_pct), бо верхня межа просто зникне,
+    # а широкі геп-когорти на PEPE стабільно програють. 0 = off.
+    max_mid_gap_ticks: float = 0.0
     # >0 = reject signals whose EXECUTABLE edge is below this many ticks.
     # exec = (binance_bid - mexc_ask)/tick for a long, mirrored for a short:
     # the dislocation net of both books' spreads, i.e. what is left after
@@ -244,6 +249,7 @@ def _parse_detector(raw: dict | None, defaults: DetectorConfig) -> DetectorConfi
         short_only=bool(raw.get("short_only", defaults.short_only)),
         max_spread_bps=float(raw.get("max_spread_bps", defaults.max_spread_bps)),
         min_mid_gap_ticks=float(raw.get("min_mid_gap_ticks", defaults.min_mid_gap_ticks)),
+        max_mid_gap_ticks=float(raw.get("max_mid_gap_ticks", defaults.max_mid_gap_ticks)),
         min_exec_ticks=float(raw.get("min_exec_ticks", defaults.min_exec_ticks)),
     )
 
