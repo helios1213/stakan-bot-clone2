@@ -2,9 +2,21 @@
 Live Safety Controller — protect real capital from runaway bugs and bad markets.
 
 ONE automatic kill, on purpose: PEAK DRAWDOWN. Halt the slot when PnL falls
-LIVE_MAX_DRAWDOWN below the session high-water mark. Measuring from the peak
-rather than from zero is what lets it catch a real bleed inside a day that is
-still net-positive.
+`LIVE_DRAWDOWN_PCT_OF_NOTIONAL × avg_notional` below the session high-water
+mark. Measuring from the peak rather than from zero is what lets it catch a
+real bleed inside a day that is still net-positive.
+
+ONE number, on purpose. A fixed dollar limit is stale the moment sizing
+changes, so the limit is a fraction of the position — and 2026-08-04 the
+absolute ceiling (LIVE_MAX_DRAWDOWN) and floor (LIVE_MIN_DRAWDOWN) were
+removed, because three numbers on one threshold meant nobody could say which
+was binding. 1.0% is measured: over 22 slot-days the drawdown-to-notional ratio
+has median 0.46%, p90 0.99%, max 1.05% (the previous 2.5% sat above everything
+ever observed and never fired).
+
+Until the slot closes its first trade the size is unknown and the limit is 0,
+i.e. no kill. record_close computes the limit AFTER updating avg_notional, so
+the very first close arms it.
 
 A cumulative daily-loss threshold and a consecutive-loss pause used to sit
 alongside it. Both were removed 2026-07-28: a profitable day masked the first
@@ -59,26 +71,22 @@ class LiveSafetyController:
 
     def __init__(
         self,
-        # Просадка від піку сесії — головний вимикач кровотечі.
-        # Ефективна межа = min(стеля, max(підлога, pct × avg_notional)),
-        # див. drawdown_limit(). Усі три приходять з .env через main.py →
-        # LivePool → сюди; значення тут — лише фолбек для тестів.
+        # ЄДИНИЙ автоматичний кіл: просадка від піку сесії.
+        # Межа = drawdown_pct_of_notional × avg_notional, більше нічого.
+        # Приходить з env LIVE_DRAWDOWN_PCT_OF_NOTIONAL через main.py →
+        # LivePool → сюди; значення тут — фолбек для тестів.
         #
-        # СТЕЛЯ (env LIVE_MAX_DRAWDOWN). Захист від розгону розміру: без неї
-        # підняття маржі в slot_pair_sizing тихо піднімало й поріг зупинки
-        # (95-100 на PEPE підняли межу з $20 до $116, і жодної правки біля
-        # цього файлу не було). До 2026-08-04 min() проти неї не існувало.
-        max_drawdown_usdt: float = 150.0,
-        # МНОЖНИК (env LIVE_DRAWDOWN_PCT_OF_NOTIONAL). Фіксована сума
-        # застаріває тієї ж миті, коли міняється сайзинг, тому основне правило
-        # розмір-відносне. 1.0% заміряно по 22 слото-днях: просадка як частка
-        # нотіоналу має медіану 0.46%, p90 0.99%, максимум 1.05%. Попередні
-        # 2.5% стояли у 2.4x вище за все спостережуване і не в'язали ніколи.
-        # При 1.0% спрацювало б 3 рази за 22 дні, з них 2 на прибуткових днях.
+        # 1.0% заміряно по 22 слото-днях: просадка як частка нотіоналу має
+        # медіану 0.46%, p90 0.99%, максимум 1.05%. Попередні 2.5% стояли у
+        # 2.4x вище за все спостережуване і не в'язали НІКОЛИ. При 1.0%
+        # спрацювало б 3 рази за 22 дні, з них 2 на прибуткових днях.
+        #
+        # ⚠️ Абсолютних стелі й підлоги більше немає (видалені 2026-08-04):
+        # три числа на одну межу означали, що ніхто не міг сказати, яке з них
+        # зараз в'яже. Наслідок — на дрібному нотіоналі межа мікроскопічна
+        # (HYPE ~$94 -> $0.94), тож перед вмиканням такої пари в лайв поріг
+        # треба переглянути.
         drawdown_pct_of_notional: float = 0.01,
-        # ПІДЛОГА (env LIVE_MIN_DRAWDOWN): дрібний нотіонал не має давати
-        # межу в копійках.
-        min_drawdown_usdt: float = 5.0,
         kill_pause_sec: int = 14400,                    # 4h pause
 
         # Per-symbol limits
@@ -88,9 +96,7 @@ class LiveSafetyController:
         # Margin sanity
         max_margin_per_trade_usdt: float = 10.0,        # never risk more than this
     ) -> None:
-        self.max_drawdown_usdt = max_drawdown_usdt
         self.drawdown_pct_of_notional = drawdown_pct_of_notional
-        self.min_drawdown_usdt = min_drawdown_usdt
         self.kill_pause_sec = kill_pause_sec
         self.max_concurrent_per_symbol = max_concurrent_per_symbol
         self.max_concurrent_total = max_concurrent_total
@@ -100,12 +106,11 @@ class LiveSafetyController:
         self._daily_reset_at_ts = self._next_reset_ts()
 
         logger.info(
-            "LiveSafetyController initialized: просадка = min(стеля $%.2f, "
-            "%.2f%% нотіоналу, підлога $%.2f) — ефективна межа в [EQUITY] і "
-            "state_summary | max_concurrent=%d, max_margin/trade=$%.2f",
-            max_drawdown_usdt,
+            "LiveSafetyController initialized: єдиний кіл — просадка %.2f%% "
+            "нотіоналу (ефективна межа в [EQUITY] і state_summary; до першого "
+            "закриття розмір невідомий і кіла немає) | max_concurrent=%d, "
+            "max_margin/trade=$%.2f",
             drawdown_pct_of_notional * 100,
-            min_drawdown_usdt,
             max_concurrent_total,
             max_margin_per_trade_usdt,
         )
@@ -190,19 +195,19 @@ class LiveSafetyController:
     def drawdown_limit(self) -> float:
         """Скільки доларів просадки цей слот може взяти при ПОТОЧНОМУ розмірі.
 
-            min(стеля, max(підлога, pct × avg_notional))
+            pct × avg_notional
 
-        Розмір-відносне правило основне — фіксована сума застаріває тієї ж
-        миті, коли міняється сайзинг, а слоти відрізняються в рази. Стеля
-        згори не дає підняттю маржі тихо підняти й поріг зупинки.
+        Одне число і жодних конкурентів. Фіксована сума застаріває тієї ж миті,
+        коли міняється сайзинг, а слоти відрізняються в рази — тому межа є
+        часткою позиції, а не доларом.
 
-        До першого закриття в процесі розмір ще невідомий, тож діє сама стеля.
+        Поки слот не закрив жодної угоди, розмір невідомий і межа = 0, тобто
+        кіла немає: record_close рахує межу вже ПІСЛЯ оновлення avg_notional,
+        тож перша ж закрита угода її вмикає.
         """
         if self.state.avg_notional_usdt <= 0:
-            return self.max_drawdown_usdt
-        return min(self.max_drawdown_usdt,
-                   max(self.min_drawdown_usdt,
-                       self.drawdown_pct_of_notional * self.state.avg_notional_usdt))
+            return 0.0
+        return self.drawdown_pct_of_notional * self.state.avg_notional_usdt
 
     def record_close(self, symbol: str, pnl_usdt: float,
                      notional_usdt: float | None = None) -> None:
@@ -381,14 +386,8 @@ class LiveSafetyController:
             "drawdown": round(self.state.peak_pnl - self.state.today_pnl, 4),
             "drawdown_limit_usdt": round(self.drawdown_limit(), 2),
             "drawdown_limit_basis": (
-                "стеля LIVE_MAX_DRAWDOWN (розмір ще невідомий)"
+                "розмір ще невідомий — кіла немає"
                 if self.state.avg_notional_usdt <= 0 else
-                f"стеля ${self.max_drawdown_usdt:.0f}"
-                if (self.drawdown_pct_of_notional * self.state.avg_notional_usdt
-                    >= self.max_drawdown_usdt) else
-                f"підлога ${self.min_drawdown_usdt:.0f}"
-                if (self.drawdown_pct_of_notional * self.state.avg_notional_usdt
-                    <= self.min_drawdown_usdt) else
                 f"{self.drawdown_pct_of_notional*100:.2f}% від нотіоналу "
                 f"${self.state.avg_notional_usdt:.0f}"),
             "avg_notional_usdt": round(self.state.avg_notional_usdt, 2),

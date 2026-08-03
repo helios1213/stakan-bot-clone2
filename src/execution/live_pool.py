@@ -41,23 +41,18 @@ class LiveExecutorPool:
         webkey_store,       # WebkeyStore
         alerts=None,        # Optional[TelegramAlerts]
         private_ws_pool=None,  # Optional[MexcPrivateWSPool] — push-based fills
-        # Просадка: ефективна межа = min(стеля, max(підлога, pct × нотіонал)).
-        # Усі три з .env — LIVE_MAX_DRAWDOWN / LIVE_DRAWDOWN_PCT_OF_NOTIONAL /
-        # LIVE_MIN_DRAWDOWN (main.py). Стеля в'яже, а не лише до першої угоди.
-        default_max_drawdown_usdt: float = 150.0,
+        # Просадка: єдиний кіл, межа = pct × нотіонал.
+        # env LIVE_DRAWDOWN_PCT_OF_NOTIONAL (main.py).
         default_drawdown_pct_of_notional: float = 0.01,
-        default_min_drawdown_usdt: float = 5.0,
         default_max_per_symbol: int = 1,
         default_max_total: int = 1,
         default_max_margin_usdt: float = 10.0,
     ) -> None:
         self.default_drawdown_pct_of_notional = default_drawdown_pct_of_notional
-        self.default_min_drawdown_usdt = default_min_drawdown_usdt
         self.client_pool = client_pool
         self.webkey_store = webkey_store
         self.alerts = alerts
         self.private_ws_pool = private_ws_pool
-        self.default_max_drawdown_usdt = default_max_drawdown_usdt
         self.default_max_per_symbol = default_max_per_symbol
         self.default_max_total = default_max_total
         self.default_max_margin_usdt = default_max_margin_usdt
@@ -106,9 +101,7 @@ class LiveExecutorPool:
                     private_ws_pool=self.private_ws_pool,
                 )
                 self._safety_controllers[sid] = LiveSafetyController(
-                    max_drawdown_usdt=self.default_max_drawdown_usdt,
                     drawdown_pct_of_notional=self.default_drawdown_pct_of_notional,
-                    min_drawdown_usdt=self.default_min_drawdown_usdt,
                     max_concurrent_per_symbol=self.default_max_per_symbol,
                     max_concurrent_total=self.default_max_total,
                     max_margin_per_trade_usdt=self.default_max_margin_usdt,

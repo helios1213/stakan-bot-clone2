@@ -793,11 +793,8 @@ async def main() -> None:
             webkey_store=webkey_store,
             alerts=None,  # wired below after alerts is created
             private_ws_pool=private_ws_pool,
-            default_max_drawdown_usdt=float(os.environ.get('LIVE_MAX_DRAWDOWN', '150.0')),
             default_drawdown_pct_of_notional=float(
                 os.environ.get('LIVE_DRAWDOWN_PCT_OF_NOTIONAL', '0.01')),
-            default_min_drawdown_usdt=float(
-                os.environ.get('LIVE_MIN_DRAWDOWN', '5.0')),
             default_max_per_symbol=int(os.environ.get('LIVE_MAX_PER_SYMBOL', '1')),
             default_max_total=int(os.environ.get('LIVE_MAX_TOTAL', '1')),
             default_max_margin_usdt=float(os.environ.get('LIVE_MAX_MARGIN', '30.0')),
@@ -829,13 +826,10 @@ async def main() -> None:
                 loguru_logger.exception("private_ws warmup scheduling failed")
         loguru_logger.warning(
             "🔴 LIVE TRADING ENABLED (multi-slot mode) — "
-            "default max_margin=${:.2f}, просадка = min(стеля ${:.2f}, "
-            "{:.2f}% нотіоналу, підлога ${:.2f}). "
+            "default max_margin=${:.2f}, єдиний кіл: просадка {:.2f}% нотіоналу. "
             "Configure slots via Telegram: tap 🔑 Webkey → slot → assign pair.",
             float(os.environ.get('LIVE_MAX_MARGIN', '30.0')),
-            float(os.environ.get('LIVE_MAX_DRAWDOWN', '150.0')),
             float(os.environ.get('LIVE_DRAWDOWN_PCT_OF_NOTIONAL', '0.01')) * 100,
-            float(os.environ.get('LIVE_MIN_DRAWDOWN', '5.0')),
         )
     else:
         loguru_logger.info("Live trading disabled (set LIVE_TRADING_ENABLED=1 to activate)")

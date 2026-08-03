@@ -317,17 +317,15 @@ class TestKillSwitchReset:
         assert c.state.consecutive_losses == 12   # still counted, for the alert
         assert c.state.kill_active is False
 
-    def test_drawdown_fires_at_the_configured_ceiling(self):
-        """Поріг береться ЯВНО: до першого закриття розмір невідомий, тож діє
-        стеля. Раніше тест спирався на дефолт конструктора (тоді 20) — тобто
-        мовчки перевіряв дефолт, а не механізм."""
+    def test_drawdown_fires_at_the_measured_fraction(self):
+        """Межа тепер одна: pct x нотіонал. При 1% від $2000 це $20."""
         from src.execution.live_safety import LiveSafetyController
-        c = LiveSafetyController(max_drawdown_usdt=20.0)
-        c.record_close("1000PEPEUSDT", +5.0)      # peak = 5
+        c = LiveSafetyController(drawdown_pct_of_notional=0.01)
+        c.record_close("1000PEPEUSDT", +5.0, notional_usdt=2000.0)   # пік = 5
         assert c.state.kill_active is False
-        c.record_close("1000PEPEUSDT", -14.0)     # -9 total, 14 below peak
+        c.record_close("1000PEPEUSDT", -14.0, notional_usdt=2000.0)  # 14 від піку
         assert c.state.kill_active is False
-        c.record_close("1000PEPEUSDT", -6.0)      # -15 total, 20 below peak
+        c.record_close("1000PEPEUSDT", -6.0, notional_usdt=2000.0)   # 20 від піку
         assert c.state.kill_active is True
 
     def test_release_kill_gives_the_full_room_back(self):
@@ -372,10 +370,14 @@ class TestDrawdownScalesWithSize:
         from src.execution.live_safety import LiveSafetyController
         return LiveSafetyController()
 
-    def test_limit_is_the_dollar_fallback_until_size_is_known(self):
+    def test_no_kill_until_the_first_close_reveals_the_size(self):
+        """Межа є часткою позиції, тож поки позиція невідома — межі немає."""
         c = self._ctl()
         assert c.state.avg_notional_usdt == 0.0
-        assert c.drawdown_limit() == c.max_drawdown_usdt
+        assert c.drawdown_limit() == 0.0
+        c.state.peak_pnl = 500.0
+        c.record_close("X", -500.0)          # величезна просадка, розміру немає
+        assert c.state.kill_active is False, "без розміру кіл не має спрацьовувати"
 
     def test_limit_tracks_the_position_size(self):
         c = self._ctl()
@@ -383,7 +385,7 @@ class TestDrawdownScalesWithSize:
         assert abs(c.drawdown_limit() - 27.55) < 0.5     # 1.0% від 2,755
         d = self._ctl()
         d.record_close("LINKUSDT", 0.0, notional_usdt=292.0)
-        assert abs(d.drawdown_limit() - 5.0) < 0.5       # 1.0%=2.92 -> підлога $5
+        assert abs(d.drawdown_limit() - 2.92) < 0.05     # 1.0% від 292, підлоги немає
 
     def test_a_big_slot_survives_what_would_have_killed_it_before(self):
         """$25 of drawdown at $2,755 notional is ordinary; the old $20 killed it."""
@@ -401,10 +403,16 @@ class TestDrawdownScalesWithSize:
         c.record_close("LINKUSDT", -25.0, notional_usdt=292.0)
         assert c.state.kill_active is True
 
-    def test_floor_stops_a_bad_notional_making_a_penny_limit(self):
+    def test_limit_is_strictly_proportional_with_no_floor(self):
+        """Підлогу видалено 2026-08-04 — межа тепер строго pct x нотіонал.
+
+        ⚠️ Наслідок: на дрібній парі межа мікроскопічна (HYPE ~$94 -> $0.94).
+        Обидві такі пари зараз у shadow; перед вмиканням у лайв поріг треба
+        переглянути.
+        """
         c = self._ctl()
-        c.record_close("X", 0.0, notional_usdt=1.0)
-        assert c.drawdown_limit() == c.min_drawdown_usdt
+        c.record_close("X", 0.0, notional_usdt=94.0)
+        assert c.drawdown_limit() == pytest.approx(0.94)
 
     def test_size_is_smoothed_not_snapped(self):
         """Margin and leverage are randomised ~15% per trade."""

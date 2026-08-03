@@ -249,12 +249,19 @@ class TestLiveSafety:
         assert ctl.state.consecutive_losses == 0
 
     def test_cumulative_loss_alone_no_longer_kills(self):
-        """Only a fall from the session high-water mark halts a slot now."""
-        ctl = LiveSafetyController(max_drawdown_usdt=20.0)
+        """Зупиняє лише падіння від піку сесії — і лише відносно РОЗМІРУ.
+
+        notional передається явно: межа тепер є часткою позиції, тож без
+        розміру її не існує (див. test_no_kill_until_the_first_close...).
+        1% від $2000 = $20.
+        """
+        ctl = LiveSafetyController(drawdown_pct_of_notional=0.01)
         for _ in range(6):
-            ctl.record_close("ZECUSDT", pnl_usdt=-2.0)   # -12 total, peak 0
+            ctl.record_close("ZECUSDT", pnl_usdt=-2.0,
+                             notional_usdt=2000.0)       # -12 разом, пік 0
         assert ctl.is_killed() is False
-        ctl.record_close("ZECUSDT", pnl_usdt=-9.0)       # -21 below the peak
+        ctl.record_close("ZECUSDT", pnl_usdt=-9.0,
+                         notional_usdt=2000.0)           # -21 від піку > $20
         assert ctl.is_killed() is True
 
     def test_per_symbol_concurrent_limit(self):
