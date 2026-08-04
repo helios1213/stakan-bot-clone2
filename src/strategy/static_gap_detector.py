@@ -68,6 +68,7 @@ class PerPairDetectorOverride:
     long_only: bool = False
     short_only: bool = False
     max_spread_bps: float = 0.0
+    max_spread_ticks: float = 0.0
     min_mid_gap_ticks: float = 0.0
     max_mid_gap_ticks: float = 0.0
     min_exec_ticks: float = 0.0
@@ -138,6 +139,7 @@ class StaticGapDetector:
         self.signals_skip_no_ob = 0
         self.signals_skip_below_threshold = 0
         self.signals_skip_wide_spread = 0
+        self.signals_skip_wide_spread_t = 0
         self.signals_skip_narrow_mid_gap = 0
         self.signals_skip_wide_mid_gap = 0
         self.signals_skip_no_exec_edge = 0
@@ -262,6 +264,7 @@ class StaticGapDetector:
                 long_only=d.long_only,
                 short_only=d.short_only,
                 max_spread_bps=d.max_spread_bps,
+                max_spread_ticks=d.max_spread_ticks,
                 min_mid_gap_ticks=d.min_mid_gap_ticks,
                 max_mid_gap_ticks=d.max_mid_gap_ticks,
                 min_exec_ticks=d.min_exec_ticks,
@@ -648,13 +651,25 @@ class StaticGapDetector:
 
         # Spread-cap gate: reject when the MEXC book is too wide to fill
         # cleanly (ported from primary 2026-06-21). Per-pair max_spread_bps; 0=off.
+        # TICKS take priority over bps, because the MEXC spread is always a
+        # whole number of ticks: a bps cap is really "<= N ticks" where N jumps as
+        # the price crosses levels. On TAO (tick $0.01) the 2.0 bps cap is <=2t
+        # below $150, <=3t at $191 and <=4t above $200 — the gate re-tunes itself
+        # on a price move with no config edit. Same failure as min_mexc_lag_pct and
+        # the PEPE entry band, both fixed 2026-08-04. Both keys 0 = off.
         _ovr_sp = self._pair_overrides.get(symbol)
-        if _ovr_sp is not None and _ovr_sp.max_spread_bps > 0 and m_mid > 0:
-            _spread_bps = (m_ask_p - m_bid_p) / m_mid * 1e4
-            if _spread_bps > _ovr_sp.max_spread_bps:
-                self.signals_skip_wide_spread += 1
-                self._last_emitted_direction.pop(symbol, None)
-                return
+        if _ovr_sp is not None and m_mid > 0:
+            _sp_raw = m_ask_p - m_bid_p
+            if _ovr_sp.max_spread_ticks > 0 and tick_scaled > 0:
+                if _sp_raw / tick_scaled > _ovr_sp.max_spread_ticks + gap_eps:
+                    self.signals_skip_wide_spread_t += 1
+                    self._last_emitted_direction.pop(symbol, None)
+                    return
+            elif _ovr_sp.max_spread_bps > 0:
+                if _sp_raw / m_mid * 1e4 > _ovr_sp.max_spread_bps:
+                    self.signals_skip_wide_spread += 1
+                    self._last_emitted_direction.pop(symbol, None)
+                    return
 
         # Mid-gap floor, in TICKS. min_ticks above reads the same-side quote
         # gap, which equals this plus half the excess MEXC spread — so it also
@@ -852,6 +867,7 @@ class StaticGapDetector:
         """
         cur = {
             "wide_spread":      self.signals_skip_wide_spread,
+            "wide_spread_t":    self.signals_skip_wide_spread_t,
             "narrow_mid_gap":   self.signals_skip_narrow_mid_gap,
             "wide_mid_gap":     self.signals_skip_wide_mid_gap,
             "no_exec_edge":     self.signals_skip_no_exec_edge,
@@ -878,6 +894,7 @@ class StaticGapDetector:
             "signals_skip_no_ob": self.signals_skip_no_ob,
             "signals_skip_below_threshold": self.signals_skip_below_threshold,
             "signals_skip_wide_spread":      self.signals_skip_wide_spread,
+            "signals_skip_wide_spread_t":    self.signals_skip_wide_spread_t,
             "signals_skip_narrow_mid_gap":   self.signals_skip_narrow_mid_gap,
             "signals_skip_wide_mid_gap":     self.signals_skip_wide_mid_gap,
             "signals_skip_no_exec_edge":     self.signals_skip_no_exec_edge,
