@@ -346,6 +346,28 @@ async def _pnl_confirms(client, first: float, tol: float = _RECOVERY_CONFIRM_TOL
     return second
 
 
+_RECOVERY_NET_TIMEOUT = 30.0
+
+
+async def _recovery_net(coro, what: str, slot_id: int):
+    """Мережевий виклик монітора під власним таймаутом.
+
+    Цикл послідовний і один на всі слоти, тож застрягання на одному слоті
+    морозило ВЕСЬ монітор — і мовчки, бо він нічого не пише за нормальний
+    прохід. Відтворено 2026-08-05: слот не армився годинами, у логах порожньо.
+    Таймаут усередині HTTP не рятує, якщо застрягає сесія або warmup.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=_RECOVERY_NET_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("[RECOVERY] slot %d: %s не вклався у %.0f с — пропускаю цикл",
+                       slot_id, what, _RECOVERY_NET_TIMEOUT)
+    except Exception as e:
+        logger.warning("[RECOVERY] slot %d: %s впав — %s: %s",
+                       slot_id, what, type(e).__name__, str(e)[:160])
+    return None
+
+
 async def recovery_monitor_loop(
     webkey_store, webkey_client_pool, state_manager, db,
     interval_sec: int = 15,
@@ -361,11 +383,14 @@ async def recovery_monitor_loop(
     errors."""
     import time as _t
     last_pnl = {}  # slot_id -> last plausible account-PnL read (spurious-jump guard)
+    logger.info("[RECOVERY] монітор запущено, цикл %d с", interval_sec)
+    _hb = 0.0
     while True:
         try:
             # Slots stopped account-wide this cycle — skip them so a sibling's
             # own pass doesn't re-fire on the already-stopped account.
             stopped_this_cycle: set[int] = set()
+            _watched = 0
             for s in await webkey_store.list_all():
                 if s.slot_id in stopped_this_cycle:
                     continue
@@ -388,14 +413,22 @@ async def recovery_monitor_loop(
 
                 if baseline is None:
                     # ARM — read the account's accumulated realized PnL
-                    try:
-                        client = await webkey_client_pool.get(s.slot_id)
-                        pnl = await client.get_account_pnl_usdt(window_days=359)
-                    except Exception as e:
-                        logger.warning("[RECOVERY] slot %d PnL read failed: %s", s.slot_id, e)
+                    client = await _recovery_net(
+                        webkey_client_pool.get(s.slot_id), "видача клієнта", s.slot_id)
+                    if client is None:
                         continue
+                    pnl = await _recovery_net(
+                        client.get_account_pnl_usdt(window_days=359),
+                        "читання PnL акаунта (арм)", s.slot_id)
                     if pnl is None:
-                        continue  # transient read failure — retry next cycle (never guess)
+                        # Раніше це був МОВЧАЗНИЙ continue: читання могло падати
+                        # щоцикл, а в логах не було нічого — і стоп, на який
+                        # розраховують, просто не існував.
+                        logger.warning(
+                            "[RECOVERY] slot %d (%s): PnL акаунта не прочитано — "
+                            "АРМУ НЕМА, стоп на -$%.0f зараз НЕ ДІЄ",
+                            s.slot_id, pair, buf)
+                        continue
                     _lp = last_pnl.get(s.slot_id)
                     # ALWAYS advance the baseline, even when we skip acting on this
                     # read. If we froze the baseline on a rejected read, a GENUINE
@@ -458,13 +491,20 @@ async def recovery_monitor_loop(
                     # climbed to within `buf` of breakeven. Cap-guard still
                     # applies on the way down. `target` stays the armed sentinel.
                     try:
-                        client = await webkey_client_pool.get(s.slot_id)
-                        pnl = await client.get_account_pnl_usdt(window_days=359)
+                        client = await _recovery_net(
+                            webkey_client_pool.get(s.slot_id), "видача клієнта", s.slot_id)
+                        pnl = await _recovery_net(
+                            client.get_account_pnl_usdt(window_days=359),
+                            "читання PnL акаунта (перевірка)", s.slot_id) if client else None
                     except Exception as e:
                         logger.warning("[RECOVERY] slot %d stop-check PnL read failed: %s", s.slot_id, e)
                         continue
                     if pnl is None:
-                        continue  # transient read failure — retry next cycle (never guess)
+                        logger.warning(
+                            "[RECOVERY] slot %d (%s): PnL акаунта не прочитано — "
+                            "перевірку зупинки пропущено, стоп на -$%.0f цього "
+                            "циклу НЕ ДІЄ", s.slot_id, pair, buf)
+                        continue
                     _lp = last_pnl.get(s.slot_id)
                     # ALWAYS advance the baseline, even when we skip acting on this
                     # read. If we froze the baseline on a rejected read, a GENUINE
