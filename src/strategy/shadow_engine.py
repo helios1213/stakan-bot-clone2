@@ -3398,6 +3398,63 @@ class ShadowEngine:
             except Exception:
                 continue
 
+    async def _release_throttle_for_new_keys(self) -> None:
+        """Зняти засувку відкриттів, щойно на слоті опинився НОВИЙ ключ.
+
+        Те саме рішення вже є в гарячому шляху live-open, але воно ЛІНИВЕ: настає
+        тільки коли по парі цього слота приходить сигнал і ми збираємось
+        відкривати. Слот без призначеної пари, пара в shadow, тиха година — і
+        засувка висить, хоча ключ замінено. Тут те саме, але з періодичного циклу,
+        тож незалежно від потоку сигналів; і чистить памʼять ПРОЦЕСУ, а не лише БД.
+
+        Правило «не знімати, поки ключа нема» збережене: ліміт на АКАУНТІ, а не на
+        слоті, тож зняття на половині «видалив/вставив» перепробувало б обмежений
+        акаунт і заробило свіжі 6 годин (виміряно 2026-07-29 12:17:38 → 12:17:39).
+        """
+        if self.live_pool is None or getattr(self.live_pool, "webkey_store", None) is None:
+            return
+        try:
+            slots = await self.live_pool.webkey_store.list_all()
+        except Exception:
+            logger.exception("[OPEN THROTTLE] не зміг перечитати слоти")
+            return
+        _mode_sec = self._env_float("OPEN_THROTTLE_MODE_SEC", 21600.0)
+        for slot in slots or []:
+            sid = getattr(slot, "slot_id", None)
+            if sid is None:
+                continue
+            _wk = getattr(slot, "webkey_refreshed_at", None)
+            if _wk is None:
+                continue                      # ключа нема — див. докстрінг
+            _ot_db = getattr(slot, "open_throttle_until", None) or 0
+            _armed = time.monotonic() < self._open_rl_mode_until.get(sid, 0.0)
+            # Три незалежні ознаки, що засувка вже не наша:
+            #   штамп ключа зрушив; ключ новіший за момент, коли засувку
+            #   заробили; або дедлайн у БД зник, а в памʼяті ще висить.
+            _stamp_moved = self._open_rl_wk_seen.get(sid, _wk) != _wk
+            _key_is_newer = _ot_db > 0 and _wk > _ot_db - _mode_sec
+            _db_cleared = _ot_db <= 0 and _armed
+            if not (_stamp_moved or _key_is_newer or _db_cleared):
+                self._open_rl_wk_seen[sid] = _wk
+                continue
+            if _armed or _ot_db > 0:
+                logger.info(
+                    "[OPEN THROTTLE] slot=%d новий вебкей — засувку знято "
+                    "(в памʼяті: %s, у БД: %s)",
+                    sid, "була" if _armed else "не було",
+                    "була" if _ot_db > 0 else "не було")
+            self._open_rl_mode_until.pop(sid, None)
+            self._open_rl_code.pop(sid, None)
+            self._open_rl_persisted.pop(sid, None)
+            self._slot_cooldown_until.pop(sid, None)
+            self._open_rl_wk_seen[sid] = _wk
+            if _ot_db > 0:
+                try:
+                    await self.live_pool.webkey_store.set_open_throttle_until(sid, None)
+                except Exception:
+                    logger.exception(
+                        "[OPEN THROTTLE] не зміг стерти дедлайн slot=%d", sid)
+
     async def _warn_on_sizing_drift(self) -> None:
         """Shout when a live pair's YAML sizing is not what its slots use.
 
@@ -3511,6 +3568,10 @@ class ShadowEngine:
         self._pair_configs = cache
         self._configs_loaded_at = int(time.time())
         # Best-effort: a stale YAML sizing must never be able to fail a reload.
+        try:
+            await self._release_throttle_for_new_keys()
+        except Exception:
+            logger.exception("[OPEN THROTTLE] release sweep raised")
         try:
             await self._warn_on_sizing_drift()
         except Exception:

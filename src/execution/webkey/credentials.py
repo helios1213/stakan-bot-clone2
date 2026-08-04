@@ -249,13 +249,22 @@ class WebkeyStore:
                SET webkey_blob = ?,
                    visitor_blob = ?,
                    webkey_refreshed_at = ?,
+                   -- Засувка відкриттів належить АКАУНТУ, не слоту. Новий ключ =
+                   -- інший акаунт, тож він не успадковує чужі 6 годин. delete()
+                   -- це вже робив, а ЗАМІНА ключа — ні, і саме заміна є типовим
+                   -- сценарієм: оператор просто вставляє новий ключ. Знята тут,
+                   -- а не в гарячому шляху відкриття, бо там зняття настає лише
+                   -- коли по парі слота приходить сигнал.
+                   open_throttle_until = NULL,
+                   last_error = NULL,
                    updated_at = ?
              WHERE slot_id = ?
             """,
             (encrypted_webkey, encrypted_visitor, now, now, slot_id),
         )
         logger.info(
-            "Slot %d: webkey set (masked=%s, visitor=%s…)",
+            "Slot %d: webkey set (masked=%s, visitor=%s…) — open-rate latch and "
+            "last_error cleared with the old account",
             slot_id, _mask_webkey(webkey), visitor_id[:8],
         )
         return visitor_id
