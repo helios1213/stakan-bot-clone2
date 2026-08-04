@@ -138,6 +138,16 @@ async def db_prune_loop(db_path: str, live_db_path: str, interval_sec: int = 864
         ("historical_candles",       "open_time",  30 * 86400),
         ("shadow_trades",            "opened_at",   3 * 86400),  # 3-day shadow retention (user)
         ("shadow_open_misses",       "ts",          3 * 86400),  # IOC-expiry rows, 3-day
+        # 2026-08-05: НЕ БУЛО в списку, і саме тому розрослась до 30.2 млн
+        # рядків / 4.70 ГБ (90% файлу) з 19 червня, поки решта чистилась.
+        # ~656 тис рядків/добу. 30 днів ≈ 20 млн ≈ 3 ГБ сталого стану —
+        # свідомо ЩЕДРО, бо це єдине місце з ПОВНИМ кандидатним простором
+        # (включно з відкинутими сигналами) і форвардними доходностями.
+        # Не 14: оператор попросив запас на аналіз. Не 90: файл росте ~100 МБ/добу.
+        # Усі PnL-аналізи стоять на live_trades, а це ІНША база (stakan-live.db,
+        # ретенція 90 днів) — сюди не заходить.
+        # ts у МІЛІСЕКУНДАХ — масштаб визначається нижче автоматично.
+        ("signal_features",          "ts",         30 * 86400),
         ("state_transitions",        "created_at", 30 * 86400),
     ]
     RET_LIVE = [
@@ -158,10 +168,25 @@ async def db_prune_loop(db_path: str, live_db_path: str, interval_sec: int = 864
                                 continue
                             scale = 1000 if mx > 1e12 else 1
                             cutoff = (now - sec) * scale
-                            cur = c.execute(
-                                f"DELETE FROM {tbl} WHERE {col} < ?", (cutoff,)
-                            )
-                            deleted_total += cur.rowcount or 0
+                            # ПАКЕТАМИ: одним DELETE перший прохід по
+                            # signal_features зняв би ~21 млн рядків і тримав
+                            # ексклюзивний лок хвилинами на живій базі. По 50 тис
+                            # із комітом між пакетами лок короткий.
+                            _n_tbl = 0
+                            while True:
+                                cur = c.execute(
+                                    f"DELETE FROM {tbl} WHERE rowid IN ("
+                                    f"  SELECT rowid FROM {tbl} WHERE {col} < ? LIMIT 50000)",
+                                    (cutoff,),
+                                )
+                                _got = cur.rowcount or 0
+                                c.commit()
+                                _n_tbl += _got
+                                if _got < 50000:
+                                    break
+                            deleted_total += _n_tbl
+                            if _n_tbl > 100000:
+                                logger.info("DB prune: %s -%d rows", tbl, _n_tbl)
                         except sqlite3.OperationalError as oe:
                             # Table absent on this instance (e.g. historical_candles
                             # on the clone) — skip quietly instead of a daily traceback.
@@ -537,9 +562,20 @@ async def recovery_monitor_loop(
                             pair, -pnl, cap,
                         )
                         continue
+                    _watched += 1
+                    if _t.time() - _hb > 600:
+                        # Heartbeat. Сьогодні монітор мовчки не працював цілу
+                        # добу — мовчання має знову стати підозрілим, а не нормою.
+                        logger.info(
+                            "[RECOVERY] %s: акаунт $%.2f, до стопу -$%.0f лишилось "
+                            "$%.2f", pair, pnl, buf, max(0.0, (-buf) - pnl))
                     if pnl >= -buf:
                         pnl = await _pnl_confirms(client, pnl)
                         if pnl is None or pnl < -buf:
+                            logger.warning(
+                                "[RECOVERY] %s: поріг досягнуто ($%.2f >= -$%.0f), "
+                                "але друге читання не підтвердило — стоп ВІДКЛАДЕНО "
+                                "на цикл", pair, pnl if pnl is not None else float("nan"), buf)
                             continue
                         stopped_this_cycle.update(await _recovery_stop(webkey_store, state_manager, db, s.slot_id, pair))
                         logger.warning(
@@ -547,6 +583,12 @@ async def recovery_monitor_loop(
                             "— LIVE STOPPED -> shadow",
                             pair, pnl, buf, (target or 0.0),
                         )
+            if _t.time() - _hb > 600:
+                if _watched == 0:
+                    logger.warning(
+                        "[RECOVERY] жоден слот не під наглядом — перевір "
+                        "live_enabled / вебкей / recovery_mode")
+                _hb = _t.time()
         except asyncio.CancelledError:
             return
         except Exception:
