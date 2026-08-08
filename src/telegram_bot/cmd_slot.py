@@ -469,25 +469,26 @@ async def handle_slot_callback(query, context, data: str) -> None:
         except Exception:
             pass
         # Повідомлення в ЧАТ, а не спливна підказка: підказка живе секунду й
-        # нічого не лишає, а після зняття запобіжника треба бачити, з чим слот
-        # поїхав далі — і на якій межі він зупиниться наступного разу.
+        # нічого не лишає. Коротко: слот, що сталось, і межа наступної зупинки.
         if _err:
-            _msg = (f"⚠️ <b>Kill switch НЕ знято</b> — слот {slot_id}\n"
-                    f"<code>{_err[:200]}</code>\n"
-                    f"Запобіжник лишається як був.")
+            _msg = (f"⚠️ <b>Слот {slot_id}</b> — кіл НЕ знято\n"
+                    f"<code>{_err[:160]}</code>")
         else:
             _lim = (_summary or {}).get("drawdown_limit_usdt")
-            _basis = (_summary or {}).get("drawdown_limit_basis", "")
-            _pnl = (_summary or {}).get("today_pnl", 0.0)
-            _head = ("♻️ <b>Kill switch знято</b>" if _was
-                     else "✅ <b>Кіл не був активний</b>")
-            _msg = (f"{_head} — слот {slot_id}\n"
-                    + (f"було: <i>{_why[:160]}</i>\n" if _why else "")
-                    + f"PnL слота сьогодні: <b>${_pnl:+.2f}</b>\n"
-                    + "База просадки переставлена на поточний PnL — "
-                      "слот отримав повний запас назад.\n"
-                    + (f"Наступна зупинка на просадці <b>${_lim:.2f}</b>"
-                       f" ({_basis})" if _lim is not None else ""))
+            _pnl = (_summary or {}).get("today_pnl", 0.0) or 0.0
+            _bits = [f"♻️ <b>Слот {slot_id}</b> — кіл знято" if _was
+                     else f"✅ <b>Слот {slot_id}</b> — кіла не було"]
+            if _lim is not None:
+                # круглу межу без копійок: «$25», а не «$25.00»
+                _bits.append("межа $" + (f"{_lim:.0f}"
+                                         if abs(_lim - round(_lim)) < 0.005
+                                         else f"{_lim:.2f}"))
+            # Нульовий PnL нічого не каже — показуємо лише коли є що показати.
+            if abs(_pnl) >= 0.01:
+                _bits.append(f"PnL ${_pnl:+.2f}")
+            _msg = " · ".join(_bits)
+            if _was and _why:
+                _msg += f"\n<i>{_why[:90]}</i>"
         try:
             await query.message.reply_text(_msg, parse_mode="HTML")
         except Exception:

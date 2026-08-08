@@ -1196,19 +1196,32 @@ def set_pair_config(symbol: str, **kwargs) -> None:
             conn.close()
 
 
-def set_all_pairs_shadow_all() -> dict:
-    """KILL ALL across EVERY bot (primary + clones).
+def set_all_pairs_shadow_all(servers: list[str] | None = None) -> dict:
+    """KILL ALL across the CHOSEN bots (default: every bot).
 
     `set_all_pairs_shadow()` only ever touched the PRIMARY database, so a clone
     kept trading live while the panel reported success — the one defect that can
     cost money at the exact moment the operator is trying to stop.
 
+    `servers` narrows the blast radius: the two bots trade different pairs on
+    different accounts, so "stop the clone" must not also stop the primary.
+    Unknown names are dropped rather than defaulted — a typo must never resolve
+    to some other bot. Passing an explicit empty list stops NOTHING and says so;
+    omitting the argument keeps the original all-bots behaviour, so no existing
+    caller changes meaning silently.
+
     Local demote runs FIRST and is committed before any SSH, so an unreachable
     clone can never delay stopping the primary. Returns per-server results so the
     UI can never render a clean success when a clone was not stopped.
     """
-    out = {"primary": {"ok": True, "demoted": set_all_pairs_shadow()}}
-    for srv in REMOTE_BOTS:
+    known = available_servers()
+    targets = known if servers is None else [s for s in servers if s in known]
+    out: dict = {}
+    if "primary" in targets:
+        out["primary"] = {"ok": True, "demoted": set_all_pairs_shadow()}
+    for srv in targets:
+        if srv == "primary":
+            continue
         try:
             out[srv] = _remote_rpc(srv, {"op": "kill_all"})
         except Exception as e:  # never let a dead clone mask the local stop
