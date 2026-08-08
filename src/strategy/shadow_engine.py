@@ -2961,7 +2961,16 @@ class ShadowEngine:
         if safety_for_close is not None:
             safety_for_close.record_close(
                 pos.symbol, pos.net_pnl_usdt,
-                notional_usdt=(pos.margin_usdt or 0) * (pos.leverage or 0))
+                # ЗАЛИТИЙ розмір, не замовлений. Межа просадки = pct × цього
+                # числа, тож вона мусить міряти гроші, які СПРАВДІ в ринку.
+                # На замовленому (margin × leverage) вона завищена рівно на
+                # недолив: PENGU 2026-08-08 замовлено $4563, залито $3134 —
+                # межа виходила $45.63 замість ~$31 (+46%). Це ще й розходилось
+                # із рештою проєкту, де кожен bps рахується на notional_usdt.
+                # Фолбек на замовлений — щоб угода без даних про наливку не
+                # лишила EMA без оновлення.
+                notional_usdt=(pos.notional_usdt
+                               or (pos.margin_usdt or 0) * (pos.leverage or 0)))
             ss = safety_for_close.state_summary()
             if ss["kill_active"]:
                 logger.warning(
@@ -3142,7 +3151,8 @@ class ShadowEngine:
                     try:
                         safety_for_close.record_close(
                             pos.symbol, pos.net_pnl_usdt or 0.0,
-                            notional_usdt=(pos.margin_usdt or 0) * (pos.leverage or 0),
+                            notional_usdt=(pos.notional_usdt
+                                           or (pos.margin_usdt or 0) * (pos.leverage or 0)),
                         )
                         logger.info(
                             "[EXTERNAL CLOSE] safety counter decremented "
