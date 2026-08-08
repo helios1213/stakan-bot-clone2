@@ -425,6 +425,188 @@ async def _send_pair_status(message_or_query, context, symbol: str, edit: bool =
         await message_or_query.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
+def _cfg_val(x) -> str:
+    """Значення у вигляді, у якому воно стоїть у ямлі."""
+    if isinstance(x, bool):
+        return "yes" if x else "no"
+    if isinstance(x, float):
+        return f"{x:g}"
+    return str(x)
+
+
+def _cfg_gate(x) -> str:
+    """Ворота: 0 означає «вимкнено», і це має читатись з першого погляду."""
+    return _cfg_val(x) if x else "—  вимкнено"
+
+
+def _fmt_pair_config_full(
+    symbol: str,
+    pc,
+    *,
+    live: bool,
+    epoch_ts: int | None = None,
+    overrides: list[tuple[int, dict]] | None = None,
+    tick: float | None = None,
+    price: float | None = None,
+) -> str:
+    """Весь конфіг пари одним повідомленням.
+
+    `overrides` — [(slot_id, {margin_min_usdt, ...})] для слотів, що торгують
+    цю пару. Вони ПЕРЕКРИВАЮТЬ ямл, тому показані окремим рядком: розмір із
+    ямла сам по собі нікого не цікавить, якщо слот торгує іншим.
+    `tick`/`price` — щоб перевести bps-пороги в тіки; без ціни просто не
+    перекладаємо, замість того щоб вигадувати.
+    """
+    import dataclasses
+    import datetime as _dt
+
+    d, ex, ec = pc.detector, pc.exit_strategy, pc.execution
+    shown: set[tuple[str, str]] = set()
+
+    def row(section, obj, field, label=None, fmt=_cfg_val, suffix=""):
+        shown.add((section, field))
+        return f"  {(label or field):<28}{fmt(getattr(obj, field))}{suffix}"
+
+    def in_ticks(bps: float) -> str:
+        """bps → тіки за останньою відомою ціною."""
+        if not bps or not tick or not price:
+            return ""
+        return f"  ≈{bps / 1e4 * price / tick:.1f}т"
+
+    out: list[str] = []
+    out.append(f"<b>⚙️ {symbol}</b>  {'🟢 LIVE' if live else '📊 SHADOW'}")
+    hdr = f"<i>config/pairs/{symbol}.yaml</i>"
+    if epoch_ts:
+        _age = (_dt.datetime.now() - _dt.datetime.fromtimestamp(epoch_ts)).days
+        hdr += (f"\n<i>тюнінг не мінявся з "
+                f"{_dt.datetime.fromtimestamp(epoch_ts):%m-%d %H:%M}"
+                f" ({_age}д)</i>")
+    out.append(hdr)
+
+    # ── ВХІД ──────────────────────────────────────────────────────────
+    ent = [
+        row("d", d, "min_ticks", fmt=_cfg_gate),
+        row("d", d, "min_mid_gap_ticks", fmt=_cfg_gate),
+        row("d", d, "max_mid_gap_ticks", fmt=_cfg_gate),
+        row("d", d, "min_exec_ticks", fmt=_cfg_gate),
+        row("d", d, "max_spread_ticks", fmt=_cfg_gate),
+        row("d", d, "max_spread_bps", fmt=_cfg_gate,
+            suffix=in_ticks(d.max_spread_bps)),
+        row("c", ec, "min_mexc_lag_pct", fmt=_cfg_gate),
+        row("c", ec, "max_mexc_lag_pct", fmt=_cfg_gate),
+        row("d", d, "long_only"),
+        row("d", d, "short_only"),
+        row("d", d, "enabled"),
+        row("d", d, "cooldown_sec", suffix="s"),
+        row("d", d, "scan_interval_sec", suffix="s"),
+    ]
+    out.append("<b>📥 ВХІД — ворота</b>\n<pre>" + "\n".join(ent) + "</pre>")
+
+    # ── ВИКОНАННЯ ────────────────────────────────────────────────────
+    ex_ = [
+        row("c", ec, "ioc_offset_ticks"),
+        row("c", ec, "ioc_max_attempts"),
+        row("c", ec, "ioc_attempt_interval_ms", suffix="ms"),
+        row("c", ec, "margin_min_usdt", fmt=lambda v: f"${v:g}"),
+        row("c", ec, "margin_max_usdt", fmt=lambda v: f"${v:g}"),
+        row("c", ec, "leverage_min"),
+        row("c", ec, "leverage_max"),
+        f"  {'→ нотіонал (yaml)':<28}"
+        f"${ec.margin_min_usdt * ec.leverage_min:,.0f}-"
+        f"{ec.margin_max_usdt * ec.leverage_max:,.0f}",
+    ]
+    for sid, ov in (overrides or []):
+        mn = ov.get("margin_min_usdt")
+        mx = ov.get("margin_max_usdt")
+        lo = ov.get("leverage_min")
+        hi = ov.get("leverage_max")
+        if mn is None and lo is None:
+            continue
+        mn = mn if mn is not None else ec.margin_min_usdt
+        mx = mx if mx is not None else ec.margin_max_usdt
+        lo = lo if lo is not None else ec.leverage_min
+        hi = hi if hi is not None else ec.leverage_max
+        same = (mn == ec.margin_min_usdt and mx == ec.margin_max_usdt
+                and lo == ec.leverage_min and hi == ec.leverage_max)
+        # Слот може бути прив'язаний до пари, але вимкнений або без ключа —
+        # тоді його розмір нічого не означає, і кричати про нього не треба.
+        off = "" if ov.get("_active", True) else " (не торгує)"
+        tag = (f"слот {sid} = ямл{off}" if same
+               else f"⚠ слот {sid} ПЕРЕКРИВАЄ{off}")
+        ex_.append(f"  {tag:<28}${mn:g}-{mx:g} x {lo}-{hi}")
+        if not same:
+            ex_.append(f"  {'  → нотіонал слота':<28}"
+                       f"${mn * lo:,.0f}-{mx * hi:,.0f}")
+    out.append("<b>🎯 ВИКОНАННЯ</b>\n<pre>" + "\n".join(ex_) + "</pre>")
+
+    # ── ВИХІД: пороги ────────────────────────────────────────────────
+    def bps_row(field, tick_field, obj=ex):
+        # bps=0 не означає «вимкнено» — воно падає на тіковий фолбек, і саме
+        # це колись з'їло ворота мовчки. Тому показуємо, що реально діє.
+        shown.add(("e", field))
+        v = getattr(obj, field)
+        if v and v > 0:
+            return f"  {field:<28}{v:g} bps ({v / 100:.3f}%){in_ticks(v)}"
+        return (f"  {field:<28}0 → діє {tick_field}="
+                f"{_cfg_val(getattr(ex, tick_field))}т")
+
+    th = [
+        bps_row("stop_adverse_bps", "stop_adverse_ticks"),
+        bps_row("trail_distance_bps", "trail_distance_ticks"),
+        bps_row("breakeven_trigger_bps", "breakeven_trigger_ticks"),
+        row("c", ec, "stop_loss_ticks", fmt=_cfg_gate),
+        row("c", ec, "binance_reversal_ticks", fmt=_cfg_gate),
+        row("c", ec, "gap_retrace_frac", fmt=_cfg_gate),
+        row("e", ex, "nevergreen_cut_ms", fmt=_cfg_gate),
+        row("e", ex, "nevergreen_adverse_ticks"),
+        row("e", ex, "nevergreen_peak_ticks"),
+        row("e", ex, "stop_adverse_ticks", "  фолбек: adverse_ticks"),
+        row("e", ex, "trail_distance_ticks", "  фолбек: trail_ticks"),
+        row("e", ex, "breakeven_trigger_ticks", "  фолбек: breakeven_ticks"),
+    ]
+    out.append("<b>📤 ВИХІД — пороги</b>\n<pre>" + "\n".join(th) + "</pre>")
+
+    # ── ВИХІД: час ───────────────────────────────────────────────────
+    tm = [
+        row("e", ex, "min_hold_ms", suffix="ms"),
+        row("e", ex, "stall_timeout_ms", fmt=_cfg_gate, suffix="ms"),
+        row("e", ex, "dead_on_arrival_timeout_ms", fmt=_cfg_gate, suffix="ms"),
+        row("e", ex, "binance_reversal_max_ms", fmt=_cfg_gate, suffix="ms"),
+        row("c", ec, "sl_grace_sec", suffix="s"),
+        row("c", ec, "max_hold_sec", fmt=_cfg_gate, suffix="s"),
+        row("c", ec, "cooldown_after_loss_sec", suffix="s"),
+        row("c", ec, "cooldown_after_win_sec", suffix="s"),
+    ]
+    out.append("<b>⏱ ВИХІД — час і кулдауни</b>\n<pre>" + "\n".join(tm) + "</pre>")
+
+    # ── моментум ─────────────────────────────────────────────────────
+    mo = [
+        row("c", ec, "momentum_filter"),
+        row("c", ec, "momentum_tau_sec", suffix="s"),
+        row("c", ec, "momentum_threshold_bps", suffix=" bps"),
+    ]
+    out.append("<b>📈 МОМЕНТУМ</b>\n<pre>" + "\n".join(mo) + "</pre>")
+
+    # ── сторож повноти ───────────────────────────────────────────────
+    # Будь-яке поле, не показане вище, з'являється тут. Це те, чого бракувало:
+    # раніше новий ключ конфігу просто не потрапляв на екран.
+    rest = []
+    for tag, obj in (("d", d), ("e", ex), ("c", ec)):
+        for f in dataclasses.fields(obj):
+            if (tag, f.name) not in shown:
+                rest.append(f"  {f.name:<28}{_cfg_val(getattr(obj, f.name))}")
+    if rest:
+        out.append("<b>❔ ІНШЕ (не згруповано)</b>\n<pre>"
+                   + "\n".join(rest) + "</pre>")
+
+    legend = "<i>ⓘ «—» = 0, ворота вимкнені</i>"
+    if tick and price:
+        legend += f"\n<i>ⓘ тік {tick:g}, ціна {price:g} → 1 тік = " \
+                  f"{1e4 * tick / price:.2f} bps</i>"
+    out.append(legend)
+    return "\n".join(out)
+
+
 async def cmd_get_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current pair_config for a symbol — full breakdown including
     adaptive params, mode, SL details, cooldowns."""
@@ -445,75 +627,70 @@ async def cmd_get_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode=ParseMode.HTML)
         return
     pc = eng._config_loader.get(symbol)
-    d, ex, ec = pc.detector, pc.exit_strategy, pc.execution
 
     # Mode = authoritative runtime state (pair_states.state), not pair_configs.mode.
     live = state_manager.is_in_live(symbol)
-    mode_emoji, mode_txt = ("🟢", "LIVE") if live else ("📊", "SHADOW")
 
-    def _exit(bps_v, tick_v):
-        # exit thresholds are price-relative bps (1 bps = 0.01%); effective ticks
-        # are derived per-trade from fill price. Show bps + %. If bps is unset
-        # (0), the trail falls back to ticks — show that honestly.
-        if bps_v and bps_v > 0:
-            return f"{bps_v:g} bps ({bps_v / 100:.3f}%)"
-        return f"{tick_v:g} ticks (bps unset → tick fallback)"
+    # behavioral_epoch живе в meta ямла і не потрапляє в PairConfig (торгівля
+    # його не читає) — беремо з файлу, м'яко.
+    epoch_ts = None
+    try:
+        import yaml as _yaml
+        from pathlib import Path as _Path
+        _raw = _yaml.safe_load(
+            _Path(f"/app/config/pairs/{symbol}.yaml").read_text(encoding="utf-8"))
+        epoch_ts = int((_raw.get("meta") or {}).get("behavioral_epoch") or 0) or None
+    except Exception:
+        pass
 
-    sl_txt = (f"{ec.stop_loss_ticks} ticks"
-              if ec.stop_loss_ticks and ec.stop_loss_ticks > 0 else "0 (disabled)")
+    # Перекриття розміру зі slot_pair_sizing. Ямл — не те, чим торгують:
+    # саме через це подвоєння маржі PENGU було невидиме тут.
+    overrides: list[tuple[int, dict]] = []
+    _store = context.bot_data.get("webkey_store")
+    if _store is not None:
+        try:
+            from src.execution.webkey.credentials import MAX_SLOTS as _MS
+            for _sid in range(1, _MS + 1):
+                _slot = await _store.get(_sid)
+                if _slot is None or _slot.assigned_pair != symbol:
+                    continue
+                _ov = await _store.get_slot_pair_sizing(_sid, symbol)
+                if _ov:
+                    _ov = {**_ov, "_active": bool(
+                        getattr(_slot, "enabled", 0)
+                        and getattr(_slot, "live_enabled", 0))}
+                    overrides.append((_sid, _ov))
+        except Exception:
+            logger.exception("[GET_CONFIG] не вдалось прочитати перекриття розміру")
 
-    mom = (f"<code>ON</code> <i>(τ={ec.momentum_tau_sec:g}s, "
-           f"thr={ec.momentum_threshold_bps:g}bps)</i>"
-           if ec.momentum_filter else "<code>off</code>")
+    # Тік і остання відома ціна — щоб перевести bps-пороги в тіки. Поріг у bps
+    # на фіксованому тіку повзе разом із ціною, тож без цього число оманливе.
+    tick = price = None
+    try:
+        from src.exchanges.mexc_rest import get_binance_scale, to_mexc
+        from src.execution.live_executor import get_tick_size
+        _mx = to_mexc(symbol)
+        tick = get_tick_size(_mx) * get_binance_scale(_mx)
+    except Exception:
+        tick = None
+    for _db, _tbl in ((context.bot_data.get("live_db"), "live_trades"),
+                      (context.bot_data.get("db"), "shadow_trades")):
+        if price is not None or _db is None:
+            continue
+        try:
+            _r = await _db.fetchone(
+                f"SELECT binance_price_at_entry FROM {_tbl} WHERE symbol = ? "
+                "AND binance_price_at_entry > 0 ORDER BY id DESC LIMIT 1",
+                (symbol,))
+            if _r and _r[0]:
+                price = float(_r[0])
+        except Exception:
+            pass
 
-    # Full resolved config — every field of detector / exit_strategy / execution
-    # as the trading loop sees it. Nothing curated out.
-    text_lines = [
-        f"<b>⚙️ Config: {symbol}</b> <i>(config/pairs/{symbol}.yaml)</i>",
-        "",
-        f"<b>Mode:</b> {mode_emoji} <code>{mode_txt}</code>",
-        "",
-        "<b>Sizing:</b>",
-        f"  margin: <code>${ec.margin_min_usdt:.0f}-${ec.margin_max_usdt:.0f}</code>",
-        f"  leverage: <code>{ec.leverage_min}x-{ec.leverage_max}x</code>",
-        "",
-        "<b>Entry (detector):</b>",
-        f"  min_ticks: <code>{d.min_ticks}</code>",
-        f"  cooldown: <code>{d.cooldown_sec:g}s</code>",
-        f"  scan_interval: <code>{d.scan_interval_sec:g}s</code>",
-        f"  long_only: <code>{'yes' if d.long_only else 'no'}</code>",
-        f"  enabled: <code>{'yes' if d.enabled else 'no'}</code>",
-        "",
-        "<b>IOC:</b>",
-        f"  offset: <code>{ec.ioc_offset_ticks} ticks</code>",
-        f"  attempts: <code>{ec.ioc_max_attempts}× @ {ec.ioc_attempt_interval_ms}ms</code>",
-        "",
-        "<b>Exit thresholds:</b> <i>(simple_trail)</i>",
-        f"  stop_adverse: <code>{_exit(ex.stop_adverse_bps, ex.stop_adverse_ticks)}</code>",
-        f"  trail: <code>{_exit(ex.trail_distance_bps, ex.trail_distance_ticks)}</code>",
-        f"  breakeven: <code>{_exit(ex.breakeven_trigger_bps, ex.breakeven_trigger_ticks)}</code>",
-        f"  stop_loss: <code>{sl_txt}</code>",
-        f"  binance_reversal: <code>{('gap-relative frac=%.2f' % ec.gap_retrace_frac) if getattr(ec, 'gap_retrace_frac', 0) > 0 else ('%g ticks' % ec.binance_reversal_ticks)}</code>",
-        f"  <i>tick fallbacks (used only if a *_bps=0): adverse={ex.stop_adverse_ticks:g} "
-        f"trail={ex.trail_distance_ticks:g} breakeven={ex.breakeven_trigger_ticks:g}</i>",
-        "",
-        "<b>Exit timing:</b>",
-        f"  min_hold: <code>{ex.min_hold_ms}ms</code>",
-        f"  stall_timeout: <code>{ex.stall_timeout_ms}ms</code>",
-        f"  dead_on_arrival: <code>{ex.dead_on_arrival_timeout_ms}ms</code>",
-        f"  binance_reversal_max: <code>{ex.binance_reversal_max_ms}ms</code>",
-        f"  sl_grace: <code>{ec.sl_grace_sec:g}s</code>",
-        f"  max_hold: <code>{ec.max_hold_sec}s</code>",
-        "",
-        "<b>Cooldowns:</b>",
-        f"  after_loss: <code>{ec.cooldown_after_loss_sec}s</code>",
-        f"  after_win: <code>{ec.cooldown_after_win_sec}s</code>",
-        "",
-        f"<b>Momentum filter:</b> {mom}",
-        "",
-        "<i>ⓘ exit bps are price-relative; effective ticks = bps×price/tick at fill</i>",
-    ]
-    await update.message.reply_text("\n".join(text_lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        _fmt_pair_config_full(symbol, pc, live=live, epoch_ts=epoch_ts,
+                              overrides=overrides, tick=tick, price=price),
+        parse_mode=ParseMode.HTML)
 
 
 async def cmd_kill_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
