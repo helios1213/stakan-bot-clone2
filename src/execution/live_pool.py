@@ -41,13 +41,15 @@ class LiveExecutorPool:
         webkey_store,       # WebkeyStore
         alerts=None,        # Optional[TelegramAlerts]
         private_ws_pool=None,  # Optional[MexcPrivateWSPool] — push-based fills
-        # Просадка: єдиний кіл, межа = pct × нотіонал.
-        # env LIVE_DRAWDOWN_PCT_OF_NOTIONAL (main.py).
+        # Просадка: межа = min(стеля, pct × нотіонал).
+        # env LIVE_MAX_DRAWDOWN / LIVE_DRAWDOWN_PCT_OF_NOTIONAL (main.py).
+        default_max_drawdown_usdt: float = 25.0,
         default_drawdown_pct_of_notional: float = 0.01,
         default_max_per_symbol: int = 1,
         default_max_total: int = 1,
         default_max_margin_usdt: float = 10.0,
     ) -> None:
+        self.default_max_drawdown_usdt = default_max_drawdown_usdt
         self.default_drawdown_pct_of_notional = default_drawdown_pct_of_notional
         self.client_pool = client_pool
         self.webkey_store = webkey_store
@@ -101,6 +103,7 @@ class LiveExecutorPool:
                     private_ws_pool=self.private_ws_pool,
                 )
                 self._safety_controllers[sid] = LiveSafetyController(
+                    max_drawdown_usdt=self.default_max_drawdown_usdt,
                     drawdown_pct_of_notional=self.default_drawdown_pct_of_notional,
                     max_concurrent_per_symbol=self.default_max_per_symbol,
                     max_concurrent_total=self.default_max_total,

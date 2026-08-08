@@ -26,13 +26,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.execution.live_safety import LiveSafetyController
 
 
-def _ctl(pct=0.01):
-    return LiveSafetyController(drawdown_pct_of_notional=pct)
+def _ctl(pct=0.01, ceiling=25.0):
+    return LiveSafetyController(max_drawdown_usdt=ceiling,
+                                drawdown_pct_of_notional=pct)
 
 
 def test_the_live_pepe_slot_gets_the_measured_number():
     """1.0% від $4650 = $46.50 (було $116 при множнику 2.5%)."""
-    c = _ctl()
+    c = _ctl(ceiling=999.0)                     # стелю відсунуто, міряємо відсоток
     c.record_close("1000PEPEUSDT", 0.10, notional_usdt=4650.0)
     assert c.drawdown_limit() == pytest.approx(46.5)
 
@@ -44,21 +45,28 @@ def test_the_live_pengu_slot_scales_down_with_it():
     assert c.drawdown_limit() == pytest.approx(14.8)
 
 
-def test_no_ceiling_can_override_the_fraction():
-    """Стелі більше немає: на будь-якому розмірі діє рівно відсоток.
+def test_the_ceiling_caps_any_size():
+    """Суть повернення стелі 2026-08-08: розмір більше не тягне стоп за собою.
 
-    Раніше env LIVE_MAX_DRAWDOWN міг перебити множник, і тоді слот із
-    нотіоналом $4650 стояв би на $20 замість $46.50.
+    Маржу PENGU підняли вдвічі — поріг поїхав з ~$22 до $45.63 сам по собі.
+    Тепер хоч 40к нотіоналу, поріг лишається $25.
     """
     c = _ctl()
     for _ in range(80):
         c.record_close("X", 0.0, notional_usdt=40000.0)
-    assert c.drawdown_limit() == pytest.approx(400.0, rel=0.05)
-    assert not hasattr(c, "max_drawdown_usdt"), "стеля не має існувати"
+    assert c.drawdown_limit() == pytest.approx(25.0)
 
 
-def test_no_floor_either():
-    """Підлоги теж немає — межа строго пропорційна.
+def test_the_percentage_still_rules_below_the_ceiling():
+    """Нижче ~$2500 нотіоналу в'яже відсоток, а не стеля — дрібна пара не
+    отримує непропорційно широкого стопу."""
+    c = _ctl()
+    c.record_close("X", 0.0, notional_usdt=1500.0)
+    assert c.drawdown_limit() == pytest.approx(15.0)
+
+
+def test_no_floor():
+    """Підлоги немає й далі — межа строго пропорційна знизу.
 
     ⚠️ Наслідок: HYPE (нотіонал ~$94) отримує межу $0.94. Пара в shadow;
     перед вмиканням у лайв поріг треба переглянути.
@@ -69,14 +77,12 @@ def test_no_floor_either():
     assert not hasattr(c, "min_drawdown_usdt"), "підлога не має існувати"
 
 
-def test_no_kill_until_the_first_close_reveals_the_size():
-    """Межа є часткою позиції, тож без позиції межі немає — і кіла теж."""
+def test_before_the_first_close_the_ceiling_protects():
+    """Розмір ще невідомий — діє стеля. Раніше тут було 0 (кіла немає взагалі);
+    зі стелею захищати з першої хвилини дешевше, ніж не захищати."""
     c = _ctl()
     assert c.state.avg_notional_usdt <= 0
-    assert c.drawdown_limit() == 0.0
-    c.state.peak_pnl = 999.0
-    c.record_close("X", -999.0)                 # просадка $999, розміру немає
-    assert c.state.kill_active is False
+    assert c.drawdown_limit() == pytest.approx(25.0)
 
 
 def test_the_first_close_arms_it_immediately():
@@ -91,13 +97,13 @@ def test_state_summary_reports_the_effective_limit():
     c = _ctl()
     c.record_close("1000PEPEUSDT", 0.10, notional_usdt=4650.0)
     s = c.state_summary()
-    assert s["drawdown_limit_usdt"] == pytest.approx(46.5)
-    assert "1.00%" in s["drawdown_limit_basis"]
+    assert s["drawdown_limit_usdt"] == pytest.approx(25.0)
+    assert "стеля" in s["drawdown_limit_basis"]
     assert s["avg_notional_usdt"] == pytest.approx(4650.0)
 
 
 def test_changing_the_regime_is_an_env_edit_not_a_code_edit():
     """Єдиний важіль — LIVE_DRAWDOWN_PCT_OF_NOTIONAL."""
-    c = _ctl(pct=0.025)                         # старий режим
+    c = _ctl(pct=0.025, ceiling=999.0)          # старий режим, стеля відсунута
     c.record_close("1000PEPEUSDT", 0.10, notional_usdt=4650.0)
     assert c.drawdown_limit() == pytest.approx(116.25)

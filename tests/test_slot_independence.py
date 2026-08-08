@@ -366,13 +366,24 @@ class TestDrawdownScalesWithSize:
     """
 
     @staticmethod
-    def _ctl():
+    def _ctl(ceiling: float = 999.0):
+        """Стеля відсунута НАВМИСНО: цей клас міряє, як межа йде за РОЗМІРОМ.
+        Зі стандартною стелею $25 усі числа нижче впирались би в неї, і тести
+        перевіряли б стелю замість відсотка. Сама стеля покрита окремо —
+        tests/test_drawdown_ceiling.py."""
         from src.execution.live_safety import LiveSafetyController
-        return LiveSafetyController()
+        return LiveSafetyController(max_drawdown_usdt=ceiling)
+
+    def test_the_ceiling_applies_before_the_first_close(self):
+        """До першої угоди розмір невідомий — діє стеля (2026-08-08).
+        Раніше тут було 0, тобто кіла не існувало взагалі."""
+        c = self._ctl(ceiling=25.0)
+        assert c.state.avg_notional_usdt == 0.0
+        assert c.drawdown_limit() == 25.0
 
     def test_no_kill_until_the_first_close_reveals_the_size(self):
         """Межа є часткою позиції, тож поки позиція невідома — межі немає."""
-        c = self._ctl()
+        c = self._ctl(ceiling=0.0)
         assert c.state.avg_notional_usdt == 0.0
         assert c.drawdown_limit() == 0.0
         c.state.peak_pnl = 500.0
@@ -386,6 +397,17 @@ class TestDrawdownScalesWithSize:
         d = self._ctl()
         d.record_close("LINKUSDT", 0.0, notional_usdt=292.0)
         assert abs(d.drawdown_limit() - 2.92) < 0.05     # 1.0% від 292, підлоги немає
+
+    def test_the_ceiling_beats_the_percentage_on_a_big_slot(self):
+        """Суть повернення стелі: розмір більше не тягне стоп за собою.
+
+        $2,755 нотіоналу дають 1% = $27.55, але зі стелею $25 в'яже стеля.
+        Саме це й сталось 2026-08-08 навпаки: без стелі маржу підняли вдвічі
+        і поріг поїхав з ~$22 до $45.63 сам по собі.
+        """
+        c = self._ctl(ceiling=25.0)
+        c.record_close("1000PEPEUSDT", 0.0, notional_usdt=2755.0)
+        assert c.drawdown_limit() == 25.0
 
     def test_a_big_slot_survives_what_would_have_killed_it_before(self):
         """$25 of drawdown at $2,755 notional is ordinary; the old $20 killed it."""

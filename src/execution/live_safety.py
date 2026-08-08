@@ -71,6 +71,12 @@ class LiveSafetyController:
 
     def __init__(
         self,
+        # АБСОЛЮТНА СТЕЛЯ (env LIVE_MAX_DRAWDOWN). Розмір-відносне правило
+        # нижче саме по собі означає, що підняття маржі піднімає й поріг
+        # зупинки — 2026-08-08 маржу PENGU підняли вдвічі, і поріг поїхав із
+        # ~$22 до $45.63 без жодної правки тут. Стеля це розв'язує: вище
+        # ~$2500 нотіоналу межа стоїть, хоч би який був розмір.
+        max_drawdown_usdt: float = 25.0,
         # ЄДИНИЙ автоматичний кіл: просадка від піку сесії.
         # Межа = drawdown_pct_of_notional × avg_notional, більше нічого.
         # Приходить з env LIVE_DRAWDOWN_PCT_OF_NOTIONAL через main.py →
@@ -96,6 +102,7 @@ class LiveSafetyController:
         # Margin sanity
         max_margin_per_trade_usdt: float = 10.0,        # never risk more than this
     ) -> None:
+        self.max_drawdown_usdt = max_drawdown_usdt
         self.drawdown_pct_of_notional = drawdown_pct_of_notional
         self.kill_pause_sec = kill_pause_sec
         self.max_concurrent_per_symbol = max_concurrent_per_symbol
@@ -106,11 +113,13 @@ class LiveSafetyController:
         self._daily_reset_at_ts = self._next_reset_ts()
 
         logger.info(
-            "LiveSafetyController initialized: єдиний кіл — просадка %.2f%% "
-            "нотіоналу (ефективна межа в [EQUITY] і state_summary; до першого "
-            "закриття розмір невідомий і кіла немає) | max_concurrent=%d, "
-            "max_margin/trade=$%.2f",
+            "LiveSafetyController initialized: єдиний кіл — просадка "
+            "min(стеля $%.2f, %.2f%% нотіоналу); стеля в'яже від ~$%.0f "
+            "нотіоналу | max_concurrent=%d, max_margin/trade=$%.2f",
+            max_drawdown_usdt,
             drawdown_pct_of_notional * 100,
+            (max_drawdown_usdt / drawdown_pct_of_notional
+             if drawdown_pct_of_notional > 0 else 0.0),
             max_concurrent_total,
             max_margin_per_trade_usdt,
         )
@@ -195,19 +204,20 @@ class LiveSafetyController:
     def drawdown_limit(self) -> float:
         """Скільки доларів просадки цей слот може взяти при ПОТОЧНОМУ розмірі.
 
-            pct × avg_notional
+            min(СТЕЛЯ, pct × avg_notional)
 
-        Одне число і жодних конкурентів. Фіксована сума застаріває тієї ж миті,
-        коли міняється сайзинг, а слоти відрізняються в рази — тому межа є
-        часткою позиції, а не доларом.
+        Відсоток тримає межу пропорційною позиції (фіксована сума застаріває тієї
+        ж миті, коли міняється сайзинг). Стеля не дає розміру тягнути стоп за
+        собою: 2026-08-08 маржу PENGU підняли вдвічі й поріг поїхав з ~$22 до
+        $45.63 сам по собі. Вище ~$2500 нотіоналу в'яже стеля, нижче — відсоток.
 
-        Поки слот не закрив жодної угоди, розмір невідомий і межа = 0, тобто
-        кіла немає: record_close рахує межу вже ПІСЛЯ оновлення avg_notional,
-        тож перша ж закрита угода її вмикає.
+        До першого закриття розмір невідомий — віддаємо стелю: з нею є що
+        захищати з першої хвилини, і це дешевше, ніж не мати кіла взагалі.
         """
         if self.state.avg_notional_usdt <= 0:
-            return 0.0
-        return self.drawdown_pct_of_notional * self.state.avg_notional_usdt
+            return self.max_drawdown_usdt
+        return min(self.max_drawdown_usdt,
+                   self.drawdown_pct_of_notional * self.state.avg_notional_usdt)
 
     def record_close(self, symbol: str, pnl_usdt: float,
                      notional_usdt: float | None = None) -> None:
@@ -386,8 +396,11 @@ class LiveSafetyController:
             "drawdown": round(self.state.peak_pnl - self.state.today_pnl, 4),
             "drawdown_limit_usdt": round(self.drawdown_limit(), 2),
             "drawdown_limit_basis": (
-                "розмір ще невідомий — кіла немає"
+                f"стеля ${self.max_drawdown_usdt:.0f} (розмір ще невідомий)"
                 if self.state.avg_notional_usdt <= 0 else
+                f"стеля ${self.max_drawdown_usdt:.0f}"
+                if (self.drawdown_pct_of_notional * self.state.avg_notional_usdt
+                    >= self.max_drawdown_usdt) else
                 f"{self.drawdown_pct_of_notional*100:.2f}% від нотіоналу "
                 f"${self.state.avg_notional_usdt:.0f}"),
             "avg_notional_usdt": round(self.state.avg_notional_usdt, 2),

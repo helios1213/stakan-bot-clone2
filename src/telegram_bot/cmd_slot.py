@@ -444,21 +444,54 @@ async def handle_slot_callback(query, context, data: str) -> None:
         # Lift an active safety kill on THIS slot only. The state is in-memory,
         # so it is reached through the live pool rather than the store.
         live_pool = context.bot_data.get("live_pool")
-        _was, _why = False, ""
-        if live_pool is not None:
+        _was, _why, _err = False, "", None
+        _summary = None
+        if live_pool is None:
+            _err = "live pool не активний"
+        else:
             try:
                 _safety = live_pool.get_safety(slot_id)
-                if _safety is not None:
+                if _safety is None:
+                    _err = f"слот {slot_id} не має контролера безпеки"
+                else:
                     _was, _why = _safety.release_kill()
-            except Exception:
-                pass
+                    _summary = _safety.state_summary()
+            except Exception as _e:
+                # Раніше тут стояв `pass`, і будь-яка помилка перевдягалась у
+                # «kill не був активний» — оператор думав, що кнопка спрацювала.
+                _err = f"{type(_e).__name__}: {_e}"
+                logger.exception("[KILL RESET] slot=%s не вдалось зняти", slot_id)
         try:
             await query.answer(
-                f"Kill switch cleared ✅ ({_why[:60]})" if _was
-                else "No kill was active — drawdown baseline re-set anyway"
+                "Не вдалось ⚠️" if _err else
+                ("Kill switch знято ✅" if _was else "Кіла не було — базу оновлено")
             )
         except Exception:
             pass
+        # Повідомлення в ЧАТ, а не спливна підказка: підказка живе секунду й
+        # нічого не лишає, а після зняття запобіжника треба бачити, з чим слот
+        # поїхав далі — і на якій межі він зупиниться наступного разу.
+        if _err:
+            _msg = (f"⚠️ <b>Kill switch НЕ знято</b> — слот {slot_id}\n"
+                    f"<code>{_err[:200]}</code>\n"
+                    f"Запобіжник лишається як був.")
+        else:
+            _lim = (_summary or {}).get("drawdown_limit_usdt")
+            _basis = (_summary or {}).get("drawdown_limit_basis", "")
+            _pnl = (_summary or {}).get("today_pnl", 0.0)
+            _head = ("♻️ <b>Kill switch знято</b>" if _was
+                     else "✅ <b>Кіл не був активний</b>")
+            _msg = (f"{_head} — слот {slot_id}\n"
+                    + (f"було: <i>{_why[:160]}</i>\n" if _why else "")
+                    + f"PnL слота сьогодні: <b>${_pnl:+.2f}</b>\n"
+                    + "База просадки переставлена на поточний PnL — "
+                      "слот отримав повний запас назад.\n"
+                    + (f"Наступна зупинка на просадці <b>${_lim:.2f}</b>"
+                       f" ({_basis})" if _lim is not None else ""))
+        try:
+            await query.message.reply_text(_msg, parse_mode="HTML")
+        except Exception:
+            logger.exception("[KILL RESET] не вдалось надіслати підтвердження")
         slot = await store.get(slot_id)
         if slot is None:
             return

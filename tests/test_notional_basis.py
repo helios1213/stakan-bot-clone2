@@ -20,8 +20,13 @@ from src.execution.live_safety import LiveSafetyController
 
 
 def test_limit_follows_the_filled_size_not_the_ordered_one():
-    """PENGU 2026-08-08: замовлено $4563, залито $3134."""
-    c = LiveSafetyController(drawdown_pct_of_notional=0.01)
+    """PENGU 2026-08-08: замовлено $4563, залито $3134.
+
+    Стеля відсунута навмисно — інакше обидва числа впираються в $25 і різниця
+    між залитим і замовленим стає невидимою. У бою стеля, звісно, діє.
+    """
+    c = LiveSafetyController(max_drawdown_usdt=999.0,
+                             drawdown_pct_of_notional=0.01)
     c.record_close("PENGUUSDT", 0.0, notional_usdt=3134.0)
     assert c.drawdown_limit() == pytest.approx(31.34)
     assert c.drawdown_limit() < 45.63, "замовлений розмір завищував межу на 46%"
@@ -29,7 +34,8 @@ def test_limit_follows_the_filled_size_not_the_ordered_one():
 
 def test_partial_fills_do_not_inflate_the_limit():
     """Серія половинчастих наливок має тримати межу на реальній експозиції."""
-    c = LiveSafetyController(drawdown_pct_of_notional=0.01)
+    c = LiveSafetyController(max_drawdown_usdt=999.0,
+                             drawdown_pct_of_notional=0.01)
     for _ in range(60):
         c.record_close("X", 0.0, notional_usdt=2000.0)   # залито
     assert c.drawdown_limit() == pytest.approx(20.0, rel=0.02)
@@ -40,7 +46,8 @@ def test_ema_smooths_a_single_tiny_fill():
 
     Це і був аргумент проти залитого розміру; перевіряємо, що він не спрацьовує.
     """
-    c = LiveSafetyController(drawdown_pct_of_notional=0.01)
+    c = LiveSafetyController(max_drawdown_usdt=999.0,
+                             drawdown_pct_of_notional=0.01)
     for _ in range(40):
         c.record_close("X", 0.0, notional_usdt=3000.0)
     before = c.drawdown_limit()
