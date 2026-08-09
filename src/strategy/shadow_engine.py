@@ -238,6 +238,140 @@ else:
     )
 
 
+def classify_live_fail(err_msg: str, raw: str, sym: str) -> dict:
+    """Класифікація невдалого відкриття live-позиції → як про це говорити.
+
+    `err_msg` — причина в нижньому регістрі, `raw` — оригінальний текст
+    помилки, `sym` — пара (потрапляє в підказки).
+
+    Винесено з `_open_position` як є: там ці 100+ рядків не можна було
+    перевірити інакше, ніж чекаючи відповідної помилки в бою.
+    Повертає kind / emoji / title / hint / throttle / auto_pause.
+    """
+    # Default classification (matches anything that wasn't benign)
+    kind = "unknown"
+    emoji = "⚠️"
+    title = "LIVE FAILED — Unknown error"
+    hint = f"Raw: <code>{(raw or '?')[:120]}</code>"
+    # 30 хв, а не 5: той самий нерозпізнаний текст, повторений 6 разів на
+    # годину, не додає інформації — він лише привчає не читати алерти.
+    throttle = 1800
+    auto_pause = False
+
+    # api_error_6026 — MEXC face verification / risk control
+    if "api_error_6026" in err_msg:
+        kind = "risk_control"
+        emoji = "🛑"
+        title = "MEXC РИЗИК-КОНТРОЛЬ"
+        hint = (
+            "MEXC вимагає face verification або інші перевірки.\n"
+            "Залогінься на MEXC web → пройди перевірку.\n"
+            "Пара авто-поставлена на pause."
+        )
+        throttle = 3600
+        auto_pause = True
+
+
+    # Insufficient balance / margin
+    elif any(s in err_msg for s in (
+        "insufficient", "api_error_6017",
+        "api_error_3003", "api_error_3005",
+    )):
+        kind = "insufficient_balance"
+        emoji = "💸"
+        title = "Недостатньо коштів"
+        hint = (
+            "Не вистачає USDT на slot для відкриття позиції.\n"
+            "Поповни баланс на MEXC або зменш margin "
+            f"(<code>/menu</code> → 💰 Sizing → <code>{sym}</code>)."
+        )
+        throttle = 600
+
+    # Webkey expired / auth issues
+    elif any(s in err_msg for s in (
+        "401", "403", "webkey", "unauthor",
+        "api_error_1002", "invalid token",
+        "session expired",
+    )):
+        kind = "webkey_invalid"
+        emoji = "🔑"
+        title = "Webkey не валідний"
+        hint = (
+            "Webkey expired або відкликаний MEXC.\n"
+            "Відкрий <code>/menu</code> → 🔑 Webkey → "
+            "вибери slot → /webkey_setup → встав свіжий webkey."
+        )
+        throttle = 1800  # 30 min — once user knows, they know
+
+    # Symbol/contract not available
+    elif any(s in err_msg for s in (
+        "api_error_3008", "api_error_30000",
+        "symbol not", "contract not",
+    )):
+        kind = "symbol_unavailable"
+        emoji = "🚫"
+        title = "Пара не доступна на MEXC"
+        hint = (
+            f"Контракт {sym} призупинено або делістили на MEXC.\n"
+            f"Розглянь переключити slot на іншу пару "
+            "(<code>/menu</code> → 🔑 Webkey → slot → Pair)."
+        )
+        throttle = 3600
+
+    # Rate limit — MEXC code 510 ("Requests are too frequent"),
+    # generic 429 / "too many requests", and our own 510 slot-cooldown
+    # skips. This is account/IP-wide, NOT a leverage problem.
+    elif any(s in err_msg for s in (
+        "rate limit", "rate_limit", "429", "too many requests",
+        "api_error_429", "api_error_510", "too frequent",
+    )):
+        kind = "rate_limit"
+        emoji = "🚦"
+        title = "MEXC rate-limit"
+        hint = ""  # title + pair say enough; 510 is self-healing
+        throttle = 600
+
+    # Network / timeout
+    elif any(s in err_msg for s in (
+        "timeout", "connection", "network",
+        "name resolution", "ssl",
+    )):
+        kind = "network"
+        emoji = "📡"
+        title = "Network / MEXC unreachable"
+        hint = (
+            "Bot не може дістатися MEXC API.\n"
+            "Перевір з'єднання сервера, або зачекай — "
+            "MEXC може бути overloaded."
+        )
+        throttle = 600
+
+    # Спрацював наш власний запобіжник — це не помилка біржі й не збій.
+    # Кіл уже надіслав свій алерт у момент спрацювання; тут лише нагадування,
+    # що слот стоїть, тому раз на пів години, а не кожні п'ять хвилин.
+    elif "safety_blocked" in err_msg or "kill_active" in err_msg:
+        kind = "safety_kill"
+        emoji = "⏸"
+        title = "Торгівля зупинена — запобіжник"
+        hint = (f"<code>{(raw or '?')[:160]}</code>\n\n"
+                "Слот не відкриває нові позиції, доки діє кіл.\n"
+                "Зняти: <code>/menu</code> → 🔑 Webkey → слот → "
+                "♻️ Reset kill switch")
+        throttle = 1800
+    # Exception in bot's own code (very rare, indicates a bug)
+    elif "exception" in err_msg:
+        kind = "internal_exception"
+        emoji = "💥"
+        title = "Внутрішня помилка боту"
+        hint = (
+            "Bot спіймав exception при відправці ордеру.\n"
+            "Дивись логи: <code>docker compose logs --tail=200 stakan-bot</code>"
+        )
+        throttle = 300
+    return {"kind": kind, "emoji": emoji, "title": title, "hint": hint,
+            "throttle": throttle, "auto_pause": auto_pause}
+
+
 # Per-pair config defaults — loaded from DB but cached
 @dataclass
 class PairExecConfig:
@@ -1783,112 +1917,13 @@ class ShadowEngine:
                 # Silent — bot's normal logs/metrics still capture them.
                 return
 
-            # Default classification (matches anything that wasn't benign)
-            kind = "unknown"
-            emoji = "⚠️"
-            title = "LIVE FAILED — Unknown error"
-            hint = f"Raw: <code>{(pos.live_open_error or '?')[:120]}</code>"
-            throttle = 300
-            auto_pause = False
-
-            # api_error_6026 — MEXC face verification / risk control
-            if "api_error_6026" in err_msg:
-                kind = "risk_control"
-                emoji = "🛑"
-                title = "MEXC РИЗИК-КОНТРОЛЬ"
-                hint = (
-                    "MEXC вимагає face verification або інші перевірки.\n"
-                    "Залогінься на MEXC web → пройди перевірку.\n"
-                    "Пара авто-поставлена на pause."
-                )
-                throttle = 3600
-                auto_pause = True
-
-
-            # Insufficient balance / margin
-            elif any(s in err_msg for s in (
-                "insufficient", "api_error_6017",
-                "api_error_3003", "api_error_3005",
-            )):
-                kind = "insufficient_balance"
-                emoji = "💸"
-                title = "Недостатньо коштів"
-                hint = (
-                    "Не вистачає USDT на slot для відкриття позиції.\n"
-                    "Поповни баланс на MEXC або зменш margin "
-                    f"(<code>/menu</code> → 💰 Sizing → <code>{sym}</code>)."
-                )
-                throttle = 600
-
-            # Webkey expired / auth issues
-            elif any(s in err_msg for s in (
-                "401", "403", "webkey", "unauthor",
-                "api_error_1002", "invalid token",
-                "session expired",
-            )):
-                kind = "webkey_invalid"
-                emoji = "🔑"
-                title = "Webkey не валідний"
-                hint = (
-                    "Webkey expired або відкликаний MEXC.\n"
-                    "Відкрий <code>/menu</code> → 🔑 Webkey → "
-                    "вибери slot → /webkey_setup → встав свіжий webkey."
-                )
-                throttle = 1800  # 30 min — once user knows, they know
-
-            # Symbol/contract not available
-            elif any(s in err_msg for s in (
-                "api_error_3008", "api_error_30000",
-                "symbol not", "contract not",
-            )):
-                kind = "symbol_unavailable"
-                emoji = "🚫"
-                title = "Пара не доступна на MEXC"
-                hint = (
-                    f"Контракт {sym} призупинено або делістили на MEXC.\n"
-                    f"Розглянь переключити slot на іншу пару "
-                    "(<code>/menu</code> → 🔑 Webkey → slot → Pair)."
-                )
-                throttle = 3600
-
-            # Rate limit — MEXC code 510 ("Requests are too frequent"),
-            # generic 429 / "too many requests", and our own 510 slot-cooldown
-            # skips. This is account/IP-wide, NOT a leverage problem.
-            elif any(s in err_msg for s in (
-                "rate limit", "rate_limit", "429", "too many requests",
-                "api_error_429", "api_error_510", "too frequent",
-            )):
-                kind = "rate_limit"
-                emoji = "🚦"
-                title = "MEXC rate-limit"
-                hint = ""  # title + pair say enough; 510 is self-healing
-                throttle = 600
-
-            # Network / timeout
-            elif any(s in err_msg for s in (
-                "timeout", "connection", "network",
-                "name resolution", "ssl",
-            )):
-                kind = "network"
-                emoji = "📡"
-                title = "Network / MEXC unreachable"
-                hint = (
-                    "Bot не може дістатися MEXC API.\n"
-                    "Перевір з'єднання сервера, або зачекай — "
-                    "MEXC може бути overloaded."
-                )
-                throttle = 600
-
-            # Exception in bot's own code (very rare, indicates a bug)
-            elif "exception" in err_msg:
-                kind = "internal_exception"
-                emoji = "💥"
-                title = "Внутрішня помилка боту"
-                hint = (
-                    "Bot спіймав exception при відправці ордеру.\n"
-                    "Дивись логи: <code>docker compose logs --tail=200 stakan-bot</code>"
-                )
-                throttle = 300
+            _cls = classify_live_fail(err_msg, pos.live_open_error or "", sym)
+            kind = _cls["kind"]
+            emoji = _cls["emoji"]
+            title = _cls["title"]
+            hint = _cls["hint"]
+            throttle = _cls["throttle"]
+            auto_pause = _cls["auto_pause"]
 
             # Auto-pause logic — applied BEFORE alert, so message reflects state
             if auto_pause:
