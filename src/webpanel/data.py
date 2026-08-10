@@ -919,9 +919,11 @@ def live_trades(limit: int = 100) -> list[dict]:
     try:
         conn = _ro(LIVE_DB)
         rows = conn.execute(
+            # notional_usdt = ЗАЛИТО, margin×leverage = ЗАМОВЛЕНО. Праймер
+            # тягне ці рядки через RPC і показує колонку «Залито».
             "SELECT id, symbol, direction, leverage, margin_usdt, net_pnl_usdt, "
             "roi_pct, opened_at, closed_at, exit_reason, duration_sec, "
-            "mode, account_label "
+            "mode, account_label, notional_usdt, entry_filled_pct "
             "FROM live_trades ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         conn.close()
