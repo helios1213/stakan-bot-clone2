@@ -41,6 +41,7 @@ class LiveExecutorPool:
         webkey_store,       # WebkeyStore
         alerts=None,        # Optional[TelegramAlerts]
         private_ws_pool=None,  # Optional[MexcPrivateWSPool] — push-based fills
+        live_db=None,       # Optional[LiveDatabase] — щоб відновити сесію після рестарту
         # Просадка: межа = min(стеля, pct × нотіонал).
         # env LIVE_MAX_DRAWDOWN / LIVE_DRAWDOWN_PCT_OF_NOTIONAL (main.py).
         default_max_drawdown_usdt: float = 25.0,
@@ -55,6 +56,7 @@ class LiveExecutorPool:
         self.webkey_store = webkey_store
         self.alerts = alerts
         self.private_ws_pool = private_ws_pool
+        self.live_db = live_db
         self.default_max_per_symbol = default_max_per_symbol
         self.default_max_total = default_max_total
         self.default_max_margin_usdt = default_max_margin_usdt
@@ -70,6 +72,26 @@ class LiveExecutorPool:
         # their stats stay readable — this set is what says which of
         # them may still be used to touch an account.
         self._active_slot_ids: set[int] = set()
+
+    async def _hydrate_safety(self, slot_id: int) -> None:
+        """Відновити добу слота з live_trades (00:00 локальних → зараз)."""
+        ctl = self._safety_controllers.get(slot_id)
+        if ctl is None or self.live_db is None:
+            return
+        try:
+            rows = await self.live_db.fetchall(
+                "SELECT net_pnl_usdt, notional_usdt FROM live_trades "
+                "WHERE account_label = ? AND closed_at IS NOT NULL "
+                "  AND closed_at >= ? ORDER BY closed_at",
+                (f"slot{slot_id}", ctl.session_start_ts()),
+            )
+            if rows:
+                ctl.hydrate_session([(r[0], r[1]) for r in rows])
+        except Exception:
+            # Не даємо збою читання завалити підняття слота: гірший наслідок —
+            # день починається з нуля, тобто рівно стара поведінка.
+            logger.exception(
+                "[SESSION] slot %d: не вдалось відновити добу", slot_id)
 
     async def rebuild_from_store(self) -> None:
         """
@@ -109,6 +131,10 @@ class LiveExecutorPool:
                     max_concurrent_total=self.default_max_total,
                     max_margin_per_trade_usdt=self.default_max_margin_usdt,
                 )
+                # Стан запобіжника живе лише в памʼяті, тож новий контролер
+                # приходить із нульовим днем. Відновлюємо добу з угод — інакше
+                # рестарт стирав пік сесії і знімав кіл.
+                await self._hydrate_safety(sid)
                 logger.info(
                     "LiveExecutorPool: spawned executor for slot %d (pair=%s)",
                     sid, slot.assigned_pair,

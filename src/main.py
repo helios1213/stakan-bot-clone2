@@ -875,6 +875,7 @@ async def main() -> None:
             webkey_store=webkey_store,
             alerts=None,  # wired below after alerts is created
             private_ws_pool=private_ws_pool,
+            live_db=live_db,
             default_max_drawdown_usdt=float(
                 os.environ.get('LIVE_MAX_DRAWDOWN', '25.0')),
             default_drawdown_pct_of_notional=float(

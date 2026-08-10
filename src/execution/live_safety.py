@@ -35,6 +35,8 @@ All checks are evaluated BEFORE every live entry. State is in-memory
 from __future__ import annotations
 
 import logging
+import datetime
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -110,6 +112,7 @@ class LiveSafetyController:
         self.max_margin_per_trade_usdt = max_margin_per_trade_usdt
 
         self.state = SafetyState()
+        self._tz = self._resolve_tz()
         self._daily_reset_at_ts = self._next_reset_ts()
 
         logger.info(
@@ -124,14 +127,89 @@ class LiveSafetyController:
             max_margin_per_trade_usdt,
         )
 
+    @staticmethod
+    def _resolve_tz():
+        """Зона, у якій рахується доба сесії — та сама, що в боті (TZ).
+
+        Раніше межа стояла на півночі UTC, тобто «доба» оператора починалась
+        о 03:00 за київським часом, і денний звіт ніколи не збігався з тим,
+        що показував запобіжник.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(os.environ.get("TZ") or "UTC")
+        except Exception:      # немає tzdata — краще UTC, ніж падіння
+            return datetime.timezone.utc
+
+    def session_start_ts(self) -> int:
+        """00:00 поточної доби за локальною зоною, unix-секунди."""
+        today = datetime.datetime.now(self._tz).date()
+        return int(datetime.datetime.combine(
+            today, datetime.time(0, 0), tzinfo=self._tz).timestamp())
+
     def _next_reset_ts(self) -> int:
-        """Reset daily counters at next 00:00 UTC."""
-        now = int(time.time())
-        # Round to next 86400-second boundary (UTC midnight)
-        return (now // 86400 + 1) * 86400
+        """Наступна локальна північ.
+
+        Через zoneinfo, а не +86400: перехід на літній час зсуває добу на
+        годину, і арифметика по модулю почала б розʼїжджатись із календарем.
+        """
+        tomorrow = datetime.datetime.now(self._tz).date() + datetime.timedelta(days=1)
+        return int(datetime.datetime.combine(
+            tomorrow, datetime.time(0, 0), tzinfo=self._tz).timestamp())
+
+    def hydrate_session(self, closes) -> bool:
+        """Відновити сесію з уже закритих угод цієї доби.
+
+        `closes` — [(net_pnl_usdt, notional_usdt), ...] у хронологічному
+        порядку, від 00:00 локальних до зараз.
+
+        Навіщо: контролер живе лише в памʼяті й створюється заново на кожному
+        рестарті, тож перезапуск о 14:00 стирав і денний PnL, і пік — після
+        чого просадка рахувалась від нуля, і запобіжник фактично знімався.
+        Програємо ті самі кроки, що й record_close, і дістаємо той самий стан.
+
+        Нічого не робить, якщо в сесії вже щось накопичено (щоб повторний
+        rebuild_from_store не подвоїв день). Повертає True, якщо відновив.
+        """
+        if self.state.today_trades or self.state.today_pnl:
+            return False
+        for pnl, notional in closes:
+            pnl = float(pnl or 0.0)
+            self.state.today_pnl += pnl
+            self.state.today_trades += 1
+            if self.state.today_pnl > self.state.peak_pnl:
+                self.state.peak_pnl = self.state.today_pnl
+            self.state.consecutive_losses = (
+                self.state.consecutive_losses + 1 if pnl < 0 else 0)
+            if notional and notional > 0:
+                a = self.state.avg_notional_usdt
+                self.state.avg_notional_usdt = (
+                    float(notional) if a <= 0 else 0.9 * a + 0.1 * float(notional))
+        self.state._logged_peak = self.state.peak_pnl
+        if not self.state.today_trades:
+            return False
+
+        dd_limit = self.drawdown_limit()
+        drawdown = self.state.peak_pnl - self.state.today_pnl
+        logger.warning(
+            "[SESSION] відновлено з %d угод доби: PnL=$%.2f пік=$%.2f "
+            "просадка=$%.2f межа=$%.2f",
+            self.state.today_trades, self.state.today_pnl,
+            self.state.peak_pnl, drawdown, dd_limit,
+        )
+        # Просадка вже пробита — вмикаємо кіл ЗАРАЗ, а не чекаємо наступного
+        # закриття. Інакше рестарт лишався б способом купити собі ще угоду.
+        if dd_limit > 0 and drawdown >= dd_limit:
+            self.engage_kill(
+                reason=(f"drawdown ${drawdown:.2f} from session peak "
+                        f"${self.state.peak_pnl:.2f} (limit ${dd_limit:.2f})"
+                        " — відновлено після рестарту"),
+                duration_sec=self.kill_pause_sec,
+            )
+        return True
 
     def _maybe_reset_daily(self) -> None:
-        """Reset daily PnL/counters at UTC midnight."""
+        """Скинути денні лічильники на локальній півночі (00:00 TZ бота)."""
         if int(time.time()) >= self._daily_reset_at_ts:
             logger.info(
                 "Daily safety reset: previous PnL=$%.2f trades=%d",
@@ -393,6 +471,7 @@ class LiveSafetyController:
             "kill_until_human": kill_until_human,
             "today_pnl": round(self.state.today_pnl, 4),
             "peak_pnl": round(self.state.peak_pnl, 4),
+            "session_start_ts": self.session_start_ts(),
             "drawdown": round(self.state.peak_pnl - self.state.today_pnl, 4),
             "drawdown_limit_usdt": round(self.drawdown_limit(), 2),
             "drawdown_limit_basis": (
