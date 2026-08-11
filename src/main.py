@@ -20,6 +20,7 @@ import sys
 import time
 from pathlib import Path
 
+import gc
 from loguru import logger as loguru_logger
 
 from src.config import load_env, load_yaml
@@ -59,6 +60,7 @@ def setup_logging(env_log_level: str, log_file: str) -> None:
             "<cyan>{name}</cyan>:<cyan>{line}</cyan> | "
             "<level>{message}</level>"
         ),
+        enqueue=True,   # async-запис: прибирає блокуючий лог з гарячого шляху
     )
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
     loguru_logger.add(
@@ -68,6 +70,7 @@ def setup_logging(env_log_level: str, log_file: str) -> None:
         retention="14 days",
         compression="gz",
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{line} | {message}",
+        enqueue=True,   # async-запис у файл — головний виграш на хвості
     )
 
     class InterceptHandler(logging.Handler):
@@ -1250,6 +1253,13 @@ async def main() -> None:
             name="raw_data_collector",
         )
     )
+
+    # Старт завершено, усі таски створені: заморозити довгоживучий граф
+    # об'єктів (конфіги, книги, пул) у постійне покоління — GC більше його не
+    # сканує, тож зникають рідкі 10-50мс stop-the-world паузи під ринок.
+    gc.freeze()
+    loguru_logger.info("gc.freeze() після старту — {} об'єктів у постійному поколінні",
+                       gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else "?")
 
     stop_waiter = None
     try:
