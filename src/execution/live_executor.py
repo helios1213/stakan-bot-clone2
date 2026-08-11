@@ -77,6 +77,10 @@ CONTRACT_SIZES: dict[str, float] = {
     "AVAX_USDT": 0.1,      # 1 contract = 0.1 AVAX (verified /contract/detail 2026-06-07)
     "WLD_USDT": 1.0,       # 1 contract = 1 WLD
     "XMR_USDT": 0.01,      # 1 contract = 0.01 XMR (verified 2026-06-13) (verified /contract/detail 2026-06-13)
+    # Стокові перпи (contractSize з /contract/detail 2026-08-11)
+    "SKHYNIXSTOCK_USDT": 0.001,
+    "SPCXSTOCK_USDT":    0.01,
+    "SOXL_USDT":         0.01,
 }
 
 
@@ -88,6 +92,9 @@ PRICE_SCALES: dict[str, int] = {
     "SHIB_USDT": 9,    # priceUnit=1e-09
     "DOGE_USDT": 5,    # priceUnit=1e-05
     "ENA_USDT": 5,     # priceUnit=1e-05
+    "SKHYNIXSTOCK_USDT": 2,  # priceUnit=0.01 (stock)
+    "SPCXSTOCK_USDT": 2,     # priceUnit=0.01 (stock)
+    "SOXL_USDT": 2,          # priceUnit=0.01 (stock)
     "ZEC_USDT": 2,     # priceUnit=0.01
     "TAO_USDT": 2,
     "BCH_USDT": 2,
@@ -351,6 +358,10 @@ TICK_SIZES: dict[str, float] = {
     "ONDO_USDT": 1e-4,    # priceScale=4 (fixed 2026-06-19)
     "WLD_USDT":  1e-4,    # priceScale=4 (was fallback 1e-5 = 10x off, fixed 2026-06-19)
     "XMR_USDT":  1e-2,    # priceScale=2 (was fallback 1e-5 = 1000x off, fixed 2026-06-19)
+    # Стокові перпи (priceUnit=0.01 з /contract/detail 2026-08-11)
+    "SKHYNIXSTOCK_USDT": 1e-2,
+    "SPCXSTOCK_USDT":    1e-2,
+    "SOXL_USDT":         1e-2,
 }
 
 
