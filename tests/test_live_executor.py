@@ -249,19 +249,14 @@ class TestLiveSafety:
         assert ctl.state.consecutive_losses == 0
 
     def test_cumulative_loss_alone_no_longer_kills(self):
-        """Зупиняє лише падіння від піку сесії — і лише відносно РОЗМІРУ.
-
-        notional передається явно: межа тепер є часткою позиції, тож без
-        розміру її не існує (див. test_no_kill_until_the_first_close...).
-        1% від $2000 = $20.
-        """
-        ctl = LiveSafetyController(drawdown_pct_of_notional=0.01)
-        for _ in range(6):
+        """Зупиняє лише падіння від піку сесії, плоско $25 (без % і без розміру)."""
+        ctl = LiveSafetyController(max_drawdown_usdt=25.0)
+        for _ in range(11):
             ctl.record_close("ZECUSDT", pnl_usdt=-2.0,
-                             notional_usdt=2000.0)       # -12 разом, пік 0
+                             notional_usdt=2000.0)       # -22 разом, пік 0
         assert ctl.is_killed() is False
-        ctl.record_close("ZECUSDT", pnl_usdt=-9.0,
-                         notional_usdt=2000.0)           # -21 від піку > $20
+        ctl.record_close("ZECUSDT", pnl_usdt=-4.0,
+                         notional_usdt=2000.0)           # -26 від піку > $25
         assert ctl.is_killed() is True
 
     def test_per_symbol_concurrent_limit(self):

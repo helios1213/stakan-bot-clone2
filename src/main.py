@@ -878,10 +878,6 @@ async def main() -> None:
             live_db=live_db,
             default_max_drawdown_usdt=float(
                 os.environ.get('LIVE_MAX_DRAWDOWN', '25.0')),
-            default_drawdown_pct_of_notional=float(
-                os.environ.get('LIVE_DRAWDOWN_PCT_OF_NOTIONAL', '0.01')),
-            default_daily_loss_kill_usdt=float(
-                os.environ.get('LIVE_DAILY_LOSS_KILL', '0.0')),
             default_max_per_symbol=int(os.environ.get('LIVE_MAX_PER_SYMBOL', '1')),
             default_max_total=int(os.environ.get('LIVE_MAX_TOTAL', '1')),
             default_max_margin_usdt=float(os.environ.get('LIVE_MAX_MARGIN', '30.0')),
@@ -912,16 +908,8 @@ async def main() -> None:
             except Exception:
                 loguru_logger.exception("private_ws warmup scheduling failed")
         _dd = float(os.environ.get('LIVE_MAX_DRAWDOWN', '25.0'))
-        _pct = float(os.environ.get('LIVE_DRAWDOWN_PCT_OF_NOTIONAL', '0.01'))
-        _daily = float(os.environ.get('LIVE_DAILY_LOSS_KILL', '0.0'))
-        if _dd > 0:
-            _kill = "просадка min(стеля ${:.2f}, {:.2f}% нотіоналу)".format(_dd, _pct * 100)
-            if _daily < 0:
-                _kill += " + сукупний денний ${:.2f}".format(_daily)
-        elif _daily < 0:
-            _kill = "сукупний денний PnL ${:.2f} (peak-drawdown вимкнено)".format(_daily)
-        else:
-            _kill = "⚠️ БЕЗ автоматичного кіла"
+        _kill = ("просадка ${:.2f} від піку сесії".format(_dd)
+                 if _dd > 0 else "⚠️ БЕЗ автоматичного кіла")
         loguru_logger.warning(
             "🔴 LIVE TRADING ENABLED (multi-slot mode) — "
             "default max_margin=${:.2f}, кіл: {}. "

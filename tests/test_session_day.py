@@ -16,7 +16,6 @@ from src.execution.live_safety import LiveSafetyController
 
 def ctl(**kw):
     kw.setdefault("max_drawdown_usdt", 25.0)
-    kw.setdefault("drawdown_pct_of_notional", 0.01)
     return LiveSafetyController(**kw)
 
 
@@ -71,11 +70,12 @@ def test_the_limit_before_any_close_is_the_ceiling_not_zero():
     assert ctl().drawdown_limit() == 25.0
 
 
-def test_a_small_pair_is_killed_on_its_own_percentage_not_on_25():
+def test_the_flat_limit_is_25_at_any_size():
+    """Плоско: $25 незалежно від нотіоналу (%-правила більше немає)."""
     c = ctl()
-    c.record_close("X", 0.0, notional_usdt=1000.0)     # межа = 1% = $10
-    assert c.drawdown_limit() == pytest.approx(10.0)
-    c.record_close("X", -10.0, notional_usdt=1000.0)
+    c.record_close("X", 0.0, notional_usdt=1000.0)
+    assert c.drawdown_limit() == pytest.approx(25.0)
+    c.record_close("X", -25.0, notional_usdt=1000.0)
     assert c.is_killed()
 
 

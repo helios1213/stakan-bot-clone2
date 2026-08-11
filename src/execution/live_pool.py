@@ -43,17 +43,13 @@ class LiveExecutorPool:
         private_ws_pool=None,  # Optional[MexcPrivateWSPool] — push-based fills
         live_db=None,       # Optional[LiveDatabase] — щоб відновити сесію після рестарту
         # Просадка: межа = min(стеля, pct × нотіонал).
-        # env LIVE_MAX_DRAWDOWN / LIVE_DRAWDOWN_PCT_OF_NOTIONAL (main.py).
+        # env LIVE_MAX_DRAWDOWN (main.py). Плоский стоп від піку сесії.
         default_max_drawdown_usdt: float = 25.0,
-        default_drawdown_pct_of_notional: float = 0.01,
-        default_daily_loss_kill_usdt: float = 0.0,
         default_max_per_symbol: int = 1,
         default_max_total: int = 1,
         default_max_margin_usdt: float = 10.0,
     ) -> None:
         self.default_max_drawdown_usdt = default_max_drawdown_usdt
-        self.default_drawdown_pct_of_notional = default_drawdown_pct_of_notional
-        self.default_daily_loss_kill_usdt = default_daily_loss_kill_usdt
         self.client_pool = client_pool
         self.webkey_store = webkey_store
         self.alerts = alerts
@@ -128,8 +124,6 @@ class LiveExecutorPool:
                 )
                 self._safety_controllers[sid] = LiveSafetyController(
                     max_drawdown_usdt=self.default_max_drawdown_usdt,
-                    drawdown_pct_of_notional=self.default_drawdown_pct_of_notional,
-                    daily_loss_kill_usdt=self.default_daily_loss_kill_usdt,
                     max_concurrent_per_symbol=self.default_max_per_symbol,
                     max_concurrent_total=self.default_max_total,
                     max_margin_per_trade_usdt=self.default_max_margin_usdt,

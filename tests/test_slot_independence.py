@@ -317,15 +317,15 @@ class TestKillSwitchReset:
         assert c.state.consecutive_losses == 12   # still counted, for the alert
         assert c.state.kill_active is False
 
-    def test_drawdown_fires_at_the_measured_fraction(self):
-        """Межа тепер одна: pct x нотіонал. При 1% від $2000 це $20."""
+    def test_drawdown_fires_at_the_flat_limit(self):
+        """Один плоский стоп: просадка від піку >= $25, будь-який розмір."""
         from src.execution.live_safety import LiveSafetyController
-        c = LiveSafetyController(drawdown_pct_of_notional=0.01)
+        c = LiveSafetyController(max_drawdown_usdt=25.0)
         c.record_close("1000PEPEUSDT", +5.0, notional_usdt=2000.0)   # пік = 5
         assert c.state.kill_active is False
-        c.record_close("1000PEPEUSDT", -14.0, notional_usdt=2000.0)  # 14 від піку
+        c.record_close("1000PEPEUSDT", -18.0, notional_usdt=2000.0)  # 23 від піку
         assert c.state.kill_active is False
-        c.record_close("1000PEPEUSDT", -6.0, notional_usdt=2000.0)   # 20 від піку
+        c.record_close("1000PEPEUSDT", -8.0, notional_usdt=2000.0)   # 26 від піку
         assert c.state.kill_active is True
 
     def test_release_kill_gives_the_full_room_back(self):
@@ -351,93 +351,56 @@ class TestKillSwitchReset:
         assert got[0] is False
 
 
-class TestDrawdownScalesWithSize:
-    """Фіксована сума застаріває тієї ж миті, коли міняється сайзинг.
-
-    Кожна історична просадка мірялась при ~$1,400 нотіоналу, тож $20 тихо
-    перетворились на еквівалент $8, щойно PEPE переїхав на $2,755 — усередину
-    звичайної варіативності, через що кіл спрацьовував у прибуткові дні. Слоти
-    ще й відрізняються в рази ($2,755 проти $292), тож одне число не підходить
-    обом.
-
-    2026-08-04 множник 2.5% -> 1.0%: заміряно по 22 слото-днях, просадка як
-    частка нотіоналу має медіану 0.46%, p90 0.99%, МАКСИМУМ 1.05% — тобто 2.5%
-    стояли у 2.4x вище за все спостережуване і не в'язали ніколи.
-    """
+class TestDrawdownIsFlat:
+    """2026-08-11: межа плоска — $25 від піку сесії за будь-якого розміру.
+    %-масштабування й підлога/стеля видалені; це замінило клас
+    TestDrawdownScalesWithSize, який перевіряв стару пропорційну модель."""
 
     @staticmethod
-    def _ctl(ceiling: float = 999.0):
-        """Стеля відсунута НАВМИСНО: цей клас міряє, як межа йде за РОЗМІРОМ.
-        Зі стандартною стелею $25 усі числа нижче впирались би в неї, і тести
-        перевіряли б стелю замість відсотка. Сама стеля покрита окремо —
-        tests/test_drawdown_ceiling.py."""
+    def _ctl(ceiling: float = 25.0):
         from src.execution.live_safety import LiveSafetyController
         return LiveSafetyController(max_drawdown_usdt=ceiling)
 
-    def test_the_ceiling_applies_before_the_first_close(self):
-        """До першої угоди розмір невідомий — діє стеля (2026-08-08).
-        Раніше тут було 0, тобто кіла не існувало взагалі."""
-        c = self._ctl(ceiling=25.0)
+    def test_limit_is_flat_before_any_close(self):
+        c = self._ctl()
         assert c.state.avg_notional_usdt == 0.0
         assert c.drawdown_limit() == 25.0
 
-    def test_no_kill_until_the_first_close_reveals_the_size(self):
-        """Межа є часткою позиції, тож поки позиція невідома — межі немає."""
-        c = self._ctl(ceiling=0.0)
-        assert c.state.avg_notional_usdt == 0.0
-        assert c.drawdown_limit() == 0.0
-        c.state.peak_pnl = 500.0
-        c.record_close("X", -500.0)          # величезна просадка, розміру немає
-        assert c.state.kill_active is False, "без розміру кіл не має спрацьовувати"
-
-    def test_limit_tracks_the_position_size(self):
+    def test_limit_does_not_track_position_size(self):
+        """Суть зміни: розмір більше НЕ тягне стоп."""
         c = self._ctl()
         c.record_close("1000PEPEUSDT", 0.0, notional_usdt=2755.0)
-        assert abs(c.drawdown_limit() - 27.55) < 0.5     # 1.0% від 2,755
+        assert c.drawdown_limit() == 25.0
         d = self._ctl()
         d.record_close("LINKUSDT", 0.0, notional_usdt=292.0)
-        assert abs(d.drawdown_limit() - 2.92) < 0.05     # 1.0% від 292, підлоги немає
+        assert d.drawdown_limit() == 25.0
 
-    def test_the_ceiling_beats_the_percentage_on_a_big_slot(self):
-        """Суть повернення стелі: розмір більше не тягне стоп за собою.
-
-        $2,755 нотіоналу дають 1% = $27.55, але зі стелею $25 в'яже стеля.
-        Саме це й сталось 2026-08-08 навпаки: без стелі маржу підняли вдвічі
-        і поріг поїхав з ~$22 до $45.63 сам по собі.
-        """
-        c = self._ctl(ceiling=25.0)
-        c.record_close("1000PEPEUSDT", 0.0, notional_usdt=2755.0)
-        assert c.drawdown_limit() == 25.0
-
-    def test_a_big_slot_survives_what_would_have_killed_it_before(self):
-        """$25 of drawdown at $2,755 notional is ordinary; the old $20 killed it."""
+    def test_a_big_slot_survives_a_25_dollar_dip_no_more(self):
         c = self._ctl()
         c.record_close("1000PEPEUSDT", +30.0, notional_usdt=2755.0)
-        c.record_close("1000PEPEUSDT", -25.0, notional_usdt=2755.0)
+        c.record_close("1000PEPEUSDT", -24.0, notional_usdt=2755.0)  # 24 від піку
         assert c.state.kill_active is False
-        c.record_close("1000PEPEUSDT", -45.0, notional_usdt=2755.0)   # 70 below peak
+        c.record_close("1000PEPEUSDT", -2.0, notional_usdt=2755.0)   # 26 від піку
         assert c.state.kill_active is True
 
-    def test_a_small_slot_is_protected_proportionally(self):
-        """The same $25 on a $292 position IS an emergency."""
+    def test_a_small_slot_gets_the_same_25_not_a_micro_limit(self):
+        """Раніше $94 нотіоналу давали межу $0.94; тепер плоскі $25."""
         c = self._ctl()
-        c.record_close("LINKUSDT", +2.0, notional_usdt=292.0)
-        c.record_close("LINKUSDT", -25.0, notional_usdt=292.0)
-        assert c.state.kill_active is True
+        c.record_close("HYPEUSDT", 0.0, notional_usdt=94.0)
+        assert c.drawdown_limit() == 25.0
+        c.record_close("HYPEUSDT", +5.0, notional_usdt=94.0)
+        c.record_close("HYPEUSDT", -24.0, notional_usdt=94.0)   # 24 від піку
+        assert c.state.kill_active is False
 
-    def test_limit_is_strictly_proportional_with_no_floor(self):
-        """Підлогу видалено 2026-08-04 — межа тепер строго pct x нотіонал.
+    def test_zero_ceiling_disables_the_kill(self):
+        c = self._ctl(ceiling=0.0)
+        assert c.drawdown_limit() == 0.0
+        c.state.peak_pnl = 500.0
+        c.record_close("X", -500.0, notional_usdt=2000.0)
+        assert c.state.kill_active is False
 
-        ⚠️ Наслідок: на дрібній парі межа мікроскопічна (HYPE ~$94 -> $0.94).
-        Обидві такі пари зараз у shadow; перед вмиканням у лайв поріг треба
-        переглянути.
-        """
-        c = self._ctl()
-        c.record_close("X", 0.0, notional_usdt=94.0)
-        assert c.drawdown_limit() == pytest.approx(0.94)
-
-    def test_size_is_smoothed_not_snapped(self):
-        """Margin and leverage are randomised ~15% per trade."""
+    def test_size_is_still_smoothed_for_display(self):
+        """avg_notional лишився як інфо (позиція ~$X), хоч у кіл не входить."""
         c = self._ctl()
         c.record_close("X", 0.0, notional_usdt=1000.0)
         c.record_close("X", 0.0, notional_usdt=2000.0)
