@@ -21,6 +21,9 @@ binance:
   reconnect_delay_sec: 3
   # latency-fix May 2026 — diagnostic-only bookTicker stream
   book_ticker_enabled: true
+  # 2026-08-11: детектор живиться з bookTicker (p50 12 / p90 55мс раніше
+  # за depth20@100ms). 10014-нейтрально (чисте читання Binance).
+  book_ticker_feed_enabled: true
   book_ticker_log_interval_sec: 60
   max_reconnect_delay_sec: 60
 
