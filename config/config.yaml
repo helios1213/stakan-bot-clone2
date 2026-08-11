@@ -60,6 +60,10 @@ universe:
     - SOLUSDT       # added 2026-06-19 — manual shadow test (was excluded: historical losses)
     - XRPUSDT       # added 2026-06-19 — manual shadow test
     - ONDOUSDT      # added 2026-06-19 — manual shadow test
+    # ── STOCK-перпи (0% комісія), додані у shadow 2026-08-11 ──
+    - SKHYNIXUSDT   # SK hynix; MEXC SKHYNIXSTOCK_USDT; тік 0.01/contract 0.001
+    - SPCXUSDT      # SpaceX; MEXC SPCXSTOCK_USDT; тік 0.01/contract 0.01
+    - SOXLUSDT      # SOXL ETF; MEXC SOXL_USDT; тік 0.01/contract 0.01
     - BTCUSDT       # reference only — see reference_only_symbols below
 
   # Safety net — explicitly blocked symbols (overrides whitelist if duplicated).
