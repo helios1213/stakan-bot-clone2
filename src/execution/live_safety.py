@@ -95,6 +95,10 @@ class LiveSafetyController:
         # (HYPE ~$94 -> $0.94), тож перед вмиканням такої пари в лайв поріг
         # треба переглянути.
         drawdown_pct_of_notional: float = 0.01,
+        # Плоский СУКУПНИЙ денний кіл (розмір-незалежний). 0 = вимкнено,
+        # від'ємне = поріг: today_pnl <= поріг → кіл. Приходить з env
+        # LIVE_DAILY_LOSS_KILL. Це «загальний -25», не % від позиції.
+        daily_loss_kill_usdt: float = 0.0,
         kill_pause_sec: int = 14400,                    # 4h pause
 
         # Per-symbol limits
@@ -106,6 +110,7 @@ class LiveSafetyController:
     ) -> None:
         self.max_drawdown_usdt = max_drawdown_usdt
         self.drawdown_pct_of_notional = drawdown_pct_of_notional
+        self.daily_loss_kill_usdt = daily_loss_kill_usdt
         self.kill_pause_sec = kill_pause_sec
         self.max_concurrent_per_symbol = max_concurrent_per_symbol
         self.max_concurrent_total = max_concurrent_total
@@ -115,14 +120,22 @@ class LiveSafetyController:
         self._tz = self._resolve_tz()
         self._daily_reset_at_ts = self._next_reset_ts()
 
+        _peak_on = max_drawdown_usdt > 0
+        _daily_on = daily_loss_kill_usdt < 0
+        if _peak_on:
+            _kill_desc = (
+                "просадка min(стеля $%.2f, %.2f%% нотіоналу)" % (
+                    max_drawdown_usdt, drawdown_pct_of_notional * 100))
+            if _daily_on:
+                _kill_desc += " + сукупний денний $%.2f" % daily_loss_kill_usdt
+        elif _daily_on:
+            _kill_desc = "лише сукупний денний PnL $%.2f (peak-drawdown ВИМКНЕНО)" % daily_loss_kill_usdt
+        else:
+            _kill_desc = "⚠️ ЖОДНОГО автоматичного кіла (обидва вимкнені)"
         logger.info(
-            "LiveSafetyController initialized: єдиний кіл — просадка "
-            "min(стеля $%.2f, %.2f%% нотіоналу); стеля в'яже від ~$%.0f "
-            "нотіоналу | max_concurrent=%d, max_margin/trade=$%.2f",
-            max_drawdown_usdt,
-            drawdown_pct_of_notional * 100,
-            (max_drawdown_usdt / drawdown_pct_of_notional
-             if drawdown_pct_of_notional > 0 else 0.0),
+            "LiveSafetyController initialized: кіл — %s | "
+            "max_concurrent=%d, max_margin/trade=$%.2f",
+            _kill_desc,
             max_concurrent_total,
             max_margin_per_trade_usdt,
         )
@@ -342,6 +355,16 @@ class LiveSafetyController:
                 duration_sec=self.kill_pause_sec,
             )
 
+        # Плоский сукупний денний кіл — розмір-незалежний. Ловить повільний
+        # злив, який peak-drawdown на дрібному нотіоналі не побачить.
+        if (self.daily_loss_kill_usdt < 0
+                and self.state.today_pnl <= self.daily_loss_kill_usdt):
+            self.engage_kill(
+                reason=(f"сукупний денний PnL ${self.state.today_pnl:.2f} "
+                        f"<= ${self.daily_loss_kill_usdt:.2f}"),
+                duration_sec=self.kill_pause_sec,
+            )
+
     def _log_equity(self, drawdown: float, dd_limit: float) -> None:
         """Make the peak and the drawdown visible without spamming the log.
 
@@ -365,6 +388,10 @@ class LiveSafetyController:
                 self.state.today_trades, self.state.today_pnl, self.state.peak_pnl,
                 drawdown, dd_limit, self.state.avg_notional_usdt)
 
+        if dd_limit <= 0:
+            # peak-drawdown вимкнено — крокові рядки безглузді (спам на
+            # кожному піку). Хартбіт вище лишається.
+            return
         step = int(drawdown / dd_limit * 4) if dd_limit > 0 else 0
         if step > self.state._logged_dd_step:
             self.state._logged_dd_step = step
@@ -457,6 +484,32 @@ class LiveSafetyController:
             return True
         return int(time.time()) < self.state.kill_until_ts
 
+    def _effective_kill(self) -> tuple[float, str]:
+        """Число й підстава кіла, за яким слот справді стане ЗАРАЗ.
+
+        peak-drawdown (якщо ввімкнений) б'є першим на просадці від піку;
+        денний поріг — на сукупному збитку. Показуємо той, що активний, щоб
+        екран/алерт не брехали «межа $0», коли %-просадку вимкнено.
+        """
+        if self.max_drawdown_usdt > 0:
+            lim = self.drawdown_limit()
+            if self.state.avg_notional_usdt <= 0:
+                basis = f"стеля ${self.max_drawdown_usdt:.0f} (розмір ще невідомий)"
+            elif (self.drawdown_pct_of_notional * self.state.avg_notional_usdt
+                  >= self.max_drawdown_usdt):
+                basis = f"стеля ${self.max_drawdown_usdt:.0f}"
+            else:
+                basis = (f"{self.drawdown_pct_of_notional*100:.2f}% від нотіоналу "
+                         f"${self.state.avg_notional_usdt:.0f}")
+            if self.daily_loss_kill_usdt < 0:
+                basis += f" (+ денний ${self.daily_loss_kill_usdt:.0f})"
+            return lim, basis
+        if self.daily_loss_kill_usdt < 0:
+            return (abs(self.daily_loss_kill_usdt),
+                    f"сукупний денний ${self.daily_loss_kill_usdt:.0f} "
+                    "(peak-drawdown вимкнено)")
+        return 0.0, "кіл вимкнено"
+
     def state_summary(self) -> dict:
         # drawdown_limit_usdt — ЕФЕКТИВНА межа зараз, а не те, що в .env.
         # Без неї жоден екран не показує число, за яким слот справді стане.
@@ -473,15 +526,9 @@ class LiveSafetyController:
             "peak_pnl": round(self.state.peak_pnl, 4),
             "session_start_ts": self.session_start_ts(),
             "drawdown": round(self.state.peak_pnl - self.state.today_pnl, 4),
-            "drawdown_limit_usdt": round(self.drawdown_limit(), 2),
-            "drawdown_limit_basis": (
-                f"стеля ${self.max_drawdown_usdt:.0f} (розмір ще невідомий)"
-                if self.state.avg_notional_usdt <= 0 else
-                f"стеля ${self.max_drawdown_usdt:.0f}"
-                if (self.drawdown_pct_of_notional * self.state.avg_notional_usdt
-                    >= self.max_drawdown_usdt) else
-                f"{self.drawdown_pct_of_notional*100:.2f}% від нотіоналу "
-                f"${self.state.avg_notional_usdt:.0f}"),
+            "daily_loss_kill_usdt": self.daily_loss_kill_usdt,
+            "drawdown_limit_usdt": round(self._effective_kill()[0], 2),
+            "drawdown_limit_basis": self._effective_kill()[1],
             "avg_notional_usdt": round(self.state.avg_notional_usdt, 2),
             "today_trades": self.state.today_trades,
             "consecutive_losses": self.state.consecutive_losses,
