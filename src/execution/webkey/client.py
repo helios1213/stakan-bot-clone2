@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -75,10 +76,21 @@ _DEFAULT_DOLOS_PARAMETERS = [
 
 _WARMUP_SYMBOL = "ZEC_USDT"
 _DEFAULT_COOKIE_MAX_AGE_SEC = 600
-# futures.mexc.com is the direct backend host (~40-100ms typical).
-# Path is /api/v1/private; proxy is not required when the bot VPS is
-# in the same region as the webkey origin.
+# BASE_URL is the WEB origin — used ONLY for the origin/referer headers, which
+# must keep looking like the browser front-end (futures.mexc.com).
 _BASE_URL = "https://futures.mexc.com"
+
+# API_URL is where requests are actually SENT. Measured A/B 2026-08-12 from the
+# Tokyo box, alternating hosts, signed IOCs on /order/create:
+#     futures.mexc.com   min 189.1  med 193.5  p90 210.1
+#     contract.mexc.com  min 139.7  med 143.3  p90 154.5
+# Non-overlapping distributions — ~50ms systematically, and futures is also the
+# unstable one (its authenticated read median swung 28ms -> 72ms between runs
+# while contract held ~28ms). Both hosts return code=0 with origin/referer left
+# pointing at futures, which is exactly the configuration measured above.
+# contract.mexc.com is already the host the private WS uses (wss://.../edge).
+# Override with MEXC_API_HOST to revert without a code change.
+_API_URL = os.environ.get("MEXC_API_HOST", "https://contract.mexc.com").rstrip("/")
 
 # Placeholder for trochilus-uid header — MEXC doesn't validate the value
 # (server does not validate the value).
@@ -120,7 +132,8 @@ class MexcWebClient:
     the standard factory.
     """
 
-    BASE_URL = _BASE_URL
+    BASE_URL = _BASE_URL      # web origin — origin/referer headers only
+    API_URL = _API_URL        # where requests are actually sent
     API_BASE = "/api/v1/private"
 
     def __init__(
@@ -269,7 +282,7 @@ class MexcWebClient:
         session = await self._ensure_session()
         t1 = time.perf_counter_ns()
 
-        url = f"{self.BASE_URL}{self.API_BASE}{endpoint}"
+        url = f"{self.API_URL}{self.API_BASE}{endpoint}"
         if query_params:
             url += f"?{query_params}" if "?" not in url else f"&{query_params}"
 
