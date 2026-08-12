@@ -188,90 +188,35 @@ class MexcWebClient:
             return self._session
         async with self._lock:
             if self._session is None:
-                self._session = curl_requests.AsyncSession(
+                session = curl_requests.AsyncSession(
                     impersonate=self.impersonate,
                     timeout=self.timeout,
                 )
+                # App-auth cookies (webkey -> u_id/uc_token). No network.
+                # Akamai cookies (_abck/bm_sz) are NOT fetched: the private
+                # host enforces them on neither reads nor /order/create
+                # (probe 2026-08-12). The cold warmup GET is gone and can no
+                # longer leak onto the order hot path.
+                session.cookies.set("u_id", self.webkey, domain=".mexc.com")
+                session.cookies.set("uc_token", self.webkey, domain=".mexc.com")
+                self._session = session
+                self._warmed_at = time.monotonic()
         return self._session
 
-    # ---- cookie warmup ----
+    # ---- cookie warmup (neutered) ----
     async def warmup(self, symbol: str = _WARMUP_SYMBOL, force: bool = False) -> None:
-        """Acquire fresh Akamai cookies via cold GET /futures/{symbol}.
+        """No-op retained for API compatibility.
 
-        Idempotent. No-op if cookies are < cookie_max_age_sec old.
+        Previously did a cold GET /futures/{symbol} to collect Akamai cookies
+        (_abck/bm_sz). Empirically the private host enforces them on neither
+        reads nor /order/create (probe 2026-08-12), so the network warmup is
+        gone — cookie acquisition can no longer land on the order hot path.
+        Ensuring the session (with its app-auth cookies, seeded once in
+        _ensure_session) is all that remains. `symbol` and `force` are kept in
+        the signature so existing callers (pool.start, health_check,
+        get_account_pnl_usdt) need no change.
         """
-        # Ensure session exists BEFORE acquiring the warmup lock — otherwise
-        # _ensure_session would try to acquire the same lock from within and
-        # deadlock. Pool's eager warmup hides this in production because it
-        # creates the session via from_slot+warmup at startup, but isolated
-        # tests (cold client) hit this deadlock on every fresh instance.
         await self._ensure_session()
-
-        # FAST-PATH: on hot sessions (cookies fresh,
-        # not forced), check `_warmed_at` WITHOUT taking the lock. Every
-        # _request calls warmup() and the lock acquire/release was costing
-        # 1-3ms per submit under load. Reading a single int is atomic in
-        # CPython, and a stale read here is harmless — worst case is we
-        # take the slow path one extra time and the lock-guarded check
-        # below catches up. Force=True ALWAYS goes through the lock.
-        if not force and self._warmed_at and \
-                (time.monotonic() - self._warmed_at) < self.cookie_max_age_sec:
-            return
-
-        async with self._lock:
-            # Re-check under lock to avoid double-warmup race.
-            if not force and self._warmed_at and \
-                    (time.monotonic() - self._warmed_at) < self.cookie_max_age_sec:
-                return
-
-            session = self._session
-            url = f"{self.BASE_URL}/futures/{symbol}?type=linear_swap"
-            kwargs: dict[str, Any] = {
-                "headers": {
-                    "user-agent": self.user_agent,
-                    "accept": (
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                        "image/avif,image/webp,*/*;q=0.8"
-                    ),
-                    "accept-language": "en-US,en;q=0.9",
-                    "sec-ch-ua": self.sec_ch_ua,
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": self.sec_ch_ua_platform,
-                    "sec-fetch-dest": "document",
-                    "sec-fetch-mode": "navigate",
-                    "sec-fetch-site": "none",
-                    "upgrade-insecure-requests": "1",
-                },
-                "timeout": self.timeout,
-            }
-
-            try:
-                resp = await session.get(url, **kwargs)
-            except Exception as e:
-                raise MexcClientError(f"Warmup network error: {e}") from e
-
-            if resp.status_code != 200:
-                raise MexcClientError(
-                    f"Warmup returned status {resp.status_code} "
-                    f"(body first 200: {resp.text[:200]!r})"
-                )
-
-            # Inject u_id cookie based on webkey (server expects it for some
-            # endpoints even though Authorization header is the source of truth).
-            session.cookies.set("u_id", self.webkey, domain=".mexc.com")
-            session.cookies.set("uc_token", self.webkey, domain=".mexc.com")
-
-            jar_cookies = dict(session.cookies)
-            if "_abck" not in jar_cookies:
-                logger.warning(
-                    "[slot %s] Warmup OK but _abck missing; got: %s",
-                    self.slot_id, list(jar_cookies.keys()),
-                )
-            self._warmed_at = time.monotonic()
-            logger.info(
-                "[slot %s] Warmup OK (%d cookies in jar)",
-                self.slot_id, len(jar_cookies),
-            )
 
     # ---- headers ----
     def _common_headers(self, with_layer2_sign: dict[str, str] | None = None) -> dict[str, str]:
@@ -319,7 +264,8 @@ class MexcWebClient:
         # t5=after JSON parse.
         t0 = time.perf_counter_ns()
 
-        await self.warmup()
+        # No warmup() on the hot path — the private host enforces no Akamai
+        # cookies (probe 2026-08-12). _ensure_session seeds app cookies once.
         session = await self._ensure_session()
         t1 = time.perf_counter_ns()
 
