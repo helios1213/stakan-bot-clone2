@@ -188,12 +188,20 @@ class WebkeyStore:
 
     MAX_SLOTS = MAX_SLOTS
 
+    # Sizing/admission рядки (pair_configs існування, slot_pair_sizing оверайди)
+    # міняються ЛИШЕ оператором (Telegram/панель), ніколи на гарячому шляху. Кеш
+    # прибирає 2 з 3 per-signal SQLite-читань get_slot_config() проти WAL 5GB БД.
+    # Стейлність обмежена цим TTL; throttle/webkey-refresh латч (get()) лишається
+    # НЕкешованим і живим — це safety (шлях до 10014).
+    _SIZING_CACHE_TTL_SEC = 30.0
+
     def __init__(self, db: Database, master_key: str) -> None:
         self.db = db
         try:
             self._fernet = Fernet(master_key.encode())
         except Exception as e:
             raise WebkeyError(f"Invalid master key: {e}") from e
+        self._sizing_cache: dict[Any, tuple[float, Any]] = {}
 
     # ---- seed ----
     async def ensure_slots_seeded(self) -> None:
@@ -665,18 +673,22 @@ class WebkeyStore:
         Returns:
             dict (4 keys, None values) if the pair_configs row exists, else None.
         """
+        key = ("pair", symbol)
+        hit = self._sizing_cache.get(key)
+        if hit is not None and time.monotonic() < hit[0]:
+            return hit[1]
         row = await self.db.fetchone(
             "SELECT symbol FROM pair_configs WHERE symbol = ?",
             (symbol,),
         )
-        if row is None:
-            return None
-        return {
+        result = None if row is None else {
             "margin_min_usdt": None,
             "margin_max_usdt": None,
             "leverage_min":    None,
             "leverage_max":    None,
         }
+        self._sizing_cache[key] = (time.monotonic() + self._SIZING_CACHE_TTL_SEC, result)
+        return result
 
     async def set_open_throttle_until(self, slot_id: int, until_ts: int | None) -> None:
         """Remember that MEXC is rate-limiting opens on this slot until `until_ts`.
@@ -699,12 +711,18 @@ class WebkeyStore:
         None (→ inherit the pair YAML). Consumed by
         LiveExecutorPool.get_slot_config; the Telegram wizard writes these rows.
         """
+        key = ("slot", slot_id, symbol)
+        hit = self._sizing_cache.get(key)
+        if hit is not None and time.monotonic() < hit[0]:
+            return hit[1]
         row = await self.db.fetchone(
             "SELECT margin_min_usdt, margin_max_usdt, leverage_min, leverage_max "
             "FROM slot_pair_sizing WHERE slot_id = ? AND symbol = ?",
             (slot_id, symbol),
         )
-        return dict(row) if row is not None else None
+        result = dict(row) if row is not None else None
+        self._sizing_cache[key] = (time.monotonic() + self._SIZING_CACHE_TTL_SEC, result)
+        return result
 
     # ---- internals ----
     async def _slot_has_webkey(self, slot_id: int) -> bool:
