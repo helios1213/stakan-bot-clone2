@@ -1,6 +1,6 @@
 meta:
   symbol: SOXLUSDT
-  behavioral_epoch: 1786552728
+  behavioral_epoch: 1786639334
   note: |
     STOCK-перп, доданий у SHADOW 2026-08-11. SOXL (Direxion 3x semis ETF) stock-perp; MEXC=SOXL_USDT
     Ворота стартові (~2.1bps геп), історії немає — перетюнити з
@@ -20,7 +20,7 @@ exit_strategy:
   min_hold_ms: 500
   stop_adverse_bps: 10.0
   trail_distance_bps: 2.0
-  breakeven_trigger_bps: 1.5
+  breakeven_trigger_bps: 4.0  # 2026-08-13: 1.5->4.0 — прибрати шкоду BE (зводився на +1.5bps і стопив winners у беззбиток, мінус на обох ботах, workflow Rank2)
   stall_timeout_ms: 3000
   dead_on_arrival_timeout_ms: 2500
   nevergreen_cut_ms: 900
