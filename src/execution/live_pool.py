@@ -180,6 +180,29 @@ class LiveExecutorPool:
     def get_executor(self, slot_id: int) -> LiveExecutor | None:
         return self._executors.get(slot_id)
 
+    def get_or_create_executor(self, slot_id: int) -> LiveExecutor:
+        """Executor for a slot, creating an idle one if none exists.
+
+        Reconcile must reach EVERY keyed account — including a slot that is not
+        live-active (after a restart, or deactivated while a position was open)
+        but may still hold a real MEXC position. Such a slot would otherwise be
+        invisible to reconcile and bleed unmanaged (audit #7 / the -$42 class).
+        The executor never trades unless the slot is in _active_slot_ids; here it
+        is used only to fetch positions and market-close orphans, gated by
+        slot_has_key.
+        """
+        ex = self._executors.get(slot_id)
+        if ex is None:
+            ex = LiveExecutor(
+                client_pool=self.client_pool,
+                slot_id=slot_id,
+                webkey_store=self.webkey_store,
+                alerts=self.alerts,
+                private_ws_pool=self.private_ws_pool,
+            )
+            self._executors[slot_id] = ex
+        return ex
+
     def reset_fee_guard(self, slot_id: int) -> bool:
         """Clear the fee-guard halt on a slot's executor (manual override).
         Returns True if it had been halted. No-op if the slot has no executor."""

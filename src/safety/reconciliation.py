@@ -137,6 +137,41 @@ async def _send_orphan_alert(alerts, action: str, mexc_pos: dict, result_msg: st
         logger.exception("Failed to send reconcile alert")
 
 
+async def _keyed_slot_executors(live_pool) -> dict:
+    """Executors for EVERY slot we hold a key for (enabled + complete).
+
+    A keyed slot that is not live-active still holds a real MEXC position that
+    must be managed (audit #7). Enumerate keyed slots from the store and
+    get-or-create an idle executor for each (it never trades). slot_has_key
+    still gates the actual close, so a deleted-key account is never touched.
+    Falls back to the pool's live view if the store cannot be enumerated.
+    """
+    store = getattr(live_pool, "webkey_store", None)
+    getoc = getattr(live_pool, "get_or_create_executor", None)
+    lister = getattr(store, "list_enabled_complete", None) if store is not None else None
+    if callable(getoc) and callable(lister):
+        try:
+            slots = await lister()
+            out = {}
+            for s in slots:
+                ex = getoc(s.slot_id)
+                if ex is not None:
+                    out[s.slot_id] = ex
+            return out
+        except Exception:
+            logger.exception(
+                "[RECONCILE] keyed-slot enumeration failed — falling back to live view")
+    _active = getattr(live_pool, "active_executors", None)
+    if callable(_active):
+        try:
+            res = _active()
+            if isinstance(res, dict):
+                return res
+        except Exception:
+            logger.exception("[RECONCILE] active_executors() fallback failed")
+    return getattr(live_pool, "_executors", {}) or {}
+
+
 # ────────────────────────────────────────────────────────────────────────
 # Startup reconciliation
 # ────────────────────────────────────────────────────────────────────────
@@ -166,9 +201,9 @@ async def startup_reconcile(live_pool, alerts) -> dict:
         logger.info("[RECONCILE STARTUP] live_pool is None — skipping (shadow-only mode)")
         return summary
 
-    executors = getattr(live_pool, "_executors", {})
+    executors = await _keyed_slot_executors(live_pool)
     if not executors:
-        logger.info("[RECONCILE STARTUP] no live executors configured — skipping")
+        logger.info("[RECONCILE STARTUP] no keyed slots configured — skipping")
         return summary
 
     logger.info("[RECONCILE STARTUP] checking %d slot(s) for unmanaged MEXC positions",
@@ -320,21 +355,12 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     if live_pool is None:
         return summary
 
-    # active_executors(), NOT _executors: the latter keeps deactivated slots for
-    # their stats, and using it meant a slot whose webkey had been deleted was
-    # still reconciled — closing positions the operator had opened by hand.
-    executors = getattr(live_pool, "_executors", {})
-    _active = getattr(live_pool, "active_executors", None)
-    if callable(_active):
-        try:
-            _res = _active()
-            # Only a real mapping counts. A test double answers callable() and
-            # returns something dict-shaped only by accident.
-            if isinstance(_res, dict):
-                executors = _res
-        except Exception:
-            logger.exception("[RECONCILE] active_executors() кинуло — "
-                             "працюю зі старим списком")
+    # Reconcile every slot we hold a KEY for, not just live-active ones. A keyed
+    # slot that is not live-active (after a restart, or deactivated while a
+    # position was open) still holds a real MEXC position that must be managed
+    # (audit #7 / the -$42 class). slot_has_key gates the actual close, so a
+    # deleted-key account is still never touched.
+    executors = await _keyed_slot_executors(live_pool)
     if not executors:
         return summary
 
