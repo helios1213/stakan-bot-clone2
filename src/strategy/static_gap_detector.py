@@ -106,6 +106,7 @@ class StaticGapDetector:
         signal_writer: SignalWriter,
         reference_only_symbols: set[str] | None = None,
         db = None,           # DB per-pair config fallback (used when config_loader has no value; wired from main.py)
+        research_db = None,  # isolated DB (orderbook); no SignalRecorder on clone
         config_loader = None,  # YAML-based per-pair config (preferred)
         pair_config_ttl_sec: float = 30.0,
     ) -> None:

@@ -119,7 +119,7 @@ async def live_pool_rebuild_loop(live_pool, interval_sec: int = 30) -> None:
             traceback.print_exc()
 
 
-def _prune_db_sync(db_path: str, live_db_path: str, ret_shadow, ret_live) -> None:
+def _prune_db_sync(db_path: str, live_db_path: str, research_path: str, ret_shadow, ret_live, ret_research) -> None:
     """Blocking sqlite prune — MUST run in a worker thread (asyncio.to_thread),
     never on the event loop. A mass DELETE + wal_checkpoint on the multi-GB
     stakan.db takes ~2min; running it on the loop froze startup (delaying the
@@ -130,7 +130,7 @@ def _prune_db_sync(db_path: str, live_db_path: str, ret_shadow, ret_live) -> Non
     import sqlite3
     import traceback
     now = int(time.time())
-    for db_p, ret in ((db_path, ret_shadow), (live_db_path, ret_live)):
+    for db_p, ret in ((db_path, ret_shadow), (research_path, ret_research), (live_db_path, ret_live)):
         c = None
         try:
             c = sqlite3.connect(db_p)
@@ -181,7 +181,7 @@ def _prune_db_sync(db_path: str, live_db_path: str, ret_shadow, ret_live) -> Non
                     pass
 
 
-async def db_prune_loop(db_path: str, live_db_path: str, interval_sec: int = 86400) -> None:
+async def db_prune_loop(db_path: str, live_db_path: str, research_path: str, interval_sec: int = 86400) -> None:
     """Periodic DB prune — keeps stakan.db from growing unbounded as new
     signals / orderbook-snapshots accumulate.
 
@@ -198,7 +198,6 @@ async def db_prune_loop(db_path: str, live_db_path: str, interval_sec: int = 864
     RET_SHADOW = [
         # (table, age_column, retention_seconds) — orderbook snapshots are
         # diagnostic only, 3 days is plenty.
-        ("live_orderbook_snapshots", "ts_ms",       3 * 86400),
         ("signals",                  "created_at",  7 * 86400),
         ("historical_candles",       "open_time",  30 * 86400),
         ("shadow_trades",            "opened_at",   3 * 86400),  # 3-day shadow retention (user)
@@ -212,11 +211,15 @@ async def db_prune_loop(db_path: str, live_db_path: str, interval_sec: int = 864
         # Усі PnL-аналізи стоять на live_trades, а це ІНША база (stakan-live.db,
         # ретенція 90 днів) — сюди не заходить.
         # ts у МІЛІСЕКУНДАХ — масштаб визначається нижче автоматично.
-        ("signal_features",          "ts",         30 * 86400),
         ("state_transitions",        "created_at", 30 * 86400),
     ]
     RET_LIVE = [
         ("live_trades", "opened_at", 90 * 86400),
+    ]
+    # Moved to stakan-research.db (2026-08-13) — see the research_db comment in main().
+    RET_RESEARCH = [
+        ("signal_features",          "ts",     30 * 86400),
+        ("live_orderbook_snapshots", "ts_ms",   3 * 86400),
     ]
     # Let the bot finish booting, then run each prune in a worker thread so the
     # blocking sqlite DELETE / wal_checkpoint NEVER freezes the event loop (it
@@ -225,7 +228,7 @@ async def db_prune_loop(db_path: str, live_db_path: str, interval_sec: int = 864
     while True:
         try:
             await asyncio.to_thread(
-                _prune_db_sync, db_path, live_db_path, RET_SHADOW, RET_LIVE)
+                _prune_db_sync, db_path, live_db_path, research_path, RET_SHADOW, RET_LIVE, RET_RESEARCH)
         except asyncio.CancelledError:
             return
         except Exception:
@@ -772,6 +775,16 @@ async def main() -> None:
     db = Database(env.db_path)
     await db.connect()
 
+    # Research DB — high-rate WRITE-ONLY tables (signal_features,
+    # live_orderbook_snapshots) live here, isolated from stakan.db so their
+    # continuous writes never contend with CONTROL writes (webkey_slots /
+    # pair_states / slot_pair_sizing) that the panel & Telegram touch. (2026-08-13.)
+    research_path = os.environ.get(
+        "RESEARCH_DB_PATH", env.db_path.replace("stakan.db", "stakan-research.db"))
+    research_db = Database(research_path)
+    await research_db.connect()
+    loguru_logger.info("Research DB (signal_features, orderbook) at {}", research_path)
+
     # Live trading DB — fully isolated from shadow DB.
     # Path defaults to /app/data/stakan-live.db (sibling to stakan.db).
     live_db_path = os.environ.get(
@@ -825,7 +838,7 @@ async def main() -> None:
     # for retention windows.
     _live_db_path = os.environ.get("LIVE_DB_PATH", "/app/data/stakan-live.db")
     asyncio.create_task(
-        db_prune_loop(env.db_path, _live_db_path, 86400),
+        db_prune_loop(env.db_path, _live_db_path, research_path, 86400),
         name="db_prune",
     )
 
@@ -1119,7 +1132,8 @@ async def main() -> None:
     static_gap = StaticGapDetector(
         static_gap_cfg, ob_manager, signal_writer,
         reference_only_symbols=reference_only,
-        db=db,                          # DB fallback
+        db=db,                          # DB fallback (control: pair_configs)
+        research_db=research_db,         # signal_features writes -> isolated DB
         config_loader=config_loader,    # preferred source
     )
 
@@ -1260,7 +1274,7 @@ async def main() -> None:
     from src.storage.raw_data_collector import raw_data_collector_loop
     tasks.append(
         asyncio.create_task(
-            raw_data_collector_loop(db, ob_manager, interval_sec=5.0),
+            raw_data_collector_loop(research_db, ob_manager, interval_sec=5.0),
             name="raw_data_collector",
         )
     )
@@ -1299,6 +1313,7 @@ async def main() -> None:
         await asyncio.gather(*tasks, *( [stop_waiter] if stop_waiter is not None else [] ),
                              return_exceptions=True)
         await db.close()
+        await research_db.close()
         loguru_logger.info("Goodbye.")
 
 
