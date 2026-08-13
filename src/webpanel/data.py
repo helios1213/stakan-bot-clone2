@@ -17,6 +17,8 @@ import secrets
 import sqlite3
 import string
 import time
+import functools
+import random
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +53,42 @@ def _ro(db: str) -> sqlite3.Connection:
     c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     c.row_factory = sqlite3.Row
     return c
+
+
+def _rw(db: str) -> sqlite3.Connection:
+    """Read-write panel connection with a generous busy wait. The bot writes
+    signal_features to this SAME stakan.db continuously (and the prune thread
+    does a wal_checkpoint that can hold the writer >5s), so sqlite3's 5s default
+    lets a panel control-write fail with 'database is locked'. Wait up to 8s.
+    Keep the DEFAULT isolation_level: these functions SELECT-then-UPDATE on one
+    connection; a snapshotting BEGIN would yield SQLITE_BUSY_SNAPSHOT, which no
+    busy_timeout can fix. (2026-08-13.)"""
+    c = sqlite3.connect(db, timeout=8.0)
+    c.execute("PRAGMA busy_timeout=8000")
+    return c
+
+
+def _rw_retry(fn):
+    """Retry a panel control-write that lost the writer-lock race. busy_timeout
+    alone is not enough when the bot holds the lock past the timeout (prune /
+    checkpoint), and disabling a slot / cutting leverage is a stop-the-loss
+    action that must not fail on contention. Each attempt re-opens its own
+    connection; sqlite3 rolls back the uncommitted txn on close, so a re-run is
+    clean and these read-modify-write ops are idempotent."""
+    @functools.wraps(fn)
+    def _wrap(*a, **k):
+        delay = 0.2
+        for attempt in range(4):
+            try:
+                return fn(*a, **k)
+            except sqlite3.OperationalError as e:
+                m = str(e).lower()
+                if ("locked" in m or "busy" in m) and attempt < 3:
+                    time.sleep(delay + random.uniform(0.0, 0.05))
+                    delay *= 2
+                    continue
+                raise
+    return _wrap
 
 
 # ---- Аккаунты ----
@@ -88,9 +126,10 @@ def accounts() -> list[dict]:
     return out
 
 
+@_rw_retry
 def set_account(slot_id: int, *, enabled: bool | None = None,
                 label: str | None = None, live_enabled: bool | None = None) -> None:
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     try:
         # One upfront read: slot existence + assigned pair + credential presence.
         # A missing slot makes every UPDATE below a silent 0-row no-op (panel
@@ -242,12 +281,13 @@ def set_account_routed(server: str, slot_id: int, **kwargs) -> dict:
     return _remote_rpc(server, {"op": "set", "slot_id": slot_id, **kwargs})
 
 
+@_rw_retry
 def assign_pair(slot_id: int, pair: str | None) -> None:
     """Assign a pair to a slot (pair=None unassigns). Mirrors
     WebkeyStore.assign_pair: updates webkey_slots.assigned_pair AND auto-shadows
     the DISPLACED old pair via pair_states.state (else it's stranded live with no
     slot → silent [SKIP SHADOW]). The bot's _load_states_from_db (≤60s) reloads."""
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     try:
         row = conn.execute(
             "SELECT assigned_pair, live_enabled, (webkey_blob IS NOT NULL) "
@@ -354,6 +394,7 @@ def set_pair_config_routed(server: str, symbol: str, **kwargs) -> dict:
     return _remote_rpc(server, {"op": "pairs_set", "symbol": symbol, **kwargs})
 
 
+@_rw_retry
 def set_slot_pair_sizing(symbol: str, slot_id: int, **kwargs) -> dict:
     """Upsert a per-(slot, pair) margin/leverage OVERRIDE into slot_pair_sizing.
     Only the provided keys are written (partial override preserved). Values are
@@ -389,7 +430,7 @@ def set_slot_pair_sizing(symbol: str, slot_id: int, **kwargs) -> dict:
         if _k.startswith("leverage_") and not (1 <= _v <= 125):
             return {"ok": False, "error": f"{_k}: плече поза межами 1–125"}
     now = int(time.time())
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     try:
         # Effective row = what is already stored, overlaid with this request.
         # Validating only the request would let a single-field edit (e.g. just
@@ -603,7 +644,7 @@ def add_account(webkey: str, label: str | None = None) -> dict:
     label = (label or "").strip()[:50] or None
 
     fernet = _fernet()
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     conn.row_factory = sqlite3.Row
     try:
         _assert_key_can_decrypt_existing(conn, fernet)
@@ -648,9 +689,10 @@ def add_account(webkey: str, label: str | None = None) -> dict:
         conn.close()
 
 
+@_rw_retry
 def remove_account(slot_id: int) -> bool:
     """Clear creds from a slot (keep the row). Returns False if already empty."""
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
@@ -677,7 +719,7 @@ def remove_account(slot_id: int) -> bool:
 
 # ---- Инциденты ----
 def _ensure_incidents() -> None:
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     try:
         conn.executescript(INCIDENTS_SCHEMA)
         conn.commit()
@@ -697,9 +739,10 @@ def incidents(limit: int = 200) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+@_rw_retry
 def add_incident(severity: str, message: str, source: str = "panel") -> int:
     _ensure_incidents()
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     try:
         cur = conn.execute(
             "INSERT INTO panel_incidents(ts,severity,source,message) VALUES(?,?,?,?)",
@@ -710,9 +753,10 @@ def add_incident(severity: str, message: str, source: str = "panel") -> int:
         conn.close()
 
 
+@_rw_retry
 def ack_incident(incident_id: int) -> None:
     _ensure_incidents()
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     try:
         conn.execute("UPDATE panel_incidents SET acked=1 WHERE id=?", (incident_id,))
         conn.commit()
@@ -1165,6 +1209,7 @@ def pairs() -> list[dict]:
     return result
 
 
+@_rw_retry
 def set_pair_config(symbol: str, **kwargs) -> None:
     # mode = operational state → DB; margin/leverage = static config → pair YAML
     # (single source of truth, read by ConfigLoader).
@@ -1186,7 +1231,7 @@ def set_pair_config(symbol: str, **kwargs) -> None:
         # mode='shadow' → demote via pair_states.state (the live authority) —
         # the same canonical write as set_all_pairs_shadow / demote_pair_to_shadow.
         now = int(time.time())
-        conn = sqlite3.connect(DB)
+        conn = _rw(DB)
         try:
             conn.execute(
                 "UPDATE pair_states SET state='shadow', state_since=?, updated_at=?, "
@@ -1231,6 +1276,7 @@ def set_all_pairs_shadow_all(servers: list[str] | None = None) -> dict:
     return out
 
 
+@_rw_retry
 def set_all_pairs_shadow() -> int:
     """Webpanel 'kill all' — demote every LIVE pair to SHADOW *state*.
 
@@ -1245,7 +1291,7 @@ def set_all_pairs_shadow() -> int:
     open positions AND disables trading globally.)
     """
     now = int(time.time())
-    conn = sqlite3.connect(DB)
+    conn = _rw(DB)
     try:
         cur = conn.execute(
             "UPDATE pair_states SET state='shadow', state_since=?, updated_at=?, "
