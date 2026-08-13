@@ -53,12 +53,19 @@ async def _fetch_mexc_positions_for_slot(
     executor,
     slot_id: int,
     timeout_sec: float = 5.0,
-) -> list[dict]:
-    """Fetch open positions for a single slot. Returns empty list on failure."""
+) -> list[dict] | None:
+    """Fetch open positions for a single slot.
+
+    Returns a list on SUCCESS (possibly empty = the account genuinely holds no
+    position), or None on FAILURE (no client / code!=0 / timeout / exception).
+    Callers MUST distinguish the two: treating a failed read as "empty" is how
+    reconcile Case B tore down a live 45-50x position on a transient MEXC 510 /
+    timeout (2026-08-13 audit). None means "unknown", never "no position".
+    """
     try:
         client = await executor.client_pool.get(slot_id)
         if client is None:
-            return []
+            return None
         resp = await asyncio.wait_for(
             client.get_open_positions(), timeout=timeout_sec,
         )
@@ -67,14 +74,14 @@ async def _fetch_mexc_positions_for_slot(
                 "[RECONCILE] slot=%d get_open_positions returned code=%s msg=%s",
                 slot_id, resp.get("code"), resp.get("msg"),
             )
-            return []
+            return None
         return resp.get("data", []) or []
     except asyncio.TimeoutError:
         logger.warning("[RECONCILE] slot=%d get_open_positions TIMEOUT", slot_id)
-        return []
+        return None
     except Exception:
         logger.exception("[RECONCILE] slot=%d get_open_positions failed", slot_id)
-        return []
+        return None
 
 
 def _num(v) -> float:
@@ -342,6 +349,10 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     # _fetch_* swallows all exceptions internally (returns []), so
     # return_exceptions=False is safe.
     mexc_by_key: dict[tuple[int, str], dict] = {}
+    # Slots whose fetch actually SUCCEEDED this pass. A failed read returns None
+    # (not []), so we never mistake "could not read" for "account empty" — that
+    # is exactly what let Case B tear down a live position on a transient 510.
+    fetched_ok_slots: set[int] = set()
     slot_items = list(executors.items())
     fetch_results = await asyncio.gather(
         *(_fetch_mexc_positions_for_slot(executor, slot_id)
@@ -349,11 +360,17 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
         return_exceptions=False,
     )
     for (slot_id, _executor), positions in zip(slot_items, fetch_results):
+        if positions is None:
+            continue  # fetch FAILED — this slot's positions are UNKNOWN, not empty
+        fetched_ok_slots.add(slot_id)
         for mexc_pos in positions:
             sym = mexc_pos.get("symbol", "")
             if sym:
                 mexc_by_key[(slot_id, sym)] = mexc_pos
     summary["mexc_positions"] = len(mexc_by_key)
+    # True if ANY slot's read failed this pass -> the symbol-wide "absent" test
+    # (unattributed Case B) can no longer be trusted.
+    any_fetch_failed = fetched_ok_slots != {sid for sid, _ in slot_items}
 
     # Build engine reality. Multiple positions per binance symbol could in
     # theory exist if max_positions_per_symbol > 1; with current default of
@@ -579,11 +596,21 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     mexc_symbols_present: set[str] = {sym for (_sid, sym) in mexc_by_key.keys()}
     for (pos_slot, mexc_sym), positions in engine_positions_by_key.items():
         if pos_slot is None:
-            # Unattributed: fall back to the symbol-wide test.
+            # Unattributed: the symbol-wide "absent" test is only trustworthy if
+            # EVERY slot was read this pass. If any read failed, the position may
+            # be hidden behind that failure — never mark-closed on missing data.
+            if any_fetch_failed:
+                continue
             if mexc_sym in mexc_symbols_present:
                 continue
-        elif (pos_slot, mexc_sym) in mexc_by_key:
-            continue
+        else:
+            # Attributed: only conclude the position is gone if THIS slot's read
+            # SUCCEEDED. A failed fetch is "unknown", not "closed" — tearing down
+            # a live 45-50x position here is the audited fail-OPEN bug.
+            if pos_slot not in fetched_ok_slots:
+                continue
+            if (pos_slot, mexc_sym) in mexc_by_key:
+                continue
         for eng_pos in positions:
             # Race protection: skip just-opened engine positions
             if eng_pos.elapsed_sec < _RECONCILE_GRACE_SEC:
