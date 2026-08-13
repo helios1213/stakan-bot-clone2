@@ -127,6 +127,7 @@ class LiveDatabase:
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self.db_path)
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.row_factory = aiosqlite.Row
 

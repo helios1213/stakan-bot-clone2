@@ -228,13 +228,17 @@ class OrderBook:
         return (b.price + a.price) / 2
 
     def is_crossed(self) -> bool:
-        """True if best_bid >= best_ask — an impossible (corrupt) book.
+        """True if best_bid > best_ask — an impossible (corrupt) book.
         A limited-depth diff stream can strand a stale top level when the
         market gaps past it and the delete for that level falls outside the
         streamed window; the version sequence stays intact so the seq-gap
-        resync never fires. Consumers use this to reject the book / resync."""
+        resync never fires. Consumers use this to reject the book / resync.
+
+        bid==ask (a LOCKED book) is a legitimate transient, NOT corrupt — it
+        must NOT trigger a re-snapshot (the churn dropped signals in that
+        window). Only a strict inversion (bid>ask) is corrupt. (2026-08-13.)"""
         bb, ba = self._top_bid_price, self._top_ask_price
-        return bb > 0.0 and ba > 0.0 and bb >= ba
+        return bb > 0.0 and ba > 0.0 and bb > ba
 
     def executable_exit_price(self, direction: str) -> float | None:
         """

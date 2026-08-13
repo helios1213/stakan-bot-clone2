@@ -750,6 +750,10 @@ class Database:
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self.db_path)
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        # Wait (up to 5s) for the write lock instead of failing immediately —
+        # concurrent writers (prune thread, signal writer) otherwise lost rows
+        # ('database is locked' -> 'signal lost'). (2026-08-13.)
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.row_factory = aiosqlite.Row
 

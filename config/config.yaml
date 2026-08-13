@@ -23,7 +23,7 @@ binance:
   book_ticker_enabled: true
   # 2026-08-11: детектор живиться з bookTicker (p50 12 / p90 55мс раніше
   # за depth20@100ms). 10014-нейтрально (чисте читання Binance).
-  book_ticker_feed_enabled: true
+  book_ticker_feed_enabled: false  # 2026-08-13: caused ~3000 false crossed-books/hr (_recompute_top over unpruned ladder) -> suppressed signals on fast moves; 22ms lead never converted to fills. Re-enable only after fixing the feed top-recompute.
   book_ticker_log_interval_sec: 60
   max_reconnect_delay_sec: 60
 
