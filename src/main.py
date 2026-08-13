@@ -119,6 +119,65 @@ async def live_pool_rebuild_loop(live_pool, interval_sec: int = 30) -> None:
             traceback.print_exc()
 
 
+def _prune_db_sync(db_path: str, live_db_path: str, ret_shadow, ret_live) -> None:
+    """Blocking sqlite prune — MUST run in a worker thread (asyncio.to_thread),
+    never on the event loop. A mass DELETE + wal_checkpoint on the multi-GB
+    stakan.db takes ~2min; running it on the loop froze startup (delaying the
+    ready notification) and froze signal detection/trading on every daily run.
+    Batched DELETE (50k + commit between) keeps the write lock short so the live
+    bot's own inserts still make progress.
+    """
+    import sqlite3
+    import traceback
+    now = int(time.time())
+    for db_p, ret in ((db_path, ret_shadow), (live_db_path, ret_live)):
+        c = None
+        try:
+            c = sqlite3.connect(db_p)
+            deleted_total = 0
+            for tbl, col, sec in ret:
+                try:
+                    mx = c.execute(f"SELECT MAX({col}) FROM {tbl}").fetchone()[0]
+                    if not mx:
+                        continue
+                    scale = 1000 if mx > 1e12 else 1
+                    cutoff = (now - sec) * scale
+                    _n_tbl = 0
+                    while True:
+                        cur = c.execute(
+                            f"DELETE FROM {tbl} WHERE rowid IN ("
+                            f"  SELECT rowid FROM {tbl} WHERE {col} < ? LIMIT 50000)",
+                            (cutoff,),
+                        )
+                        _got = cur.rowcount or 0
+                        c.commit()
+                        _n_tbl += _got
+                        if _got < 50000:
+                            break
+                    deleted_total += _n_tbl
+                    if _n_tbl > 100000:
+                        logger.info("DB prune: %s -%d rows", tbl, _n_tbl)
+                except sqlite3.OperationalError as oe:
+                    if "no such table" in str(oe):
+                        continue
+                    traceback.print_exc()
+                except Exception:
+                    traceback.print_exc()
+            c.commit()
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if deleted_total > 0:
+                loguru_logger.info(
+                    "DB prune: deleted {} rows from {}", deleted_total, db_p)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+
 async def db_prune_loop(db_path: str, live_db_path: str, interval_sec: int = 86400) -> None:
     """Periodic DB prune — keeps stakan.db from growing unbounded as new
     signals / orderbook-snapshots accumulate.
@@ -156,70 +215,19 @@ async def db_prune_loop(db_path: str, live_db_path: str, interval_sec: int = 864
     RET_LIVE = [
         ("live_trades", "opened_at", 90 * 86400),
     ]
+    # Let the bot finish booting, then run each prune in a worker thread so the
+    # blocking sqlite DELETE / wal_checkpoint NEVER freezes the event loop (it
+    # used to run on the loop: a ~2min freeze at startup and on every daily run).
+    await asyncio.sleep(min(interval_sec, 120))
     while True:
         try:
-            now = int(time.time())
-            for db_p, ret in ((db_path, RET_SHADOW), (live_db_path, RET_LIVE)):
-                c = None
-                try:
-                    c = sqlite3.connect(db_p)
-                    deleted_total = 0
-                    for tbl, col, sec in ret:
-                        try:
-                            mx = c.execute(f"SELECT MAX({col}) FROM {tbl}").fetchone()[0]
-                            if not mx:
-                                continue
-                            scale = 1000 if mx > 1e12 else 1
-                            cutoff = (now - sec) * scale
-                            # ПАКЕТАМИ: одним DELETE перший прохід по
-                            # signal_features зняв би ~21 млн рядків і тримав
-                            # ексклюзивний лок хвилинами на живій базі. По 50 тис
-                            # із комітом між пакетами лок короткий.
-                            _n_tbl = 0
-                            while True:
-                                cur = c.execute(
-                                    f"DELETE FROM {tbl} WHERE rowid IN ("
-                                    f"  SELECT rowid FROM {tbl} WHERE {col} < ? LIMIT 50000)",
-                                    (cutoff,),
-                                )
-                                _got = cur.rowcount or 0
-                                c.commit()
-                                _n_tbl += _got
-                                if _got < 50000:
-                                    break
-                            deleted_total += _n_tbl
-                            if _n_tbl > 100000:
-                                logger.info("DB prune: %s -%d rows", tbl, _n_tbl)
-                        except sqlite3.OperationalError as oe:
-                            # Table absent on this instance (e.g. historical_candles
-                            # on the clone) — skip quietly instead of a daily traceback.
-                            if "no such table" in str(oe):
-                                continue
-                            import traceback; traceback.print_exc()
-                        except Exception:
-                            import traceback; traceback.print_exc()
-                    c.commit()
-                    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    if deleted_total > 0:
-                        loguru_logger.info(
-                            "DB prune: deleted {} rows from {}",
-                            deleted_total, db_p,
-                        )
-                except Exception:
-                    import traceback; traceback.print_exc()
-                finally:
-                    # Always close — commit()/PRAGMA can raise "database is locked"
-                    # (the bot holds WAL connections to these same files), which
-                    # would otherwise leak the sqlite3.Connection every day.
-                    if c is not None:
-                        try:
-                            c.close()
-                        except Exception:
-                            pass
+            await asyncio.to_thread(
+                _prune_db_sync, db_path, live_db_path, RET_SHADOW, RET_LIVE)
         except asyncio.CancelledError:
             return
         except Exception:
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
         await asyncio.sleep(interval_sec)
 
 
