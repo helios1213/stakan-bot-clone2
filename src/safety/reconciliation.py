@@ -137,6 +137,90 @@ async def _send_orphan_alert(alerts, action: str, mexc_pos: dict, result_msg: st
         logger.exception("Failed to send reconcile alert")
 
 
+async def _real_realized_from_history(executor, mexc_sym: str, since_ms: int):
+    """Exchange-authoritative (close_price, realised_pnl) for a just closed or
+    vanished position, read from MEXC history_positions with a short retry.
+
+    A real loss must reach the $25 kill. Two paths drop it otherwise: an orphan
+    close whose history had not settled yet (exit==0), and an externally-closed
+    /liquidated position booked from a mid estimate (~$0). Both are fixed by
+    pulling the real value here. Returns (0.0, 0.0) if history never settles.
+    """
+    try:
+        from src.execution.live_executor import _poll_close_fill
+        slot_id = getattr(executor, "slot_id", None)
+        cp = getattr(executor, "client_pool", None)
+        if slot_id is None or cp is None:
+            return 0.0, 0.0
+        client = await cp.get(slot_id)
+        if client is None:
+            return 0.0, 0.0
+        close_avg, realised, _open = await _poll_close_fill(
+            client, mexc_sym, None, int(since_ms or 0), timeout_sec=6.0)
+        return close_avg, realised
+    except Exception:
+        logger.exception("[RECONCILE] realized backfill failed for %s", mexc_sym)
+        return 0.0, 0.0
+
+
+
+async def _record_orphan_close(shadow_engine, live_pool, slot_id, mexc_sym,
+                               symbol, direction, qty, lev, exit_price, pnl,
+                               entry_confirmed: float = 0.0) -> None:
+    """Book a reconcile-closed orphan into live_trades AND the per-slot $25 kill
+    (record_close). Mirrors the periodic Case A path so a STARTUP force-close is
+    booked identically (audit #3) — otherwise the loss is dropped from the kill
+    and from the ledger the next restart's hydrate reads. exit_price<=0 means
+    MEXC history had not settled; skip the ledger row (a $0 row corrupts the
+    daily total) but never crash the reconcile loop.
+    """
+    try:
+        live_db = getattr(shadow_engine, "live_db", None)
+        if live_db is None:
+            logger.warning("[RECONCILE] no live_db; orphan %s PnL not persisted", symbol)
+        elif exit_price <= 0:
+            logger.warning(
+                "[RECONCILE] orphan %s closed but realised n/a (exit_price=0) — "
+                "NOT writing live_trades row; check MEXC account", symbol)
+        else:
+            from src.exchanges.mexc_rest import to_binance
+            from src.execution.live_executor import CONTRACT_SIZES
+            internal_sym = to_binance(mexc_sym)
+            contract_size = CONTRACT_SIZES.get(symbol, 1.0)
+            _entry = _num(entry_confirmed) if _num(entry_confirmed) > 0 else exit_price
+            notional = exit_price * qty * contract_size
+            margin = (notional / lev) if lev else notional
+            now_s = int(time.time())
+            await live_db.execute(
+                """INSERT INTO live_trades
+                   (symbol, direction, leverage, margin_usdt, notional_usdt,
+                    entry_price, entry_slippage_pct, opened_at,
+                    exit_price, closed_at, exit_reason,
+                    pnl_usdt, net_pnl_usdt,
+                    entry_fees_usdt, exit_fees_usdt,
+                    mode, account_label, detector_source)
+                   VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?, ?,?, ?,?,?)""",
+                (internal_sym, direction, int(lev), margin, notional,
+                 _entry, 0.0, now_s, exit_price, now_s, "reconcile_orphan",
+                 pnl, pnl, 0.0, 0.0, "live", f"slot{slot_id}", "reconcile"),
+            )
+            logger.info("[RECONCILE] persisted orphan %s (%s) net_pnl=%+.4f to live_trades",
+                        internal_sym, symbol, pnl)
+    except Exception:
+        logger.exception("[RECONCILE] failed to persist orphan %s to live_trades", symbol)
+
+    if exit_price > 0:
+        try:
+            _safety = live_pool.get_safety(slot_id)
+            if _safety is not None:
+                from src.exchanges.mexc_rest import to_binance as _to_int
+                from src.execution.live_executor import CONTRACT_SIZES as _CS
+                _notional = exit_price * qty * _CS.get(symbol, 1.0)
+                _safety.record_close(_to_int(symbol), pnl, notional_usdt=_notional)
+        except Exception:
+            logger.exception("[RECONCILE] failed to record orphan %s in safety", symbol)
+
+
 async def _keyed_slot_executors(live_pool) -> dict:
     """Executors for EVERY slot we hold a key for (enabled + complete).
 
@@ -176,7 +260,7 @@ async def _keyed_slot_executors(live_pool) -> dict:
 # Startup reconciliation
 # ────────────────────────────────────────────────────────────────────────
 
-async def startup_reconcile(live_pool, alerts) -> dict:
+async def startup_reconcile(live_pool, alerts, shadow_engine=None) -> dict:
     """At bot startup: close any MEXC position bot has no record of.
 
     Fail-soft: if reconciliation can't complete (MEXC unreachable, etc.),
@@ -288,6 +372,18 @@ async def startup_reconcile(live_pool, alerts) -> dict:
                 summary["closed_successfully"] += 1
                 exit_price = _num(getattr(result, "exit_price", 0))
                 pnl = _num(getattr(result, "realized_pnl_usdt", 0))
+                # #3: a startup force-close must reach the $25 kill and the ledger
+                # exactly like the periodic path. Back-fill from history if the
+                # close result's realised had not settled.
+                if exit_price <= 0:
+                    _ca_su, _re_su = await _real_realized_from_history(
+                        executor, symbol, int(mexc_pos.get("createTime", 0) or 0))
+                    if _ca_su > 0:
+                        exit_price, pnl = _ca_su, _re_su
+                await _record_orphan_close(
+                    shadow_engine, live_pool, slot_id, symbol, symbol,
+                    direction, qty, lev, exit_price, pnl,
+                    entry_confirmed=_num(getattr(result, "entry_price_confirmed", 0)))
                 logger.info(
                     "[RECONCILE STARTUP] %s CLOSED: exit=%.6f pnl=$%+.4f",
                     symbol, exit_price, pnl,
@@ -519,6 +615,15 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
             # a misleading $0.0000 — the real PnL is in the MEXC account.
             _pnl = _num(getattr(result, "realized_pnl_usdt", 0))
             _exit = _num(getattr(result, "exit_price", 0))
+            # #5/#6: market_close's own history poll can time out (realised not
+            # settled), leaving _exit==0 — the loss would then be dropped from
+            # BOTH the ledger AND the $25 kill. Re-poll here so a settled real
+            # loss is still booked.
+            if _exit <= 0:
+                _ca_bf, _re_bf = await _real_realized_from_history(
+                    executor, mexc_sym, int(mexc_pos.get("createTime", 0) or 0))
+                if _ca_bf > 0:
+                    _exit, _pnl = _ca_bf, _re_bf
             _msg = (f"realised=${_pnl:+.4f}" if _exit > 0
                     else "realised: n/a (MEXC history not settled — check account)")
             await _send_orphan_alert(alerts, "ORPHAN closed", mexc_pos, _msg)
@@ -648,8 +753,21 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
                 eng_pos.symbol, eng_pos.elapsed_sec,
             )
             try:
+                # #4: an externally-closed/liquidated position must book its REAL
+                # loss, not a mid estimate (~$0) that never trips the $25 kill.
+                # Pull the exchange close price from history and pass it as the
+                # exit hint (falls back to mid if history is unavailable).
+                _hint = 0.0
+                if pos_slot is not None:
+                    _ex = live_pool.get_executor(pos_slot)
+                    if _ex is not None:
+                        _ca_x, _re_x = await _real_realized_from_history(
+                            _ex, mexc_sym, int(getattr(eng_pos, "opened_at_ms", 0) or 0))
+                        if _ca_x > 0:
+                            _hint = _ca_x
                 await shadow_engine.mark_position_closed_externally(
                     eng_pos, reason="reconciliation_external_close",
+                    exit_price_hint=_hint,
                 )
                 summary["stale_engine_marked"] += 1
             except Exception:

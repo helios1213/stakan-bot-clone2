@@ -1141,7 +1141,7 @@ async def main() -> None:
     # Fail-soft: errors are logged but don't block bot startup.
     try:
         from src.safety.reconciliation import startup_reconcile
-        await startup_reconcile(live_pool, alerts)
+        await startup_reconcile(live_pool, alerts, shadow_engine)
     except Exception:
         loguru_logger.exception("startup_reconcile failed — bot will continue")
 
