@@ -137,7 +137,8 @@ async def _send_orphan_alert(alerts, action: str, mexc_pos: dict, result_msg: st
         logger.exception("Failed to send reconcile alert")
 
 
-async def _real_realized_from_history(executor, mexc_sym: str, since_ms: int):
+async def _real_realized_from_history(executor, mexc_sym: str, since_ms: int,
+                                      position_id: int = 0):
     """Exchange-authoritative (close_price, realised_pnl) for a just closed or
     vanished position, read from MEXC history_positions with a short retry.
 
@@ -156,7 +157,7 @@ async def _real_realized_from_history(executor, mexc_sym: str, since_ms: int):
         if client is None:
             return 0.0, 0.0
         close_avg, realised, _open = await _poll_close_fill(
-            client, mexc_sym, None, int(since_ms or 0), timeout_sec=6.0)
+            client, mexc_sym, (position_id or None), int(since_ms or 0), timeout_sec=6.0)
         return close_avg, realised
     except Exception:
         logger.exception("[RECONCILE] realized backfill failed for %s", mexc_sym)
@@ -342,7 +343,8 @@ async def startup_reconcile(live_pool, alerts, shadow_engine=None) -> dict:
                 # close result's realised had not settled.
                 if exit_price <= 0:
                     _ca_su, _re_su = await _real_realized_from_history(
-                        executor, symbol, int(mexc_pos.get("createTime", 0) or 0))
+                        executor, symbol, int(mexc_pos.get("createTime", 0) or 0),
+                        position_id=int(mexc_pos.get("positionId", 0) or 0))
                     if _ca_su > 0:
                         exit_price, pnl = _ca_su, _re_su
                 await _record_orphan_close(
@@ -607,7 +609,8 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
             # loss is still booked.
             if _exit <= 0:
                 _ca_bf, _re_bf = await _real_realized_from_history(
-                    executor, mexc_sym, int(mexc_pos.get("createTime", 0) or 0))
+                    executor, mexc_sym, int(mexc_pos.get("createTime", 0) or 0),
+                    position_id=int(mexc_pos.get("positionId", 0) or 0))
                 if _ca_bf > 0:
                     _exit, _pnl = _ca_bf, _re_bf
             _msg = (f"realised=${_pnl:+.4f}" if _exit > 0

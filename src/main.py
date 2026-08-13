@@ -134,6 +134,9 @@ def _prune_db_sync(db_path: str, live_db_path: str, ret_shadow, ret_live) -> Non
         c = None
         try:
             c = sqlite3.connect(db_p)
+            # Wait (up to 5s) for the write lock instead of failing immediately —
+            # the live bot writes to these same files concurrently.
+            c.execute("PRAGMA busy_timeout=5000")
             deleted_total = 0
             for tbl, col, sec in ret:
                 try:
