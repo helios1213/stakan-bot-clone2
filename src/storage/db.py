@@ -772,6 +772,29 @@ class Database:
         await self.conn.execute(sql, params)
         await self.conn.commit()
 
+    async def execute_write(self, sql: str, params: tuple[Any, ...] = (),
+                            *, retries: int = 5, base_delay: float = 0.2) -> None:
+        """execute() for rare CONTROL writes that must survive a busy DB: retries
+        on 'database is locked' with exponential backoff. A concurrent process
+        (prune thread / host panel / WAL checkpoint) can hold the single writer
+        lock longer than busy_timeout, which otherwise makes a per-slot leverage
+        change or a live_enabled toggle fail with an ugly error exactly when the
+        operator needs it. NOT for the hot signal path (that stays on execute()/
+        conn to avoid queue back-up). Statements must be idempotent (a retry
+        re-runs them). (2026-08-13.)"""
+        import asyncio
+        import sqlite3
+        for attempt in range(retries):
+            try:
+                await self.conn.execute(sql, params)
+                await self.conn.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < retries - 1:
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                    continue
+                raise
+
     async def executemany(self, sql: str, params_list: list[tuple[Any, ...]]) -> None:
         await self.conn.executemany(sql, params_list)
         await self.conn.commit()

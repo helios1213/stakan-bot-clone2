@@ -149,16 +149,16 @@ async def _upsert_slot_pair(db, slot_id: int, symbol: str, *,
                             leverage: tuple | None = None) -> None:
     """UPSERT one param (margin OR leverage) of the (slot, pair) override, leaving
     the other param untouched (partial overrides are allowed)."""
-    await db.execute(
+    await db.execute_write(
         "INSERT OR IGNORE INTO slot_pair_sizing (slot_id, symbol) VALUES (?, ?)",
         (slot_id, symbol))
     if margin is not None:
-        await db.execute(
+        await db.execute_write(
             "UPDATE slot_pair_sizing SET margin_min_usdt=?, margin_max_usdt=?, "
             "updated_at=? WHERE slot_id=? AND symbol=?",
             (float(margin[0]), float(margin[1]), int(time.time()), slot_id, symbol))
     if leverage is not None:
-        await db.execute(
+        await db.execute_write(
             "UPDATE slot_pair_sizing SET leverage_min=?, leverage_max=?, "
             "updated_at=? WHERE slot_id=? AND symbol=?",
             (int(leverage[0]), int(leverage[1]), int(time.time()), slot_id, symbol))
@@ -176,7 +176,7 @@ async def _update_slot_leverage(db, slot_id: int, symbol: str, mn: int, mx: int)
 
 async def _reset_slot(db, slot_id: int, symbol: str) -> bool:
     """Drop the (slot, pair) override so the slot inherits the pair YAML again."""
-    await db.execute(
+    await db.execute_write(
         "DELETE FROM slot_pair_sizing WHERE slot_id=? AND symbol=?", (slot_id, symbol))
     return True
 

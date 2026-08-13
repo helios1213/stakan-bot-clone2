@@ -586,7 +586,7 @@ class WebkeyStore:
         so a fee-guard halt (set_live_enabled False) doesn't hide the slot.
         """
         _validate_slot_id(slot_id)
-        await self.db.execute(
+        await self.db.execute_write(
             """
             UPDATE webkey_slots
                SET live_enabled=?,
