@@ -81,6 +81,8 @@ CONTRACT_SIZES: dict[str, float] = {
     "SKHYNIXSTOCK_USDT": 0.001,
     "SPCXSTOCK_USDT":    0.01,
     "SOXL_USDT":         0.01,
+    "MUSTOCK_USDT":      0.01,
+    "SNDKSTOCK_USDT":    0.001,
 }
 
 
@@ -95,6 +97,8 @@ PRICE_SCALES: dict[str, int] = {
     "SKHYNIXSTOCK_USDT": 2,  # priceUnit=0.01 (stock)
     "SPCXSTOCK_USDT": 2,     # priceUnit=0.01 (stock)
     "SOXL_USDT": 2,          # priceUnit=0.01 (stock)
+    "MUSTOCK_USDT": 2,       # priceUnit=0.01 (stock)
+    "SNDKSTOCK_USDT": 2,     # priceUnit=0.01 (stock)
     "ZEC_USDT": 2,     # priceUnit=0.01
     "TAO_USDT": 2,
     "BCH_USDT": 2,
@@ -362,6 +366,8 @@ TICK_SIZES: dict[str, float] = {
     "SKHYNIXSTOCK_USDT": 1e-2,
     "SPCXSTOCK_USDT":    1e-2,
     "SOXL_USDT":         1e-2,
+    "MUSTOCK_USDT":      1e-2,
+    "SNDKSTOCK_USDT":    1e-2,
 }
 
 

@@ -67,6 +67,8 @@ universe:
     - SKHYNIXUSDT   # SK hynix; MEXC SKHYNIXSTOCK_USDT; тік 0.01/contract 0.001
     - SPCXUSDT      # SpaceX; MEXC SPCXSTOCK_USDT; тік 0.01/contract 0.01
     - SOXLUSDT      # SOXL ETF; MEXC SOXL_USDT; тік 0.01/contract 0.01
+    - MUUSDT        # MU stock; MEXC MUSTOCK_USDT; тік 0.01/contract 0.01; ~$909
+    - SNDKUSDT      # SNDK stock; MEXC SNDKSTOCK_USDT; тік 0.01/contract 0.001; ~$1344
     - BTCUSDT       # reference only — see reference_only_symbols below
 
   # Safety net — explicitly blocked symbols (overrides whitelist if duplicated).

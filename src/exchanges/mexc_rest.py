@@ -51,6 +51,8 @@ BINANCE_TO_MEXC_ALIASES: dict[str, str] = {
     # Стокові перпи: рідний символ MEXC із суфіксом STOCK
     "SKHYNIXUSDT": "SKHYNIXSTOCK_USDT",
     "SPCXUSDT": "SPCXSTOCK_USDT",
+    "MUUSDT": "MUSTOCK_USDT",
+    "SNDKUSDT": "SNDKSTOCK_USDT",
     # SOXL мапиться правильно дефолтом (SOXL_USDT) — аліас не потрібен
 }
 MEXC_TO_BINANCE_ALIASES: dict[str, str] = {v: k for k, v in BINANCE_TO_MEXC_ALIASES.items()}
