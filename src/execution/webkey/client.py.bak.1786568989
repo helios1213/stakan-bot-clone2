@@ -478,7 +478,7 @@ class MexcWebClient:
         return await self._request(
             "POST", "/order/create",
             body=body,
-            needs_dolos=False,
+            needs_dolos=True,
             needs_web_sign=True,
         )
 

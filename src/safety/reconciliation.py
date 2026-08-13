@@ -221,41 +221,6 @@ async def _record_orphan_close(shadow_engine, live_pool, slot_id, mexc_sym,
             logger.exception("[RECONCILE] failed to record orphan %s in safety", symbol)
 
 
-async def _keyed_slot_executors(live_pool) -> dict:
-    """Executors for EVERY slot we hold a key for (enabled + complete).
-
-    A keyed slot that is not live-active still holds a real MEXC position that
-    must be managed (audit #7). Enumerate keyed slots from the store and
-    get-or-create an idle executor for each (it never trades). slot_has_key
-    still gates the actual close, so a deleted-key account is never touched.
-    Falls back to the pool's live view if the store cannot be enumerated.
-    """
-    store = getattr(live_pool, "webkey_store", None)
-    getoc = getattr(live_pool, "get_or_create_executor", None)
-    lister = getattr(store, "list_enabled_complete", None) if store is not None else None
-    if callable(getoc) and callable(lister):
-        try:
-            slots = await lister()
-            out = {}
-            for s in slots:
-                ex = getoc(s.slot_id)
-                if ex is not None:
-                    out[s.slot_id] = ex
-            return out
-        except Exception:
-            logger.exception(
-                "[RECONCILE] keyed-slot enumeration failed — falling back to live view")
-    _active = getattr(live_pool, "active_executors", None)
-    if callable(_active):
-        try:
-            res = _active()
-            if isinstance(res, dict):
-                return res
-        except Exception:
-            logger.exception("[RECONCILE] active_executors() fallback failed")
-    return getattr(live_pool, "_executors", {}) or {}
-
-
 # ────────────────────────────────────────────────────────────────────────
 # Startup reconciliation
 # ────────────────────────────────────────────────────────────────────────
@@ -285,9 +250,9 @@ async def startup_reconcile(live_pool, alerts, shadow_engine=None) -> dict:
         logger.info("[RECONCILE STARTUP] live_pool is None — skipping (shadow-only mode)")
         return summary
 
-    executors = await _keyed_slot_executors(live_pool)
+    executors = getattr(live_pool, "_executors", {})
     if not executors:
-        logger.info("[RECONCILE STARTUP] no keyed slots configured — skipping")
+        logger.info("[RECONCILE STARTUP] no live executors configured — skipping")
         return summary
 
     logger.info("[RECONCILE STARTUP] checking %d slot(s) for unmanaged MEXC positions",
@@ -451,12 +416,21 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     if live_pool is None:
         return summary
 
-    # Reconcile every slot we hold a KEY for, not just live-active ones. A keyed
-    # slot that is not live-active (after a restart, or deactivated while a
-    # position was open) still holds a real MEXC position that must be managed
-    # (audit #7 / the -$42 class). slot_has_key gates the actual close, so a
-    # deleted-key account is still never touched.
-    executors = await _keyed_slot_executors(live_pool)
+    # active_executors(), NOT _executors: the latter keeps deactivated slots for
+    # their stats, and using it meant a slot whose webkey had been deleted was
+    # still reconciled — closing positions the operator had opened by hand.
+    # (Group C keyed-slot scan reverted 2026-08-13: it broke the executor<->safety
+    # controller invariant and could close manual positions on enabled-idle slots.
+    # The -$42 class is covered by the slot_has_key fix.)
+    executors = getattr(live_pool, "_executors", {})
+    _active = getattr(live_pool, "active_executors", None)
+    if callable(_active):
+        try:
+            _res = _active()
+            if isinstance(_res, dict):
+                executors = _res
+        except Exception:
+            logger.exception("[RECONCILE] active_executors() failed — using stale list")
     if not executors:
         return summary
 
@@ -511,20 +485,28 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     engine_unattributed_syms: set[str] = set()
     # Map (slot | None, mexc_symbol) → list of ShadowPosition (Case B iteration).
     engine_positions_by_key: dict[tuple, list] = {}
+    # (slot|None, mexc_sym) / symbols whose NORMAL close is IN FLIGHT (is_closing).
+    # The normal close path books their realised PnL; reconcile must NOT also
+    # orphan-close and re-book them — that double-counts into the $25 kill.
+    engine_closing_keys: set[tuple] = set()
+    engine_closing_syms: set[str] = set()
     open_positions = getattr(shadow_engine, "_open_positions", {})
     for sym, poss in open_positions.items():
         for pos in poss:
-            if (pos.mode == "live"
-                    and pos.is_open
-                    and not getattr(pos, "is_closing", False)):
-                mexc_sym = to_mexc(sym)
-                pos_slot = _slot_of(pos)
-                if pos_slot is None:
-                    engine_unattributed_syms.add(mexc_sym)
-                else:
-                    engine_live_by_key.add((pos_slot, mexc_sym))
-                engine_positions_by_key.setdefault(
-                    (pos_slot, mexc_sym), []).append(pos)
+            if pos.mode != "live" or not pos.is_open:
+                continue
+            mexc_sym = to_mexc(sym)
+            pos_slot = _slot_of(pos)
+            if getattr(pos, "is_closing", False):
+                engine_closing_keys.add((pos_slot, mexc_sym))
+                engine_closing_syms.add(mexc_sym)
+                continue
+            if pos_slot is None:
+                engine_unattributed_syms.add(mexc_sym)
+            else:
+                engine_live_by_key.add((pos_slot, mexc_sym))
+            engine_positions_by_key.setdefault(
+                (pos_slot, mexc_sym), []).append(pos)
     summary["engine_positions"] = sum(
         len(v) for v in engine_positions_by_key.values()
     )
@@ -535,6 +517,10 @@ async def reconcile_once(shadow_engine, live_pool, alerts) -> dict:
     for (slot_id, mexc_sym), mexc_pos in mexc_by_key.items():
         if (slot_id, mexc_sym) in engine_live_by_key:
             # This very slot has a tracked position here — not an orphan.
+            continue
+        if (slot_id, mexc_sym) in engine_closing_keys or mexc_sym in engine_closing_syms:
+            # A normal close is IN FLIGHT for this — the close path books its
+            # PnL. Do NOT orphan-close/re-book it (would double-count the loss).
             continue
         if mexc_sym in engine_unattributed_syms:
             # A live position on this symbol whose slot we could not read.
