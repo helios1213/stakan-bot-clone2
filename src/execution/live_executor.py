@@ -231,6 +231,17 @@ IOC_PRE_RETRY_POSITION_CHECK = True
 # PEPE liquidation (believed-expired IOC that actually filled → 49min naked
 # short → −$25.82 liquidation, with no bot record and no TG alert).
 PHANTOM_FILL_CHECK_DELAY_SEC = float(os.environ.get("PHANTOM_FILL_CHECK_DELAY_SEC", "2.5"))
+# Multi-window phantom re-check: a believed-EXPIRED IOC can have its fill/deal
+# land on MEXC AFTER the first (2.5s) window, so a single check left the naked
+# position to the 60s reconcile. Re-check at these ABSOLUTE delays (seconds) and
+# flatten the moment a fill appears (early-exit). A genuine no-fill polls every
+# window (the safety cost — cheap reads); persistent unreadable falls through to
+# the 60s periodic reconcile backstop. Override via env (comma list). (2026-08-13.)
+PHANTOM_FILL_CHECK_DELAYS_SEC = [
+    float(x) for x in os.environ.get(
+        "PHANTOM_FILL_CHECK_DELAYS_SEC",
+        f"{PHANTOM_FILL_CHECK_DELAY_SEC},6,12").split(",") if x.strip()
+]
 
 # Sleep between /position/open_positions polls inside _poll_fill_price
 # while waiting for an IOC fill to appear. Each poll is a network roundtrip
@@ -1584,68 +1595,87 @@ class LiveExecutor:
             logger.exception("[PHANTOM] failed to schedule check for %s order %s", symbol, order_id)
 
     async def _phantom_open_check(self, order_id, symbol, direction, leverage) -> None:
-        """After a short delay, re-check the order's REAL deals. If it actually
-        filled despite our no-fill verdict, the position is naked → flatten
-        exactly that many contracts (surgical: does not touch legit scalps)."""
-        try:
-            await asyncio.sleep(PHANTOM_FILL_CHECK_DELAY_SEC)
-            client = await self.client_pool.get(self.slot_id)
-            if client is None:
-                return
-            resp = await client.get_order_deals(order_id)
-            if not isinstance(resp, dict) or resp.get("code") not in (0, 200, None):
-                # Unreadable (e.g. 401) — periodic reconcile is the backstop.
-                logger.warning(
-                    "[PHANTOM] %s order %s deal-check unreadable (code=%s) — reconcile backstop",
-                    symbol, order_id, resp.get("code") if isinstance(resp, dict) else "?",
-                )
-                return
-            deals = resp.get("data") or []
-            filled = sum(int(d.get("vol", 0) or 0) for d in deals)
-            if filled <= 0:
-                return  # genuinely no fill — the normal expired case, nothing to do
-            # PHANTOM: believed-expired but ACTUALLY filled → naked position.
-            logger.error(
-                "🚨 [PHANTOM FILL] %s %s order=%s believed-EXPIRED but ACTUALLY FILLED %d cont "
-                "— flattening to avoid a naked position/liquidation",
-                symbol, direction.upper(), order_id, filled,
-            )
-            close_side = SIDE_CLOSE_SHORT if direction == "short" else SIDE_CLOSE_LONG
+        """Re-check the order's REAL deals at widening windows. A fill can appear
+        on MEXC AFTER the first window, so a single check left the naked position
+        to the 60s reconcile; we re-poll and flatten the moment a fill shows
+        (early-exit). Genuine no-fills poll every window (the safety cost);
+        persistent unreadable falls through to the periodic reconcile backstop."""
+        prev = 0.0
+        for i, delay in enumerate(PHANTOM_FILL_CHECK_DELAYS_SEC):
+            await asyncio.sleep(max(0.0, delay - prev))
+            prev = delay
             try:
-                cresp = await asyncio.wait_for(
-                    client.submit_order(
-                        symbol=symbol, side=close_side, vol=filled,
-                        leverage=leverage, open_type=OPEN_TYPE_ISOLATED, order_type="5",
-                    ),
-                    timeout=self.close_timeout_sec,
-                )
-                code = cresp.get("code", -1) if isinstance(cresp, dict) else -1
-                ok = code in (0, 200)
-                already = code == 2009  # position already gone — also fine
-                logger.error(
-                    "[PHANTOM FILL] %s flatten %s: code=%s resp=%s",
-                    symbol, "OK" if ok else ("already-flat" if already else "FAILED"), code, cresp,
-                )
-                if self.alerts is not None:
-                    await self.alerts.send(
-                        text=(
-                            f"🚨 <b>PHANTOM FILL flattened</b>\n\n"
-                            f"<b>Slot:</b> SLOT{self.slot_id}\n"
-                            f"<b>Pair:</b> {symbol} {direction.upper()}\n"
-                            f"<b>Qty:</b> {filled} cont\n<b>Order:</b> {order_id}\n\n"
-                            f"An IOC we believed EXPIRED actually FILLED and was auto-flattened "
-                            f"({'OK' if ok else ('already flat' if already else 'CLOSE FAILED — CHECK MEXC')})."
-                        ),
-                        category=f"phantom_{symbol}_{order_id}",
-                        throttle_sec=0, suppress_during_quiet=False,
-                    )
+                if await self._phantom_check_once(
+                        order_id, symbol, direction, leverage, i + 1, delay):
+                    return  # fill found + flattened — stop
             except Exception:
                 logger.exception(
-                    "[PHANTOM FILL] %s flatten threw — CHECK MEXC MANUALLY (order %s, %d cont)",
-                    symbol, order_id, filled,
+                    "[PHANTOM] check %d/%d failed for %s order %s",
+                    i + 1, len(PHANTOM_FILL_CHECK_DELAYS_SEC), symbol, order_id)
+
+    async def _phantom_check_once(
+            self, order_id, symbol, direction, leverage, attempt, delay) -> bool:
+        """One phantom re-check window. Returns True to STOP (fill found +
+        flatten attempted), False to RETRY at the next window (no fill yet /
+        transient unreadable — the 60s reconcile is the ultimate backstop)."""
+        client = await self.client_pool.get(self.slot_id)
+        if client is None:
+            return False
+        resp = await client.get_order_deals(order_id)
+        if not isinstance(resp, dict) or resp.get("code") not in (0, 200, None):
+            # Unreadable (e.g. 401/510) — retry next window; reconcile backstop.
+            logger.warning(
+                "[PHANTOM] %s order %s deal-check unreadable (code=%s) — retry %d/%d",
+                symbol, order_id, resp.get("code") if isinstance(resp, dict) else "?",
+                attempt, len(PHANTOM_FILL_CHECK_DELAYS_SEC),
+            )
+            return False
+        deals = resp.get("data") or []
+        filled = sum(int(d.get("vol", 0) or 0) for d in deals)
+        if filled <= 0:
+            return False  # no fill YET — re-check at the next (later) window
+        # PHANTOM: believed-expired but ACTUALLY filled → naked position.
+        logger.error(
+            "🚨 [PHANTOM FILL] %s %s order=%s believed-EXPIRED but ACTUALLY FILLED %d cont "
+            "(window %d/%d @%.1fs) — flattening to avoid a naked position/liquidation",
+            symbol, direction.upper(), order_id, filled, attempt,
+            len(PHANTOM_FILL_CHECK_DELAYS_SEC), delay,
+        )
+        close_side = SIDE_CLOSE_SHORT if direction == "short" else SIDE_CLOSE_LONG
+        try:
+            cresp = await asyncio.wait_for(
+                client.submit_order(
+                    symbol=symbol, side=close_side, vol=filled,
+                    leverage=leverage, open_type=OPEN_TYPE_ISOLATED, order_type="5",
+                ),
+                timeout=self.close_timeout_sec,
+            )
+            code = cresp.get("code", -1) if isinstance(cresp, dict) else -1
+            ok = code in (0, 200)
+            already = code == 2009  # position already gone — also fine
+            logger.error(
+                "[PHANTOM FILL] %s flatten %s: code=%s resp=%s",
+                symbol, "OK" if ok else ("already-flat" if already else "FAILED"), code, cresp,
+            )
+            if self.alerts is not None:
+                await self.alerts.send(
+                    text=(
+                        f"🚨 <b>PHANTOM FILL flattened</b>\n\n"
+                        f"<b>Slot:</b> SLOT{self.slot_id}\n"
+                        f"<b>Pair:</b> {symbol} {direction.upper()}\n"
+                        f"<b>Qty:</b> {filled} cont\n<b>Order:</b> {order_id}\n\n"
+                        f"An IOC we believed EXPIRED actually FILLED and was auto-flattened "
+                        f"({'OK' if ok else ('already flat' if already else 'CLOSE FAILED — CHECK MEXC')})."
+                    ),
+                    category=f"phantom_{symbol}_{order_id}",
+                    throttle_sec=0, suppress_during_quiet=False,
                 )
         except Exception:
-            logger.exception("[PHANTOM] check failed for %s order %s", symbol, order_id)
+            logger.exception(
+                "[PHANTOM FILL] %s flatten threw — CHECK MEXC MANUALLY (order %s, %d cont)",
+                symbol, order_id, filled,
+            )
+        return True  # fill handled (flatten attempted) — do not re-check/re-flatten
 
     async def _guard_close_fee(self, close_order_id: str, symbol: str) -> None:
         """Fee-guard on the CLOSE order (mirror of the entry guard).
