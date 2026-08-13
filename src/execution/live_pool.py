@@ -175,7 +175,7 @@ class LiveExecutorPool:
         except Exception:
             return False
         return bool(slot and getattr(slot, "enabled", False)
-                    and getattr(slot, "webkey_blob", None) is not None)
+                    and getattr(slot, "webkey", None) is not None)
 
     def get_executor(self, slot_id: int) -> LiveExecutor | None:
         return self._executors.get(slot_id)
