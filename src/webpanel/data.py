@@ -361,11 +361,12 @@ def remove_account_routed(server: str, slot_id: int) -> dict:
 
 
 def add_account_routed(server: str, *, webkey: str,
-                       label: str | None = None) -> dict:
+                       label: str | None = None,
+                       slot_id: int | None = None) -> dict:
     if server == "primary":
-        return {"ok": True, **add_account(webkey, label)}
+        return {"ok": True, **add_account(webkey, label, slot_id)}
     return _remote_rpc(server,
-        {"op": "add", "webkey": webkey, "label": label})
+        {"op": "add", "webkey": webkey, "label": label, "slot_id": slot_id})
 
 
 def available_servers() -> list[str]:
@@ -598,7 +599,13 @@ def _gen_visitor_id() -> str:
 
 
 def _fernet():
-    from cryptography.fernet import Fernet  # local import: only the panel write-path needs it
+    try:
+        from cryptography.fernet import Fernet  # panel write-path only
+    except ImportError as e:
+        raise AccountError(
+            "Пакет cryptography не встановлено у venv панелі — запусти "
+            "`.venv/bin/pip install cryptography==43.0.3` і перезапусти stakan-panel."
+        ) from e
     try:
         return Fernet(_master_key().encode())
     except Exception as e:  # noqa: BLE001 — surface a clean message to the form
@@ -627,7 +634,8 @@ def _assert_key_can_decrypt_existing(conn: sqlite3.Connection, fernet) -> None:
         ) from e
 
 
-def add_account(webkey: str, label: str | None = None) -> dict:
+def add_account(webkey: str, label: str | None = None,
+                slot_id: int | None = None) -> dict:
     """Connect a MEXC account by webkey (the `u_id` cookie value, WEB+64hex).
 
     Fills the first EMPTY slot, or creates the next slot row (up to
@@ -652,17 +660,33 @@ def add_account(webkey: str, label: str | None = None) -> dict:
         rows = conn.execute(
             "SELECT slot_id, webkey_blob FROM webkey_slots ORDER BY slot_id"
         ).fetchall()
-        slot_id = next((r["slot_id"] for r in rows if r["webkey_blob"] is None), None)
-        is_new_row = False
-        if slot_id is None:
-            next_id = (max((r["slot_id"] for r in rows), default=0) + 1)
-            if next_id > MAX_ACCOUNT_SLOTS:
+        by_id = {r["slot_id"]: r for r in rows}
+        if slot_id is not None:
+            # explicit slot chosen in the form — must exist-or-createable
+            # and be EMPTY (never overwrite a live credential).
+            want = int(slot_id)
+            if want < 1 or want > MAX_ACCOUNT_SLOTS:
                 raise AccountError(
-                    f"Нет свободных слотов (лимит {MAX_ACCOUNT_SLOTS}). "
-                    "Удалите неиспользуемый слот."
-                )
-            slot_id = next_id
-            is_new_row = True
+                    f"Слот {want} поза діапазоном 1..{MAX_ACCOUNT_SLOTS}.")
+            existing = by_id.get(want)
+            if existing is not None and existing["webkey_blob"] is not None:
+                raise AccountError(
+                    f"Слот {want} вже зайнятий — спершу видаліть його ключ.")
+            slot_id = want
+            is_new_row = existing is None
+        else:
+            slot_id = next((r["slot_id"] for r in rows
+                            if r["webkey_blob"] is None), None)
+            is_new_row = False
+            if slot_id is None:
+                next_id = (max((r["slot_id"] for r in rows), default=0) + 1)
+                if next_id > MAX_ACCOUNT_SLOTS:
+                    raise AccountError(
+                        f"Нет свободных слотов (лимит {MAX_ACCOUNT_SLOTS}). "
+                        "Удалите неиспользуемый слот."
+                    )
+                slot_id = next_id
+                is_new_row = True
 
         now = int(time.time())
         wk_blob = fernet.encrypt(webkey.encode("utf-8"))
