@@ -496,9 +496,7 @@ def _fmt_pair_config_full(
         row("c", ec, "max_mexc_lag_pct", fmt=_cfg_gate),
         row("d", d, "long_only"),
         row("d", d, "short_only"),
-        row("d", d, "enabled"),
         row("d", d, "cooldown_sec", suffix="s"),
-        row("d", d, "scan_interval_sec", suffix="s"),
     ]
     out.append("<b>📥 ВХІД — ворота</b>\n<pre>" + "\n".join(ent) + "</pre>")
 
