@@ -62,9 +62,6 @@ execution:
   cooldown_after_win_sec: 2
   binance_reversal_ticks: 0.0   # 2026-07-14 DISABLED (mirror of primary; workflow 101%-verified +$4.4/day). Revert=15.0
   gap_retrace_frac: 0.0
-  momentum_filter: false
-  momentum_tau_sec: 2.0
-  momentum_threshold_bps: 2.0
   # 2026-08-04: ПРИБРАНО (був 0.02). Дубль detector.min_mid_gap_ticks 4.25
   # у гірших одиницях: тік TAO = $0.01, тож у тіках цей поріг = 0.02·price
   # і вище $212.50 він перехоплював владу в тікового, починаючи різати

@@ -39,8 +39,5 @@ execution:
   cooldown_after_win_sec: 2
   binance_reversal_ticks: 0.0
   gap_retrace_frac: 0.0
-  momentum_filter: false
-  momentum_tau_sec: 2.0
-  momentum_threshold_bps: 2.0
   min_mexc_lag_pct: 0.0
   max_mexc_lag_pct: 0.0
