@@ -577,21 +577,17 @@ def _fmt_pair_config_full(
     ]
     out.append("<b>⏱ ВИХІД — час і кулдауни</b>\n<pre>" + "\n".join(tm) + "</pre>")
 
-    # ── моментум ─────────────────────────────────────────────────────
-    mo = [
-        row("c", ec, "momentum_filter"),
-        row("c", ec, "momentum_tau_sec", suffix="s"),
-        row("c", ec, "momentum_threshold_bps", suffix=" bps"),
-    ]
-    out.append("<b>📈 МОМЕНТУМ</b>\n<pre>" + "\n".join(mo) + "</pre>")
-
     # ── сторож повноти ───────────────────────────────────────────────
     # Будь-яке поле, не показане вище, з'являється тут. Це те, чого бракувало:
     # раніше новий ключ конфігу просто не потрапляв на екран.
+    # GLOBAL-ONLY / dead knobs — never per-pair, hidden from this dump:
+    _HIDE = {("d", "enabled"), ("d", "scan_interval_sec"),
+             ("c", "momentum_filter"), ("c", "momentum_tau_sec"),
+             ("c", "momentum_threshold_bps")}
     rest = []
     for tag, obj in (("d", d), ("e", ex), ("c", ec)):
         for f in dataclasses.fields(obj):
-            if (tag, f.name) not in shown:
+            if (tag, f.name) not in shown and (tag, f.name) not in _HIDE:
                 rest.append(f"  {f.name:<28}{_cfg_val(getattr(obj, f.name))}")
     if rest:
         out.append("<b>❔ ІНШЕ (не згруповано)</b>\n<pre>"
