@@ -518,10 +518,15 @@ def _fmt_pair_config_full(
         lo = lo if lo is not None else ec.leverage_min
         hi = hi if hi is not None else ec.leverage_max
         # Розмір живе лише в БД (slot_pair_sizing); ямлових margin/leverage
-        # більше немає. Показуємо реальний розмір призначеного слота.
-        # Слот може бути прив'язаний, але вимкнений/без ключа — тоді помітка.
-        off = "" if ov.get("_active", True) else " (не торгує)"
-        ex_.append(f"  {('слот ' + str(sid) + off):<28}${mn:g}-{mx:g} x {lo}-{hi}")
+        # більше немає. Показуємо ОБИДВА слоти (кожен акаунт) для пари, із
+        # поміткою: хто реально торгує зараз / призначена-не-торгує / інша пара.
+        if ov.get("_active"):
+            mark = " ◀ торгує"
+        elif ov.get("_assigned"):
+            mark = " (призначена, не торгує)"
+        else:
+            mark = " (не на цій парі)"
+        ex_.append(f"  {('слот ' + str(sid)):<28}${mn:g}-{mx:g} x {lo}-{hi}{mark}")
         ex_.append(f"  {'  → нотіонал':<28}${mn * lo:,.0f}-{mx * hi:,.0f}")
     out.append("<b>🎯 ВИКОНАННЯ</b>\n<pre>" + "\n".join(ex_) + "</pre>")
 
@@ -636,14 +641,17 @@ async def cmd_get_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             from src.execution.webkey.credentials import MAX_SLOTS as _MS
             for _sid in range(1, _MS + 1):
                 _slot = await _store.get(_sid)
-                if _slot is None or _slot.assigned_pair != symbol:
+                if _slot is None:
                     continue
                 _ov = await _store.get_slot_pair_sizing(_sid, symbol)
-                if _ov:
-                    _ov = {**_ov, "_active": bool(
-                        getattr(_slot, "enabled", 0)
-                        and getattr(_slot, "live_enabled", 0))}
-                    overrides.append((_sid, _ov))
+                if not _ov:
+                    continue
+                _assigned = (_slot.assigned_pair == symbol)
+                _ov = {**_ov, "_assigned": _assigned, "_active": bool(
+                    _assigned
+                    and getattr(_slot, "enabled", 0)
+                    and getattr(_slot, "live_enabled", 0))}
+                overrides.append((_sid, _ov))
         except Exception:
             logger.exception("[GET_CONFIG] не вдалось прочитати перекриття розміру")
 
