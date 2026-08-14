@@ -703,8 +703,14 @@ def add_account(webkey: str, label: str | None = None,
             )
         else:
             conn.execute(
+                # New webkey in an existing slot = fresh account: zero any
+                # stale recovery regime (mode/baseline/target) + last_error
+                # so the slot starts clean, not inheriting the old key's
+                # recovery auto-stop. INSERT path is clean by column defaults.
                 "UPDATE webkey_slots SET label=?, webkey_blob=?, visitor_blob=?, "
-                "proxy_blob=?, webkey_refreshed_at=?, updated_at=? WHERE slot_id=?",
+                "proxy_blob=?, webkey_refreshed_at=?, updated_at=?, "
+                "recovery_mode=0, recovery_baseline_ts=NULL, "
+                "recovery_target_usdt=NULL, last_error=NULL WHERE slot_id=?",
                 (label, wk_blob, vis_blob, proxy_blob, now, now, slot_id),
             )
         conn.commit()
