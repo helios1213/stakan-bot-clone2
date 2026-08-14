@@ -381,10 +381,10 @@ class PairExecConfig:
     ioc_attempt_interval_ms: int = 80
 
     # Position sizing (RANDOMIZED per trade)
-    margin_min_usdt: float = 23.0
+    margin_min_usdt: float = 25.0
     margin_max_usdt: float = 30.0
-    leverage_min: int = 50
-    leverage_max: int = 80
+    leverage_min: int = 45  # 2026-08-14: safe fallback (was 50); live size = slot_pair_sizing override
+    leverage_max: int = 50  # 2026-08-14: safe fallback (was 80)
 
     # Stop loss — TICK-BASED ONLY (leverage-invariant). ROI-based SL is
     # not used: it created leverage-dependent thresholds that interfered

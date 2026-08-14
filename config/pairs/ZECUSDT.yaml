@@ -28,10 +28,6 @@ execution:
   ioc_offset_ticks: 5      # 2026-07-17 (was 3) more aggressive cross for fills
   ioc_max_attempts: 1
   ioc_attempt_interval_ms: 80
-  margin_min_usdt: 8.0
-  margin_max_usdt: 10.0
-  leverage_min: 25
-  leverage_max: 30
   stop_loss_ticks: 13
   sl_grace_sec: 1.5
   max_hold_sec: 60

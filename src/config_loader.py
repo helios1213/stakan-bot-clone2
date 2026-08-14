@@ -176,10 +176,10 @@ class ExecutionConfig:
     ioc_max_attempts: int = 2
     ioc_attempt_interval_ms: int = 80
 
-    margin_min_usdt: float = 23.0
+    margin_min_usdt: float = 25.0
     margin_max_usdt: float = 30.0
-    leverage_min: int = 50
-    leverage_max: int = 80
+    leverage_min: int = 45  # 2026-08-14: safe fallback (was 50); live size = slot_pair_sizing override
+    leverage_max: int = 50  # 2026-08-14: safe fallback (was 80)
 
     stop_loss_ticks: int = 5
     sl_grace_sec: float = 0.0

@@ -28,10 +28,6 @@ execution:
   ioc_offset_ticks: 0
   ioc_max_attempts: 2
   ioc_attempt_interval_ms: 80
-  margin_min_usdt: 36.0
-  margin_max_usdt: 48.0
-  leverage_min: 50
-  leverage_max: 50
   stop_loss_ticks: 5
   sl_grace_sec: 0.0
   max_hold_sec: 60

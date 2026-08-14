@@ -505,13 +505,6 @@ def _fmt_pair_config_full(
         row("c", ec, "ioc_offset_ticks"),
         row("c", ec, "ioc_max_attempts"),
         row("c", ec, "ioc_attempt_interval_ms", suffix="ms"),
-        row("c", ec, "margin_min_usdt", fmt=lambda v: f"${v:g}"),
-        row("c", ec, "margin_max_usdt", fmt=lambda v: f"${v:g}"),
-        row("c", ec, "leverage_min"),
-        row("c", ec, "leverage_max"),
-        f"  {'→ нотіонал (yaml)':<28}"
-        f"${ec.margin_min_usdt * ec.leverage_min:,.0f}-"
-        f"{ec.margin_max_usdt * ec.leverage_max:,.0f}",
     ]
     for sid, ov in (overrides or []):
         mn = ov.get("margin_min_usdt")
@@ -524,17 +517,12 @@ def _fmt_pair_config_full(
         mx = mx if mx is not None else ec.margin_max_usdt
         lo = lo if lo is not None else ec.leverage_min
         hi = hi if hi is not None else ec.leverage_max
-        same = (mn == ec.margin_min_usdt and mx == ec.margin_max_usdt
-                and lo == ec.leverage_min and hi == ec.leverage_max)
-        # Слот може бути прив'язаний до пари, але вимкнений або без ключа —
-        # тоді його розмір нічого не означає, і кричати про нього не треба.
+        # Розмір живе лише в БД (slot_pair_sizing); ямлових margin/leverage
+        # більше немає. Показуємо реальний розмір призначеного слота.
+        # Слот може бути прив'язаний, але вимкнений/без ключа — тоді помітка.
         off = "" if ov.get("_active", True) else " (не торгує)"
-        tag = (f"слот {sid} = ямл{off}" if same
-               else f"⚠ слот {sid} ПЕРЕКРИВАЄ{off}")
-        ex_.append(f"  {tag:<28}${mn:g}-{mx:g} x {lo}-{hi}")
-        if not same:
-            ex_.append(f"  {'  → нотіонал слота':<28}"
-                       f"${mn * lo:,.0f}-{mx * hi:,.0f}")
+        ex_.append(f"  {('слот ' + str(sid) + off):<28}${mn:g}-{mx:g} x {lo}-{hi}")
+        ex_.append(f"  {'  → нотіонал':<28}${mn * lo:,.0f}-{mx * hi:,.0f}")
     out.append("<b>🎯 ВИКОНАННЯ</b>\n<pre>" + "\n".join(ex_) + "</pre>")
 
     # ── ВИХІД: пороги ────────────────────────────────────────────────
@@ -583,7 +571,9 @@ def _fmt_pair_config_full(
     # GLOBAL-ONLY / dead knobs — never per-pair, hidden from this dump:
     _HIDE = {("d", "enabled"), ("d", "scan_interval_sec"),
              ("c", "momentum_filter"), ("c", "momentum_tau_sec"),
-             ("c", "momentum_threshold_bps")}
+             ("c", "momentum_threshold_bps"),
+             ("c", "margin_min_usdt"), ("c", "margin_max_usdt"),
+             ("c", "leverage_min"), ("c", "leverage_max")}
     rest = []
     for tag, obj in (("d", d), ("e", ex), ("c", ec)):
         for f in dataclasses.fields(obj):
