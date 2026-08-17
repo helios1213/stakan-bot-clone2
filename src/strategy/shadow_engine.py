@@ -622,9 +622,11 @@ class ShadowEngine:
 
     async def start(self) -> None:
         await self._reload_pair_configs()
-        # start heartbeat loop that warns owner via TG
-        # if no live trades happened in the last N minutes despite live state.
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # NO-TRADES TG watchdog DISABLED 2026-08-17 (оператор: марний алерт —
+        # спамив "NO TRADES · SLOT1 HYPEUSDT" на парах у live-стані, що фактично
+        # не торгують). Цикл слав ЛИШЕ цей алерт, тож просто не стартуємо його.
+        # (container-healthcheck heartbeat у main.py — окремий, не чіпаємо.)
+        self._heartbeat_task = None
         # every 60s log signal funnel counters at INFO
         # level so we can see WHERE signals are dropping (cooldown / lag /
         # latency_drift / max_positions / no_book / etc.) without enabling DEBUG.
