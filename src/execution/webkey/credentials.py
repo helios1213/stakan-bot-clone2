@@ -273,6 +273,11 @@ class WebkeyStore:
                    -- переармиться з фактичного PnL наступним циклом (15 с).
                    recovery_baseline_ts = NULL,
                    recovery_target_usdt = NULL,
+                   -- Новий ключ = чистий старт: ВИМИКАЄМО recovery-режим
+                   -- (не лише базу), інакше монітор переармиться з ~0 PnL
+                   -- свіжого акаунта і ОДРАЗУ спинить слот у shadow.
+                   -- Оператор увімкне recovery вручну, якщо треба.
+                   recovery_mode = 0,
                    updated_at = ?
              WHERE slot_id = ?
             """,
