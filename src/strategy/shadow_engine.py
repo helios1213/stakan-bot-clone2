@@ -729,7 +729,8 @@ class ShadowEngine:
         base_sec = int(os.environ.get("BURST_BASELINE_SEC", "3600"))
         rate_mult = float(os.environ.get("BURST_RATE_MULT", "3.0"))
         conf_min = float(os.environ.get("BURST_CONF_MIN", "0.62"))  # лише для показу
-        pk1000_min = float(os.environ.get("BURST_PK1000_MIN", "2.0"))  # ГОЛОВНИЙ гейт
+        pk1000_min = float(os.environ.get("BURST_PK1000_MIN", "1.0"))  # абс. підлога (сан.)
+        pk1000_mult = float(os.environ.get("BURST_PK1000_MULT", "1.5"))  # відносний гейт (самокалібр.)
         min_trades = int(os.environ.get("BURST_MIN_TRADES", "8"))
         min_base_trades = int(os.environ.get("BURST_MIN_BASE_TRADES", "20"))
         alert_count = int(os.environ.get("BURST_ALERT_COUNT", "1"))
@@ -784,11 +785,16 @@ class ShadowEngine:
                         rpnl = sum((r["net_pnl_usdt"] or 0.0) for r in w)
                         rconf = sum((r["confidence"] or 0.0) for r in w) / n_win
                         rpk10 = sum((r["peak_ticks_at_1000ms"] or 0.0) for r in w) / n_win
-                        # Розрізнювач real-burst vs fake = СПРИЯТЛИВИЙ РУХ (pk1000),
-                        # НЕ confidence. Валідовано причинно на 08-13+08-18: pk1000
-                        # спільний для ОБОХ сплесків (>=2.0), conf — ні (08-18 0.67 /
-                        # 08-13 0.57). rate+PnL — контекст і безпека.
+                        # base pk1000 за годину = НОРМА пари (для самокалібрації)
+                        base_pk10 = max(
+                            sum((r["peak_ticks_at_1000ms"] or 0.0) for r in tr) / len(tr),
+                            0.5)
+                        # Розрізнювач real-burst vs fake = СПРИЯТЛИВИЙ РУХ (pk1000)
+                        # ВІДНОСНО власної норми пари (самокалібрація під БУДЬ-ЯКУ
+                        # пару). Валідовано на 08-13+08-18: rpk >= 1.5x норми ловить
+                        # обидва сплески, відкидає чоп/норму. conf — НЕ розрізнювач.
                         is_burst = (rate >= rate_mult * base_rate and rpnl > 0
+                                    and rpk10 >= pk1000_mult * base_pk10
                                     and rpk10 >= pk1000_min)
                         if is_burst:
                             first = key not in active
