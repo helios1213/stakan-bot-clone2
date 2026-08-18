@@ -728,7 +728,8 @@ class ShadowEngine:
         win_sec = int(os.environ.get("BURST_WIN_SEC", "300"))
         base_sec = int(os.environ.get("BURST_BASELINE_SEC", "3600"))
         rate_mult = float(os.environ.get("BURST_RATE_MULT", "3.0"))
-        conf_min = float(os.environ.get("BURST_CONF_MIN", "0.62"))
+        conf_min = float(os.environ.get("BURST_CONF_MIN", "0.62"))  # лише для показу
+        pk1000_min = float(os.environ.get("BURST_PK1000_MIN", "2.0"))  # ГОЛОВНИЙ гейт
         min_trades = int(os.environ.get("BURST_MIN_TRADES", "8"))
         min_base_trades = int(os.environ.get("BURST_MIN_BASE_TRADES", "20"))
         alert_count = int(os.environ.get("BURST_ALERT_COUNT", "1"))
@@ -757,7 +758,8 @@ class ShadowEngine:
                         continue
                     ph = ",".join("?" * len(live_pairs))
                     rows = await self.live_db.fetchall(
-                        f"SELECT symbol, account_label, opened_at, confidence, net_pnl_usdt "
+                        f"SELECT symbol, account_label, opened_at, confidence, net_pnl_usdt, "
+                        f"       peak_ticks_at_1000ms "
                         f"FROM live_trades WHERE symbol IN ({ph}) AND opened_at >= ? "
                         f"ORDER BY opened_at",
                         tuple(live_pairs) + (now - base_sec,))
@@ -781,8 +783,13 @@ class ShadowEngine:
                         rate = n_win / (win_sec / 60.0)
                         rpnl = sum((r["net_pnl_usdt"] or 0.0) for r in w)
                         rconf = sum((r["confidence"] or 0.0) for r in w) / n_win
+                        rpk10 = sum((r["peak_ticks_at_1000ms"] or 0.0) for r in w) / n_win
+                        # Розрізнювач real-burst vs fake = СПРИЯТЛИВИЙ РУХ (pk1000),
+                        # НЕ confidence. Валідовано причинно на 08-13+08-18: pk1000
+                        # спільний для ОБОХ сплесків (>=2.0), conf — ні (08-18 0.67 /
+                        # 08-13 0.57). rate+PnL — контекст і безпека.
                         is_burst = (rate >= rate_mult * base_rate and rpnl > 0
-                                    and rconf >= conf_min)
+                                    and rpk10 >= pk1000_min)
                         if is_burst:
                             first = key not in active
                             if first or (now - active.get(key, 0)) >= repeat_sec:
@@ -791,9 +798,9 @@ class ShadowEngine:
                                 msg = ("🚨🚨🚨 <b>СПЛЕСК ВОЛАТИЛЬНОСТІ</b>" + lbl + "\n"
                                        "Пара: <code>" + symbol + "</code>\n"
                                        "Частота: <b>%.1f/хв</b> (×%.1f норми)\n"
-                                       "Гепи(conf): <b>%.2f</b> · 5хв PnL: <b>$%+.1f</b>\n"
+                                       "Рух(pk1s): <b>%.1fт</b> · conf %.2f · 5хв PnL: <b>$%+.1f</b>\n"
                                        "👉 <b>МОЖНА ВРУЧНУ ЗБІЛЬШИТИ РОЗМІР</b>"
-                                       % (rate, ratio, rconf, rpnl))
+                                       % (rate, ratio, rpk10, rconf, rpnl))
                                 reps = alert_count if first else 1
                                 for i in range(reps):
                                     try:
