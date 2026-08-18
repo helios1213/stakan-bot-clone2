@@ -679,6 +679,40 @@ class ShadowEngine:
         await asyncio.gather(*self._watcher_tasks.values(), return_exceptions=True)
         logger.info("ShadowEngine stopped")
 
+    async def _send_pushover(self, title: str, message: str) -> None:
+        """Критичний пуш через Pushover HTTP API (повна гучність / обхід тихого
+        режиму, якщо у застосунку увімкнено Critical Alerts). No-op якщо ключі
+        PUSHOVER_TOKEN/PUSHOVER_USER не задані. Ніколи не кидає — лише сповіщення."""
+        import os
+        token = os.environ.get("PUSHOVER_TOKEN", "").strip()
+        user = os.environ.get("PUSHOVER_USER", "").strip()
+        if not token or not user:
+            return
+        priority = int(os.environ.get("PUSHOVER_PRIORITY", "1"))
+        params = {
+            "token": token, "user": user, "title": title[:250],
+            "message": message[:1024], "priority": priority,
+            "sound": os.environ.get("PUSHOVER_SOUND", "siren"),
+        }
+        if priority == 2:  # emergency: repeats until acknowledged
+            params["retry"] = int(os.environ.get("PUSHOVER_RETRY", "60"))
+            params["expire"] = int(os.environ.get("PUSHOVER_EXPIRE", "3600"))
+
+        def _post():
+            import urllib.request, urllib.parse
+            data = urllib.parse.urlencode(params).encode()
+            req = urllib.request.Request(
+                "https://api.pushover.net/1/messages.json", data=data)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status
+
+        try:
+            loop = asyncio.get_running_loop()
+            status = await loop.run_in_executor(None, _post)
+            logger.info("[BURST] pushover надіслано (HTTP %s)", status)
+        except Exception:
+            logger.exception("[BURST] pushover send failed")
+
     async def _burst_alert_loop(self) -> None:
         """Детектор сплеску волатильності → Telegram-алерт. РОЗМІР НЕ ЧІПАЄ —
         лише сповіщає, щоб оператор сам збільшив розмір. Валідовано причинно на
@@ -697,8 +731,8 @@ class ShadowEngine:
         conf_min = float(os.environ.get("BURST_CONF_MIN", "0.62"))
         min_trades = int(os.environ.get("BURST_MIN_TRADES", "8"))
         min_base_trades = int(os.environ.get("BURST_MIN_BASE_TRADES", "20"))
-        alert_count = int(os.environ.get("BURST_ALERT_COUNT", "3"))
-        repeat_sec = int(os.environ.get("BURST_REPEAT_SEC", "120"))
+        alert_count = int(os.environ.get("BURST_ALERT_COUNT", "1"))
+        repeat_sec = int(os.environ.get("BURST_REPEAT_SEC", "600"))
         logger.info("[BURST] детектор запущено: rate>=%.1fx/год-медіана, conf>=%.2f, "
                     "win=%ds, scan=%ds, spam=%d", rate_mult, conf_min, win_sec,
                     scan_sec, alert_count)
@@ -769,6 +803,13 @@ class ShadowEngine:
                                     except Exception:
                                         logger.exception("[BURST] send failed %s", symbol)
                                     await asyncio.sleep(0.3)
+                                if first:
+                                    await self._send_pushover(
+                                        "🚨 СПЛЕСК " + symbol,
+                                        "%s%s частота %.1f/хв (×%.1f), conf %.2f, "
+                                        "5хв PnL $%+.1f — можна збільшити розмір"
+                                        % (symbol, ("/" + label) if label else "",
+                                           rate, ratio, rconf, rpnl))
                                 active[key] = now
                                 logger.info("[BURST] %s%s ON rate=%.1f/min (x%.1f) conf=%.2f "
                                             "pnl=$%.1f", symbol, ("/" + label) if label else "",
