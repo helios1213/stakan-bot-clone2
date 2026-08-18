@@ -627,6 +627,9 @@ class ShadowEngine:
         # не торгують). Цикл слав ЛИШЕ цей алерт, тож просто не стартуємо його.
         # (container-healthcheck heartbeat у main.py — окремий, не чіпаємо.)
         self._heartbeat_task = None
+        # Детектор СПЛЕСКУ ВОЛАТИЛЬНОСТІ → Telegram-алерт (оператор сам
+        # збільшує розмір). РОЗМІР/ОРДЕРИ НЕ ЧІПАЄ. Валідовано на 08-13/08-18.
+        self._burst_alert_task = asyncio.create_task(self._burst_alert_loop())
         # every 60s log signal funnel counters at INFO
         # level so we can see WHERE signals are dropping (cooldown / lag /
         # latency_drift / max_positions / no_book / etc.) without enabling DEBUG.
@@ -641,6 +644,12 @@ class ShadowEngine:
     async def stop(self) -> None:
         self._stop.set()
         # Cancel heartbeat first
+        if getattr(self, "_burst_alert_task", None) is not None:
+            self._burst_alert_task.cancel()
+            try:
+                await self._burst_alert_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if hasattr(self, "_heartbeat_task") and self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:
@@ -669,6 +678,121 @@ class ShadowEngine:
             task.cancel()
         await asyncio.gather(*self._watcher_tasks.values(), return_exceptions=True)
         logger.info("ShadowEngine stopped")
+
+    async def _burst_alert_loop(self) -> None:
+        """Детектор сплеску волатильності → Telegram-алерт. РОЗМІР НЕ ЧІПАЄ —
+        лише сповіщає, щоб оператор сам збільшив розмір. Валідовано причинно на
+        08-13 (шумний чоп — коректно проігноровано) та 08-18 (+$450 — зловлено
+        93%): сплеск = частота угод по live-парі >= RATE_MULT× її норми (медіана
+        угод/хв за годину) І поточний rolling PnL(5хв) > 0 І середня confidence
+        >= CONF_MIN. Усе через env (BURST_*)."""
+        import os, statistics
+        if os.environ.get("BURST_ALERT_ENABLED", "1") != "1":
+            logger.info("[BURST] детектор вимкнено (BURST_ALERT_ENABLED!=1)")
+            return
+        scan_sec = int(os.environ.get("BURST_SCAN_SEC", "30"))
+        win_sec = int(os.environ.get("BURST_WIN_SEC", "300"))
+        base_sec = int(os.environ.get("BURST_BASELINE_SEC", "3600"))
+        rate_mult = float(os.environ.get("BURST_RATE_MULT", "3.0"))
+        conf_min = float(os.environ.get("BURST_CONF_MIN", "0.62"))
+        min_trades = int(os.environ.get("BURST_MIN_TRADES", "8"))
+        min_base_trades = int(os.environ.get("BURST_MIN_BASE_TRADES", "20"))
+        alert_count = int(os.environ.get("BURST_ALERT_COUNT", "3"))
+        repeat_sec = int(os.environ.get("BURST_REPEAT_SEC", "120"))
+        logger.info("[BURST] детектор запущено: rate>=%.1fx/год-медіана, conf>=%.2f, "
+                    "win=%ds, scan=%ds, spam=%d", rate_mult, conf_min, win_sec,
+                    scan_sec, alert_count)
+        active: dict = {}   # (symbol,label) -> last alert ts, поки в сплеску
+        try:
+            while not self._stop.is_set():
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=scan_sec)
+                    return  # _stop set -> exit
+                except asyncio.TimeoutError:
+                    pass
+                if self.alerts is None or self.live_db is None or self.state_manager is None:
+                    continue
+                try:
+                    now = int(time.time())
+                    try:
+                        live_pairs = [ps.symbol for ps in self.state_manager.states_by_status("live")]
+                    except Exception:
+                        continue
+                    if not live_pairs:
+                        active.clear()
+                        continue
+                    ph = ",".join("?" * len(live_pairs))
+                    rows = await self.live_db.fetchall(
+                        f"SELECT symbol, account_label, opened_at, confidence, net_pnl_usdt "
+                        f"FROM live_trades WHERE symbol IN ({ph}) AND opened_at >= ? "
+                        f"ORDER BY opened_at",
+                        tuple(live_pairs) + (now - base_sec,))
+                    by_key: dict = {}
+                    for r in rows or []:
+                        by_key.setdefault((r["symbol"], r["account_label"]), []).append(r)
+                    seen = set()
+                    for key, tr in by_key.items():
+                        seen.add(key)
+                        symbol, label = key
+                        if len(tr) < min_base_trades:
+                            continue
+                        mins: dict = {}
+                        for r in tr:
+                            mins[r["opened_at"] // 60] = mins.get(r["opened_at"] // 60, 0) + 1
+                        base_rate = statistics.median(list(mins.values())) if mins else 0
+                        w = [r for r in tr if r["opened_at"] >= now - win_sec]
+                        n_win = len(w)
+                        if n_win < min_trades or base_rate <= 0:
+                            continue
+                        rate = n_win / (win_sec / 60.0)
+                        rpnl = sum((r["net_pnl_usdt"] or 0.0) for r in w)
+                        rconf = sum((r["confidence"] or 0.0) for r in w) / n_win
+                        is_burst = (rate >= rate_mult * base_rate and rpnl > 0
+                                    and rconf >= conf_min)
+                        if is_burst:
+                            first = key not in active
+                            if first or (now - active.get(key, 0)) >= repeat_sec:
+                                ratio = rate / base_rate if base_rate else 0
+                                lbl = (" · <b>" + label.upper() + "</b>") if label else ""
+                                msg = ("🚨🚨🚨 <b>СПЛЕСК ВОЛАТИЛЬНОСТІ</b>" + lbl + "\n"
+                                       "Пара: <code>" + symbol + "</code>\n"
+                                       "Частота: <b>%.1f/хв</b> (×%.1f норми)\n"
+                                       "Гепи(conf): <b>%.2f</b> · 5хв PnL: <b>$%+.1f</b>\n"
+                                       "👉 <b>МОЖНА ВРУЧНУ ЗБІЛЬШИТИ РОЗМІР</b>"
+                                       % (rate, ratio, rconf, rpnl))
+                                reps = alert_count if first else 1
+                                for i in range(reps):
+                                    try:
+                                        await self.alerts.send(
+                                            msg, category="burst:%s:%s:%d" % (symbol, label, i),
+                                            throttle_sec=0, suppress_during_quiet=False)
+                                    except Exception:
+                                        logger.exception("[BURST] send failed %s", symbol)
+                                    await asyncio.sleep(0.3)
+                                active[key] = now
+                                logger.info("[BURST] %s%s ON rate=%.1f/min (x%.1f) conf=%.2f "
+                                            "pnl=$%.1f", symbol, ("/" + label) if label else "",
+                                            rate, ratio, rconf, rpnl)
+                        else:
+                            if key in active:
+                                try:
+                                    await self.alerts.send(
+                                        "😌 Сплеск <code>" + symbol + "</code> згас — "
+                                        "можна повернути звичайний розмір.",
+                                        category="burst_end:%s:%s" % (symbol, label),
+                                        throttle_sec=0, suppress_during_quiet=False)
+                                except Exception:
+                                    pass
+                                logger.info("[BURST] %s%s OFF", symbol,
+                                            ("/" + label) if label else "")
+                                del active[key]
+                    for k in list(active.keys()):
+                        if k not in seen:
+                            del active[k]
+                except Exception:
+                    logger.exception("[BURST] loop iteration failed")
+        except asyncio.CancelledError:
+            return
 
     async def _heartbeat_loop(self) -> None:
         """
