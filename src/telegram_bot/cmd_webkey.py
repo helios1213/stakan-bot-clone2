@@ -111,17 +111,19 @@ def _client_pool(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _md_escape(s: str) -> str:
-    """Escape MarkdownV1 special chars in user-provided strings."""
+    """Neutralise the only char that breaks a Markdown code span. Every
+    call-site wraps the result in backticks; inside a code span all chars are
+    literal except the backtick, so only it needs handling. Legacy Markdown
+    has no working backslash-escape, so the old per-char backslash approach
+    broke parsing on labels like MEX_901 (chr(96)=backtick -> chr(700)=ʼ)."""
     if not s:
         return ""
-    for ch in ("_", "*", "`", "["):
-        s = s.replace(ch, f"\\{ch}")
-    return s
+    return s.replace(chr(96), chr(700))
 
 
 def _slot_line(s: WebkeySlot) -> str:
     """One-line summary for the /webkey overview."""
-    label = f" — _{_md_escape(s.label)}_" if s.label else ""
+    label = f" — `{_md_escape(s.label)}`" if s.label else ""
     head = f"*Slot {s.slot_id}*{label}"
 
     if s.is_empty:
@@ -154,7 +156,7 @@ def _fmt_slot_detail(s: WebkeySlot) -> str:
 
     lines = [f"🔑 *Slot {s.slot_id}*"]
     if s.label:
-        lines.append(f"_{_md_escape(s.label)}_")
+        lines.append(f"`{_md_escape(s.label)}`")
     lines.append("")
     lines.append(f"webkey:    `{s.masked_webkey()}`")
     # "enabled" = the slot's LIVE toggle (live_enabled), i.e. the enable/disable
@@ -308,7 +310,7 @@ async def cmd_webkey_label(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     label = " ".join(args[1:]).strip() or None
     await _store(context).set_label(n, label)
     if label:
-        await update.message.reply_text(f"✅ Slot {n} label: _{_md_escape(label)}_",
+        await update.message.reply_text(f"✅ Slot {n} label: `{_md_escape(label)}`",
                                          parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text(f"✅ Slot {n}: label cleared")
