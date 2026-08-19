@@ -119,12 +119,18 @@ def accounts() -> list[dict]:
         _lc = _ro(LIVE_DB)
         try:
             _cut = int(time.time()) - 6 * 3600
+            # МЕДІАНА, не AVG: одна повільна угода (напр. 4009ms fill-poll)
+            # роздувала середнє до ~1149ms, хоча типова затримка ~180ms.
+            _vals = {}
             for _lr in _lc.execute(
-                "SELECT account_label, AVG(real_entry_latency_ms) al FROM live_trades "
-                "WHERE opened_at>=? AND real_entry_latency_ms>0 GROUP BY account_label",
-                (_cut,)):
-                if _lr["al"]:
-                    _lat[_lr["account_label"]] = int(round(_lr["al"]))
+                "SELECT account_label, real_entry_latency_ms v FROM live_trades "
+                "WHERE opened_at>=? AND real_entry_latency_ms>0 "
+                "ORDER BY real_entry_latency_ms", (_cut,)):
+                _vals.setdefault(_lr["account_label"], []).append(_lr["v"])
+            for _al, _vs in _vals.items():
+                _n = len(_vs)  # _vs уже відсортований (ORDER BY)
+                _med = _vs[_n // 2] if _n % 2 else (_vs[_n // 2 - 1] + _vs[_n // 2]) / 2
+                _lat[_al] = int(round(_med))
         finally:
             _lc.close()
     except Exception:
