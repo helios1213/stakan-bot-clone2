@@ -274,10 +274,11 @@ async def slot_balance_refresh_loop(webkey_store, webkey_client_pool, interval_s
                         )
                         if isinstance(bal, dict) else None
                     )
-                    await webkey_store.update_health(
+                    await webkey_store.refresh_health(
                         slot_id=s.slot_id,
                         latency_ms=report.get("latency_ms"),
                         balance_usdt=balance_str,
+                        valid=bool(report.get("valid")),
                         error=None if report.get("valid") else (report.get("error") or "n/a"),
                     )
                 except Exception:

@@ -238,6 +238,10 @@ else:
     )
 
 
+_PANEL_KEEP = object()   # benign no-fill: last_error не чіпати
+_PANEL_UNSET = object()  # dedup: ще нічого не писали
+
+
 def classify_live_fail(err_msg: str, raw: str, sym: str) -> dict:
     """Класифікація невдалого відкриття live-позиції → як про це говорити.
 
@@ -1839,6 +1843,28 @@ class ShadowEngine:
                         retry_delay_ms=cfg.ioc_attempt_interval_ms,  # per-pair (was global env IOC_RETRY_DELAY_MS)
                         t_signal_created=t_sig,
                     )
+                # Видимість у панелі: писати РЕАЛЬНУ причину відмови
+                # відкриття (api_error_2006 leverage, throttle 9082/10014,
+                # 510, …) у колонку ПОМИЛКА і чистити при успіху. Рутинні
+                # no-fill (ioc_expired_no_fill) НЕ показуємо. Дедуп на слот,
+                # щоб шторм однакових відмов не бив по БД. ⚠️-префікс не дає
+                # 60с-балансному циклу стерти це (див. refresh_health).
+                try:
+                    _pcache = self.__dict__.setdefault("_panel_err_cache", {})
+                    _em = live_result.error_msg or ""
+                    if live_result.success:
+                        _newerr = None
+                    elif _em.startswith("api_error_"):
+                        _newerr = f"⚠️ {_em}"
+                    else:
+                        _newerr = _PANEL_KEEP  # benign no-fill → лишити як є
+                    if _newerr is not _PANEL_KEEP and _pcache.get(sid, _PANEL_UNSET) != _newerr:
+                        _pcache[sid] = _newerr
+                        _ws = getattr(executor, "webkey_store", None)
+                        if _ws is not None:
+                            await _ws.set_slot_error(sid, _newerr)
+                except Exception:
+                    pass
                 if live_result.success:
                     # MEASUREMENT: gap since this slot's previous accepted open.
                     # This is the number that reveals the imposed ceiling — read

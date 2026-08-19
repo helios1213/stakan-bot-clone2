@@ -363,6 +363,37 @@ class WebkeyStore:
             (error, int(time.time()), slot_id),
         )
 
+    async def refresh_health(self, slot_id: int, latency_ms: int | None,
+                             balance_usdt: str | None, valid: bool,
+                             error: str | None = None) -> None:
+        """Періодичний health-refresh (balance/latency). Політика last_error:
+        VALID перевірка чистить ЛИШЕ помилки звʼязку — вона НЕ стирає
+        помилки виконавця (⚠️-префікс: throttle, leverage-reject 2006, KYC),
+        які зникають самі при наступному успішному відкритті. INVALID —
+        ставить помилку звʼязку."""
+        _validate_slot_id(slot_id)
+        now = int(time.time())
+        if valid:
+            row = await self.db.fetchone(
+                "SELECT last_error FROM webkey_slots WHERE slot_id=?", (slot_id,))
+            cur = (row["last_error"] if row else None) or ""
+            if cur.startswith("⚠️"):
+                # executor-owned помилка — НЕ чіпати
+                await self.db.execute(
+                    "UPDATE webkey_slots SET last_health_check=?, last_latency_ms=?, "
+                    "last_balance_usdt=?, updated_at=? WHERE slot_id=?",
+                    (now, latency_ms, balance_usdt, now, slot_id))
+            else:
+                await self.db.execute(
+                    "UPDATE webkey_slots SET last_health_check=?, last_latency_ms=?, "
+                    "last_balance_usdt=?, last_error=NULL, updated_at=? WHERE slot_id=?",
+                    (now, latency_ms, balance_usdt, now, slot_id))
+        else:
+            await self.db.execute(
+                "UPDATE webkey_slots SET last_health_check=?, last_latency_ms=?, "
+                "last_balance_usdt=?, last_error=?, updated_at=? WHERE slot_id=?",
+                (now, latency_ms, balance_usdt, error, now, slot_id))
+
     # ---- delete ----
     async def delete(self, slot_id: int) -> bool:
         """Wipe webkey/visitor/proxy/health from a slot but keep the row.
