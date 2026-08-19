@@ -149,4 +149,11 @@ class SignalWriter:
             await self.db.conn.commit()
             self.total_written += len(batch)
         except Exception as e:
+            # ROLLBACK обовʼязково: інакше executemany лишає ВІДКРИТУ транзакцію
+            # на спільному зʼєднанні -> усі подальші read'и застигають на старому
+            # снапшоті до рестарту (баг привид-webkey у /webkey). Батч уже втрачено.
+            try:
+                await self.db.conn.rollback()
+            except Exception:
+                pass
             logger.exception("Signal batch write failed (%d signals lost): %s", len(batch), e)

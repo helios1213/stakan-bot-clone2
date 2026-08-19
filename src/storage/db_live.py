@@ -151,10 +151,17 @@ class LiveDatabase:
         await self.conn.commit()
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Row | None:
+        # Flush any orphaned write txn so this read gets a FRESH WAL snapshot.
+        # Else an uncommitted txn from a prior write freezes this connection's
+        # snapshot and reads go stale until restart (the /webkey ghost bug).
+        if self.conn.in_transaction:
+            await self.conn.commit()
         async with self.conn.execute(sql, params) as cursor:
             return await cursor.fetchone()
 
     async def fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[aiosqlite.Row]:
+        if self.conn.in_transaction:
+            await self.conn.commit()
         async with self.conn.execute(sql, params) as cursor:
             return list(await cursor.fetchall())
 
