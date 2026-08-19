@@ -736,7 +736,11 @@ def remove_account(slot_id: int) -> bool:
             "UPDATE webkey_slots SET webkey_blob=NULL, visitor_blob=NULL, proxy_blob=NULL, "
             "enabled=0, live_enabled=0, assigned_pair=NULL, last_health_check=NULL, "
             "last_latency_ms=NULL, last_balance_usdt=NULL, last_error=NULL, "
-            "webkey_refreshed_at=NULL, label=NULL, updated_at=? WHERE slot_id=?",
+            "webkey_refreshed_at=NULL, label=NULL, "
+            # Повне очищення слота від засувок/помилок при видаленні:
+            "open_throttle_until=NULL, recovery_mode=0, recovery_baseline_ts=NULL, "
+            "recovery_target_usdt=NULL, soft_start_until=NULL, soft_start_max_per_hour=NULL, "
+            "updated_at=? WHERE slot_id=?",
             (int(time.time()), slot_id),
         )
         # Auto-shadow the displaced pair (unless a sibling live slot still trades

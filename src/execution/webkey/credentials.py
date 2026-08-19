@@ -390,6 +390,13 @@ class WebkeyStore:
                    -- Leaving it behind made the next webkey inherit the
                    -- previous account's six-hour throttle.
                    open_throttle_until=NULL,
+                   -- Повне очищення слота від будь-яких засувок/помилок:
+                   -- recovery + soft_start (last_error/open_throttle вже вище).
+                   recovery_mode=0,
+                   recovery_baseline_ts=NULL,
+                   recovery_target_usdt=NULL,
+                   soft_start_until=NULL,
+                   soft_start_max_per_hour=NULL,
                    updated_at=?
              WHERE slot_id=?
             """,
