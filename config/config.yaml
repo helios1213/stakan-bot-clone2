@@ -106,8 +106,6 @@ walls:
 # ---- Shadow execution ----
 shadow:
   enabled: true
-  margin_per_trade_usdt: 25
-  default_leverage: 100                # actual leverage capped by per-pair max from MEXC
 
   # Slippage simulation — shadow IOC sleep window calibrated to live PENGU
   # submit-latency p10..p90 (2026-06, from live_trades.latency_submit_ms).

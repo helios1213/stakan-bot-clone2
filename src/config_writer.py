@@ -83,6 +83,13 @@ def set_pair_execution(symbol: str, **kwargs) -> bool:
     block (caller should treat that as 'pair not configured')."""
     if not kwargs:
         return False
+    # ЄДИНЕ ДЖЕРЕЛО РОЗМІРУ = slot_pair_sizing (DB оверайд). Сайзинг
+    # НІКОЛИ не пишеться в yaml — відкидаємо margin_/leverage_ ключі
+    # (Ship 2). Якщо лишились лише сайзинг-ключі — нічого не пишемо.
+    kwargs = {k: v for k, v in kwargs.items()
+              if not (k.startswith("margin_") or k.startswith("leverage_"))}
+    if not kwargs:
+        return False
     path = os.path.join(CONFIG_DIR, "pairs", f"{symbol}.yaml")
     if not os.path.exists(path):
         return False

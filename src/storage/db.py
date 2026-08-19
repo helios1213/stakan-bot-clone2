@@ -608,12 +608,13 @@ async def init_db(db_path: str) -> None:
         # live_pool). UPDATE webkey_slots SET slot_margin_min_usdt=... запишеться
         # чисто, переживе рестарт і не змінить розмір позиції.
         # Розмір міняти ТІЛЬКИ через slot_pair_sizing (Telegram/панель).
-        await _add_columns_idempotent(db, "webkey_slots", [
-            ("slot_margin_min_usdt",  "REAL"),
-            ("slot_margin_max_usdt",  "REAL"),
-            ("slot_leverage_min",     "INTEGER"),
-            ("slot_leverage_max",     "INTEGER"),
-        ])
+        # 2026-08-19 Ship 2: slot_margin_*/slot_leverage_* ВИДАЛЕНО. Були
+        # МЕРТВІ (ніколи не читались; сайзинг = slot_pair_sizing через
+        # live_pool) і FOOTGUN — імена збігались із живими ключами slot_cfg,
+        # тож сирий UPDATE тут писався чисто, але розмір НЕ міняв. Дропаємо.
+        for _dead in ("slot_margin_min_usdt", "slot_margin_max_usdt",
+                      "slot_leverage_min", "slot_leverage_max"):
+            await _drop_column_idempotent(db, "webkey_slots", _dead)
         # 2026-07-28: the soft-start warm-up columns were removed. The premise
         # — that MEXC restricts accounts which open too fast in their first day
         # — did not survive measurement across 11 key installations: at first
