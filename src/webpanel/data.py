@@ -448,7 +448,7 @@ def set_slot_pair_sizing(symbol: str, slot_id: int, **kwargs) -> dict:
         if _k.startswith("margin_") and not (0 < _v <= 100000):
             return {"ok": False, "error": f"{_k}: маржа поза межами 0–100000"}
         if _k.startswith("leverage_") and not (1 <= _v <= 500):
-            return {"ok": False, "error": f"{_k}: плече поза межами 1–125"}
+            return {"ok": False, "error": f"{_k}: плече поза межами 1–500"}
     now = int(time.time())
     conn = _rw(DB)
     try:
