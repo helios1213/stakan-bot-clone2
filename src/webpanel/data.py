@@ -1271,13 +1271,9 @@ def pairs() -> list[dict]:
 
 @_rw_retry
 def set_pair_config(symbol: str, **kwargs) -> None:
-    # mode = operational state → DB; margin/leverage = static config → pair YAML
-    # (single source of truth, read by ConfigLoader).
-    sizing = {k: v for k, v in kwargs.items()
-              if k in ("margin_min_usdt", "margin_max_usdt", "leverage_min", "leverage_max")}
-    if sizing:
-        from src.config_writer import set_pair_execution
-        set_pair_execution(symbol, **sizing)
+    # Розмір (маржа/плече) — ТІЛЬКИ через slot_pair_sizing (set_slot_pair_sizing).
+    # Тут лишається лише операційний стан (mode). Сайзинг у yaml НЕ пишемо
+    # (єдине джерело = DB-оверайд; Ship 2).
     if "mode" in kwargs:
         if kwargs["mode"] == "live":
             # Go-live is NOT a webpanel action — it needs a coordinated state
