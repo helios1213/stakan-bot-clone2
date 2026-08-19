@@ -111,14 +111,33 @@ def accounts() -> list[dict]:
             return cast(v) if v not in (None, "") else None
         except (ValueError, TypeError):
             return None
+    # #3: реальна затримка ВІДПРАВКИ ордера (/order/create) з live_trades
+    # (account_label = "slotN"), сер. за 6 год. Health-ping (last_latency_ms)
+    # лишаємо як fallback.
+    _lat = {}
+    try:
+        _lc = _ro(LIVE_DB)
+        try:
+            _cut = int(time.time()) - 6 * 3600
+            for _lr in _lc.execute(
+                "SELECT account_label, AVG(real_entry_latency_ms) al FROM live_trades "
+                "WHERE opened_at>=? AND real_entry_latency_ms>0 GROUP BY account_label",
+                (_cut,)):
+                if _lr["al"]:
+                    _lat[_lr["account_label"]] = int(round(_lr["al"]))
+        finally:
+            _lc.close()
+    except Exception:
+        pass
     out = []
     for r in rows:
         out.append({
-            "slot_id": r["slot_id"], "label": r["label"] or f"slot {r['slot_id']}",
+            "slot_id": r["slot_id"], "label": r["label"],  # реальна мітка (порожньо=нема); дефолт-хінт у UI (placeholder)
             "enabled": bool(r["enabled"]), "live_enabled": bool(r["live_enabled"]),
             "assigned_pair": r["assigned_pair"],
             "balance_usdt": _num(r["last_balance_usdt"], float),
             "latency_ms": _num(r["last_latency_ms"], int),
+            "order_latency_ms": _lat.get(f"slot{r['slot_id']}"),
             "last_health_check": r["last_health_check"],
             "last_error": r["last_error"], "has_key": bool(r["has_key"]),
             "has_proxy": bool(r["has_proxy"]),
@@ -428,7 +447,7 @@ def set_slot_pair_sizing(symbol: str, slot_id: int, **kwargs) -> dict:
             return {"ok": False, "error": f"{_k}: не число (NaN/inf)"}
         if _k.startswith("margin_") and not (0 < _v <= 100000):
             return {"ok": False, "error": f"{_k}: маржа поза межами 0–100000"}
-        if _k.startswith("leverage_") and not (1 <= _v <= 125):
+        if _k.startswith("leverage_") and not (1 <= _v <= 500):
             return {"ok": False, "error": f"{_k}: плече поза межами 1–125"}
     now = int(time.time())
     conn = _rw(DB)

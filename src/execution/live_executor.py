@@ -838,6 +838,16 @@ class LiveExecutor:
         if code != 0:
             self.opens_failed += 1
             self.last_error = f"api_error_{code}: {msg}"
+            # #4: персист причини стопу (throttle/delay коди) у БД, щоб
+            # панель показувала ЧОМУ opens стали. Account-level (risk-control
+            # текст) персиститься нижче; health-check із error=None очистить,
+            # коли акаунт відновиться.
+            if str(code) in OPEN_FREQ_CODES and self.webkey_store is not None:
+                try:
+                    await self.webkey_store.set_slot_error(
+                        self.slot_id, f"⚠️ order throttled: api_error_{code} ({msg})")
+                except Exception:
+                    pass
 
             # Slot-level error detection (face verification, risk control, etc.)
             # These errors mean the entire slot is unusable until resolved on MEXC
@@ -1043,6 +1053,12 @@ class LiveExecutor:
                 logger.exception(
                     "fee guard: failed to disable slot %d in store", self.slot_id
                 )
+            try:
+                await self.webkey_store.set_slot_error(
+                    self.slot_id,
+                    f"⚠️ fee guard: MEXC стягнула комісію ${fee_usdt:.6f} (0% премісу зламано)")
+            except Exception:
+                logger.exception("fee guard: failed to persist last_error slot %d", self.slot_id)
             # Durably flip the pair to SHADOW. live_enabled alone leaves the
             # pair stuck in pair_states.state='live' (the REAL live determinant
             # PairStateManager.is_in_live checks) — so without this the alert's

@@ -354,6 +354,15 @@ class WebkeyStore:
             (int(time.time()), slot_id),
         )
 
+    async def set_slot_error(self, slot_id: int, error: str | None) -> None:
+        """Persist ONLY last_error (keeps latency/balance) — щоб панель
+        показувала ПРИЧИНУ стопу слота (fee-guard, throttle тощо)."""
+        _validate_slot_id(slot_id)
+        await self.db.execute(
+            "UPDATE webkey_slots SET last_error=?, updated_at=? WHERE slot_id=?",
+            (error, int(time.time()), slot_id),
+        )
+
     # ---- delete ----
     async def delete(self, slot_id: int) -> bool:
         """Wipe webkey/visitor/proxy/health from a slot but keep the row.
