@@ -739,7 +739,7 @@ def remove_account(slot_id: int) -> bool:
             "webkey_refreshed_at=NULL, label=NULL, "
             # Повне очищення слота від засувок/помилок при видаленні:
             "open_throttle_until=NULL, recovery_mode=0, recovery_baseline_ts=NULL, "
-            "recovery_target_usdt=NULL, soft_start_until=NULL, soft_start_max_per_hour=NULL, "
+            "recovery_target_usdt=NULL, "
             "updated_at=? WHERE slot_id=?",
             (int(time.time()), slot_id),
         )
