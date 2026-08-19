@@ -683,6 +683,36 @@ class ShadowEngine:
         await asyncio.gather(*self._watcher_tasks.values(), return_exceptions=True)
         logger.info("ShadowEngine stopped")
 
+    async def _alert_missing_sizing(self, symbol: str, slot_id: int) -> None:
+        """(slot,pair) без sizing-оверайду НЕ торгує live (єдине джерело =
+        slot_pair_sizing). Гучний, але тротлений алерт + панельна помилка."""
+        logger.warning(
+            "[NO SIZING] slot=%d %s has NO slot_pair_sizing override — NOT "
+            "trading live (single source of truth). Set margin/leverage in the "
+            "panel / Telegram wizard.", slot_id, symbol,
+        )
+        _msg = f"⚠️ немає sizing-оверайду для {symbol} — не торгую live"
+        # Панель: показати причину (⚠️-префікс тримається health-циклом; дедуп
+        # тим самим _panel_err_cache, ключ = slot_id, що й success-clear).
+        try:
+            _pcache = self.__dict__.setdefault("_panel_err_cache", {})
+            _ws = getattr(self.live_pool, "webkey_store", None)
+            if _ws is not None and _pcache.get(slot_id) != _msg:
+                _pcache[slot_id] = _msg
+                await _ws.set_slot_error(slot_id, _msg)
+        except Exception:
+            pass
+        if self.alerts is not None:
+            try:
+                await self.alerts.send(
+                    text=(f"⚠️ <b>Немає sizing-оверайду</b> · <b>SLOT{slot_id}</b>\n"
+                          f"Пара <code>{symbol}</code> НЕ торгує live — постав "
+                          f"маржу/плече (slot_pair_sizing = єдине джерело)."),
+                    category=f"nosize_{symbol}_slot{slot_id}", throttle_sec=1800,
+                )
+            except Exception:
+                logger.exception("no-sizing alert failed")
+
     async def _send_pushover(self, title: str, message: str) -> None:
         """Критичний пуш через Pushover HTTP API (повна гучність / обхід тихого
         режиму, якщо у застосунку увімкнено Critical Alerts). No-op якщо ключі
@@ -1766,28 +1796,24 @@ class ShadowEngine:
                         _skip_reason, _skip_sid = "no_slot_config", sid
                     continue
 
-                # Sizing (margin/leverage) comes from the SAME yaml source as
-                # shadow (cfg = PairExecConfig from ConfigLoader) — single source
-                # of truth. Randomized per trade within the configured range.
-                # Per-slot sizing OVERRIDE (slot_cfg) wins over the pair YAML —
-                # lets two accounts on the same pair use different margin/leverage.
-                # None fields fall through to cfg (exact prior behaviour).
+                # ЄДИНЕ ДЖЕРЕЛО РОЗМІРУ = slot_pair_sizing (оверайд на slot,pair).
+                # НЕМАЄ код/yaml-дефолту: якщо на цей (slot,pair) немає оверайду
+                # (або будь-яке з 4 полів NULL) — пара НЕ відкриває live: skip +
+                # гучний тротлений алерт. Раніше тут був fallback на cfg.* (код-
+                # дефолт 25/30 × 45/50), який мовчки сайзив пари без оверайду.
                 _s_mmin = slot_cfg.get("slot_margin_min_usdt")
                 _s_mmax = slot_cfg.get("slot_margin_max_usdt")
                 _s_lmin = slot_cfg.get("slot_leverage_min")
                 _s_lmax = slot_cfg.get("slot_leverage_max")
-                # sorted() so an inverted override (min>max) reaching the DB via a
-                # raw edit degrades gracefully instead of random.randint raising
-                # ValueError and silently dropping the open. The Telegram wizard
-                # already validates min<=max; this is defence in depth.
-                _m_lo, _m_hi = sorted((
-                    _s_mmin if _s_mmin is not None else cfg.margin_min_usdt,
-                    _s_mmax if _s_mmax is not None else cfg.margin_max_usdt,
-                ))
-                _l_lo, _l_hi = sorted((
-                    _s_lmin if _s_lmin is not None else cfg.leverage_min,
-                    _s_lmax if _s_lmax is not None else cfg.leverage_max,
-                ))
+                if None in (_s_mmin, _s_mmax, _s_lmin, _s_lmax):
+                    if _skip_reason is None:
+                        _skip_reason, _skip_sid = "no_sizing_override", sid
+                    await self._alert_missing_sizing(signal.symbol, sid)
+                    continue
+                # sorted() = захист від інвертованого (min>max) сирого едиту:
+                # random.randint не впаде, відкрив не зникне мовчки.
+                _m_lo, _m_hi = sorted((_s_mmin, _s_mmax))
+                _l_lo, _l_hi = sorted((_s_lmin, _s_lmax))
                 live_margin = round(random.uniform(_m_lo, _m_hi), 2)
                 live_leverage = random.randint(_l_lo, _l_hi)
                 live_notional = live_margin * live_leverage
