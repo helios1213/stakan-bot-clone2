@@ -31,6 +31,7 @@ from .futures_soft_start import FuturesSoftStart, FuturesSoftStartConfig, live_a
 from .soft_start_budget import (DEFAULT_MAX_COST_USDT, MIN_VIABLE_BALANCE_USDT,
                                 SoftStartBudget, scale_spot_config)
 from .soft_start_campaign import DEFAULT_CAMPAIGN_DAYS, SoftStartCampaign
+from .soft_start_reporter import SoftStartReporter
 from .spot_soft_start import SoftStartConfig, SpotSoftStart
 from .webkey.spot_client import SpotWebClient
 
@@ -50,7 +51,8 @@ class SlotWarmer:
     def __init__(self, slot_id: int, webkey: str, client, universe: list[str],
                  *, dry_run: bool, data_dir: str = "/app/data",
                  max_cost_usdt: float = DEFAULT_MAX_COST_USDT,
-                 campaign_days: int = DEFAULT_CAMPAIGN_DAYS) -> None:
+                 campaign_days: int = DEFAULT_CAMPAIGN_DAYS,
+                 alerts=None) -> None:
         self.slot_id = slot_id
         self.client = client
         self.universe = universe
@@ -67,6 +69,10 @@ class SlotWarmer:
         self.spot_client = SpotWebClient(webkey, dry_run=dry_run)
         self.spot: SpotSoftStart | None = None
         self.futures: FuturesSoftStart | None = None
+        # Live status message in Telegram. None disables reporting entirely —
+        # warming must work with or without it.
+        self.reporter = (SoftStartReporter(alerts, slot_id, dry_run)
+                         if alerts is not None else None)
 
     async def _read_balances(self) -> tuple[float, float]:
         """(spot_usdt, futures_usdt). A read failure returns 0.0, and 0.0 means
@@ -125,11 +131,61 @@ class SlotWarmer:
                                "— that half stays idle", self.slot_id, name, bal,
                                MIN_VIABLE_BALANCE_USDT)
 
-        self.campaign.start_if_new()
+        if self.campaign.start_if_new() and self.reporter is not None:
+            try:
+                await self.reporter.campaign_started(self.campaign.state.days,
+                                                     **self._status())
+            except Exception as e:
+                logger.debug("soft-start reporter: start notice failed: %s", e)
         logger.info("soft-start slot %d: campaign day %d/%d, %.2f day(s) left",
                     self.slot_id, self.campaign.state.day_index() + 1,
                     self.campaign.state.days, self.campaign.state.remaining_days())
         await self.futures.recover()
+
+    def _snapshot(self) -> tuple:
+        """The counters that tell us an action happened, for diffing a tick."""
+        sp, fu = self.spot.plan, self.futures.state
+        pos = (fu.position or {}).get("symbol")
+        return (sp.buys_done, sp.sells_done, fu.orders_done, pos)
+
+    async def _report_diff(self, before: tuple, after: tuple) -> None:
+        """Turn a before/after tick diff into operator-facing alerts.
+
+        Diffing rather than calling the reporter from inside the engines: the
+        engines stay unaware of Telegram, and there is exactly one place that
+        decides what is worth announcing.
+        """
+        if self.reporter is None or before == after:
+            return
+        st = self._status()
+        b0, s0, o0, p0 = before
+        b1, s1, o1, p1 = after
+        try:
+            if b1 > b0:
+                await self.reporter.spot_buy(
+                    "spot", self.spot.cfg.order_usdt_max, "~", **st)
+            if s1 > s0:
+                await self.reporter.spot_sell("spot", "~", **st)
+            if p1 and p1 != p0:
+                pos = self.futures.state.position or {}
+                hold = int(((pos.get("close_after") or 0) - (pos.get("opened_at") or 0)) / 60)
+                await self.reporter.futures_open(
+                    p1, int(pos.get("side") or 1), int(pos.get("leverage") or 0),
+                    hold, **st)
+            elif p0 and not p1:
+                await self.reporter.futures_close(p0, 0.0, **st)
+        except Exception as e:
+            logger.debug("soft-start reporter diff failed: %s", e)
+
+    def _status(self) -> dict:
+        pos = (self.futures.state.position or {}).get("symbol") if self.futures else None
+        return {
+            "day": self.campaign.state.day_index() + 1,
+            "days": self.campaign.state.days,
+            "spent": self.budget.spent,
+            "ceiling": self.budget.state.max_usdt,
+            "position": pos,
+        }
 
     def _apply_day_weight(self) -> None:
         """Reshape today's targets by the day's randomly drawn activity weight.
@@ -158,10 +214,12 @@ class SlotWarmer:
             return                                  # ceiling reached; stay quiet
 
         self._apply_day_weight()
+        before = self._snapshot()
         if self._spot_viable:
             await self.spot.tick()
         if self._fut_viable:
             await self.futures.tick()
+        await self._report_diff(before, self._snapshot())
 
     def finished(self) -> bool:
         """True when this slot has nothing left to do: campaign over or budget spent."""
@@ -176,7 +234,7 @@ class SlotWarmer:
 
 
 async def soft_start_loop(store, client_pool, universe_provider,
-                          poll_sec: int = POLL_SEC) -> None:
+                          poll_sec: int = POLL_SEC, alerts=None) -> None:
     """Keep warming engines in sync with the per-slot button.
 
     `universe_provider()` returns the candidate symbols; the FeeGate narrows
@@ -211,7 +269,8 @@ async def soft_start_loop(store, client_pool, universe_provider,
                 try:
                     client = await client_pool.get(sid)
                     warmers[sid] = SlotWarmer(sid, slot.webkey, client,
-                                              universe_provider(), dry_run=dry_run)
+                                              universe_provider(), dry_run=dry_run,
+                                              alerts=alerts)
                     await warmers[sid].start()
                     logger.info("soft-start slot %d: ON (%s)", sid,
                                 "dry-run" if dry_run else "LIVE")
@@ -234,11 +293,25 @@ async def soft_start_loop(store, client_pool, universe_provider,
                               else "spend ceiling reached")
                     logger.info("soft-start slot %d: %s — switching the slot off",
                                 sid, reason)
+                    left_open = False
                     try:
                         await w.stop()
+                        left_open = (w.futures is not None
+                                     and w.futures.state.position is not None)
                         await store.set_soft_start(sid, False)
                     except Exception:
                         logger.exception("soft-start slot %d: auto-off failed", sid)
+                        left_open = True
+                    # Closing summary — a message that STAYS, so the operator
+                    # sees how it went without digging through logs.
+                    if w.reporter is not None:
+                        try:
+                            await w.reporter.final_report(
+                                reason, spent=w.budget.spent,
+                                ceiling=w.budget.state.max_usdt,
+                                position_left=left_open)
+                        except Exception:
+                            logger.exception("soft-start slot %d: final report failed", sid)
                     warmers.pop(sid, None)
 
         except asyncio.CancelledError:

@@ -843,30 +843,6 @@ async def main() -> None:
         name="db_prune",
     )
 
-    # Soft-start (account warming), driven by the per-slot Telegram button
-    # (/slot N → "🌱 Soft-start"). The loop polls webkey_slots.soft_start_enabled,
-    # so flipping the button takes effect without a restart.
-    # It stays DRY-RUN unless SOFT_START_LIVE=1 is in the environment — the
-    # button alone can never start placing real orders.
-    def _soft_start_universe() -> list[str]:
-        """Candidate pairs. FeeGate narrows these to the 0%-fee ones per open."""
-        import sqlite3
-        try:
-            con = sqlite3.connect(f"file:{env.db_path}?mode=ro", uri=True)
-            try:
-                return [r[0] for r in con.execute(
-                    "SELECT DISTINCT symbol FROM pair_states ORDER BY symbol")]
-            finally:
-                con.close()
-        except Exception:
-            logger.exception("soft-start: universe read failed")
-            return []
-
-    from src.execution.soft_start_runner import soft_start_loop
-    asyncio.create_task(
-        soft_start_loop(webkey_store, webkey_client_pool, _soft_start_universe),
-        name="soft_start",
-    )
 
     # ---- Components ----
     ob_manager = OrderBookManager()
@@ -994,6 +970,34 @@ async def main() -> None:
         owner_id=env.telegram_owner_id,
         quiet_hours=None,
         alert_min_pnl_usdt=0.0,
+    )
+
+    # Soft-start (account warming), driven by the per-slot Telegram button
+    # (/slot N -> "Enable soft-start"). The loop polls
+    # webkey_slots.soft_start_enabled, so the button takes effect without a
+    # restart. Placed AFTER `alerts` exists so the live status message and the
+    # closing report can actually be delivered.
+    # Stays DRY-RUN unless SOFT_START_LIVE=1 is in the environment — the button
+    # alone can never start placing real orders.
+    def _soft_start_universe() -> list[str]:
+        """Candidate pairs. FeeGate narrows these to the 0%-fee ones per open."""
+        import sqlite3
+        try:
+            con = sqlite3.connect(f"file:{env.db_path}?mode=ro", uri=True)
+            try:
+                return [r[0] for r in con.execute(
+                    "SELECT DISTINCT symbol FROM pair_states ORDER BY symbol")]
+            finally:
+                con.close()
+        except Exception:
+            logger.exception("soft-start: universe read failed")
+            return []
+
+    from src.execution.soft_start_runner import soft_start_loop
+    asyncio.create_task(
+        soft_start_loop(webkey_store, webkey_client_pool, _soft_start_universe,
+                        alerts=alerts),
+        name="soft_start",
     )
 
     # Wire alerts to ShadowEngine for orphan position notifications

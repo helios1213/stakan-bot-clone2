@@ -188,12 +188,29 @@ class _Pool:
 async def test_finished_campaign_switches_the_slot_off(monkeypatch):
     monkeypatch.delenv("SOFT_START_LIVE", raising=False)
 
+    made = []
+
     class DoneWarmer:
+        """Mirrors SlotWarmer's interface — including `futures` and `reporter`,
+        which the loop reads when posting the closing report."""
+
         def __init__(self, slot_id, webkey, client, universe, *, dry_run, **kw):
+            made.append(self)
             self.slot_id = slot_id
             self.stopped = False
             self.campaign = type("C", (), {"expired": lambda self: True})()
-            self.budget = type("B", (), {"exhausted": lambda self: False})()
+            self.budget = type("B", (), {"exhausted": lambda self: False,
+                                         "spent": 0.0,
+                                         "state": type("S", (), {"max_usdt": 5.0})()})()
+            self.futures = type("F", (), {"state": type("St", (), {"position": None})()})()
+            self.reported = []
+            reported = self.reported
+
+            class _Rep:
+                async def final_report(self, reason, **kw):
+                    reported.append((reason, kw))
+
+            self.reporter = _Rep()
 
         async def start(self):
             pass
@@ -227,3 +244,9 @@ async def test_finished_campaign_switches_the_slot_off(monkeypatch):
 
     assert store.switched_off == [1], "a finished campaign must switch itself off"
     assert store.slots[0].soft_start_enabled is False
+    # and the operator gets a closing summary, not just silence
+    assert made, "the warmer was never constructed"
+    assert made[0].reported, "a finished campaign must post a closing report"
+    reason, kw = made[0].reported[0]
+    assert "campaign" in reason
+    assert kw["position_left"] is False
