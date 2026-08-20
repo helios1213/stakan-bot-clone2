@@ -126,10 +126,10 @@ def _fmt_slot_config(slot, whitelist_lookup: dict | None = None,
     # the operator believe orders are going out.
     if getattr(slot, "soft_start_enabled", False):
         if _soft_start_live_allowed():
-            lines.append("🌱 Soft-start: ON (живий — ордери йдуть)")
+            lines.append("🌱 Soft-start: ON (LIVE — orders are being placed)")
         else:
-            lines.append("🌱 Soft-start: ON (DRY-RUN — SOFT_START_LIVE не виставлено)")
-        lines.append("   прогрів акаунта, тільки пари з 0% комісією")
+            lines.append("🌱 Soft-start: ON (DRY-RUN — SOFT_START_LIVE is not set)")
+        lines.append("   account warming, 0%-fee pairs only, 3-day campaign")
 
     if slot.assigned_pair:
         lines.append(f"💱 Pair: {slot.assigned_pair}")
@@ -246,14 +246,14 @@ def _kb_slot_config(slot) -> InlineKeyboardMarkup:
         if slot.soft_start_enabled:
             rows.append([
                 InlineKeyboardButton(
-                    "🔥 Soft-start ON — вимкнути",
+                    "🛑 Disable soft-start",
                     callback_data=f"m:slot:{sid}:softstart_off",
                 ),
             ])
         else:
             rows.append([
                 InlineKeyboardButton(
-                    "🌱 Soft-start (прогрів акаунта)",
+                    "🌱 Enable soft-start",
                     callback_data=f"m:slot:{sid}:softstart_on",
                 ),
             ])
@@ -850,7 +850,7 @@ async def handle_slot_callback(query, context, data: str) -> None:
         # Warming needs a credential; it does NOT need an assigned pair.
         if want_on and (slot_now is None or not slot_now.webkey):
             await query.answer(
-                f"Слот {slot_id}: немає веб-ключа — прогрівати нічим.",
+                f"Slot {slot_id}: no webkey — nothing to warm.",
                 show_alert=True,
             )
             return
@@ -862,24 +862,24 @@ async def handle_slot_callback(query, context, data: str) -> None:
         wl = await store.list_live_whitelist()
         wl_lookup = {w["symbol"]: w for w in wl}
         if want_on:
-            text = f"🌱 Soft-start увімкнено для слота {slot_id}.\n"
+            text = f"🌱 Soft-start enabled for slot {slot_id}.\n"
             text += (
-                "Прогрів акаунта на 3 ДНІ, далі вимкнеться сам.\n"
-                "Дрібні спот-ордери (купівля/утримання/продаж) і рідкі ф'ючерсні "
-                "позиції — СТРОГО на парах, де цей акаунт має 0% комісії "
-                "(перевіряється перед кожним відкриттям).\n"
-                "Все рандомізовано: скільки дій на день, які саме, у якому "
-                "порядку, час, суми, плече, час утримання.\n"
-                "Стеля витрат — 5 USDT на весь прогрів; при вичерпанні "
-                "вимикається достроково.\n"
+                "Account warming, 3-DAY campaign — it switches itself off.\n"
+                "Small spot orders (buy / hold / sell) plus rare futures "
+                "positions, STRICTLY on pairs where this account pays 0% fee "
+                "(re-checked before every open).\n"
+                "Everything is randomised: how many actions per day, which "
+                "ones, in what order, timing, sizes, leverage, hold time.\n"
+                "Spend ceiling: 5 USDT for the whole campaign — it stops early "
+                "if that runs out.\n"
             )
             if not _soft_start_live_allowed():
                 text += (
-                    "\n⚠️ Зараз DRY-RUN: змінна SOFT_START_LIVE не виставлена, "
-                    "тож бот лише ЛОГУЄ намір і не шле жодного ордера.\n"
+                    "\n⚠️ DRY-RUN: SOFT_START_LIVE is not set, so the bot only "
+                    "LOGS what it would do and sends no orders.\n"
                 )
         else:
-            text = f"⚪ Soft-start вимкнено для слота {slot_id}.\n"
+            text = f"⚪ Soft-start disabled for slot {slot_id}.\n"
         text += "\n"
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
         slot_ovr = (await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair)
