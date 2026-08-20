@@ -15,10 +15,17 @@ Callbacks:
   m:slot:N:unassign  — clear assignment
   m:slot:N:live_on   — enable live
   m:slot:N:live_off  — disable live
+  m:slot:N:softstart_on / :softstart_off  — account warming (see below)
+
+Soft-start is a SEPARATE switch from live. Live runs the arb strategy on the
+slot's assigned pair; soft-start warms the ACCOUNT with tiny spot orders and
+rare futures open→hold→close, only on pairs this account trades at 0%. A slot
+can run either, both, or neither, and warming needs no assigned pair.
 """
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -28,6 +35,17 @@ from src.config_writer import pair_config_exists, read_pair_sizing
 from src.execution.webkey.credentials import MAX_SLOTS
 
 logger = logging.getLogger(__name__)
+
+
+def _soft_start_live_allowed() -> bool:
+    """Whether soft-start would actually SEND orders.
+
+    The panel switch alone is not enough: the env flag is the second,
+    independent gate, so flipping the button on a running bot can never start
+    placing real orders by itself. Read live rather than imported once, so the
+    UI reflects the environment the bot is actually running in.
+    """
+    return os.environ.get("SOFT_START_LIVE", "") in ("1", "true", "yes")
 
 
 async def _get_slot_pnl(live_db, slot_id: int) -> dict | None:
@@ -102,6 +120,16 @@ def _fmt_slot_config(slot, whitelist_lookup: dict | None = None,
 
     lines.append("")
     lines.append("=== Trading Configuration ===")
+
+    # Warming status. Shown even with no assigned pair, because soft-start does
+    # not need one — and if the env gate is missing, say so here rather than let
+    # the operator believe orders are going out.
+    if getattr(slot, "soft_start_enabled", False):
+        if _soft_start_live_allowed():
+            lines.append("🌱 Soft-start: ON (живий — ордери йдуть)")
+        else:
+            lines.append("🌱 Soft-start: ON (DRY-RUN — SOFT_START_LIVE не виставлено)")
+        lines.append("   прогрів акаунта, тільки пари з 0% комісією")
 
     if slot.assigned_pair:
         lines.append(f"💱 Pair: {slot.assigned_pair}")
@@ -211,6 +239,24 @@ def _kb_slot_config(slot) -> InlineKeyboardMarkup:
                         callback_data=f"m:slot:{sid}:live_on:confirm",
                     ),
                 ])
+
+        # Soft-start (account warming). Independent of live and of the assigned
+        # pair: it warms the ACCOUNT, not a strategy pair, so it is offered on
+        # any slot that has a webkey.
+        if slot.soft_start_enabled:
+            rows.append([
+                InlineKeyboardButton(
+                    "🔥 Soft-start ON — вимкнути",
+                    callback_data=f"m:slot:{sid}:softstart_off",
+                ),
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    "🌱 Soft-start (прогрів акаунта)",
+                    callback_data=f"m:slot:{sid}:softstart_on",
+                ),
+            ])
 
     if not slot.is_empty:
         rows.append([
@@ -790,6 +836,54 @@ async def handle_slot_callback(query, context, data: str) -> None:
         text += "\n\n"
         sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
         slot_ovr = await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair) if slot.assigned_pair else None
+        text += _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr)
+        kb = _kb_slot_config(slot)
+        try:
+            await query.edit_message_text(text, reply_markup=kb)
+        except Exception:
+            await query.message.reply_text(text, reply_markup=kb)
+        return
+
+    if action in ("softstart_on", "softstart_off"):
+        want_on = action == "softstart_on"
+        slot_now = await store.get(slot_id)
+        # Warming needs a credential; it does NOT need an assigned pair.
+        if want_on and (slot_now is None or not slot_now.webkey):
+            await query.answer(
+                f"Слот {slot_id}: немає веб-ключа — прогрівати нічим.",
+                show_alert=True,
+            )
+            return
+
+        await store.set_soft_start(slot_id, want_on)
+        logger.info("[SLOT SOFTSTART] slot=%d -> %s", slot_id, "ON" if want_on else "OFF")
+
+        slot = await store.get(slot_id)
+        wl = await store.list_live_whitelist()
+        wl_lookup = {w["symbol"]: w for w in wl}
+        if want_on:
+            text = f"🌱 Soft-start увімкнено для слота {slot_id}.\n"
+            text += (
+                "Прогрів акаунта на 3 ДНІ, далі вимкнеться сам.\n"
+                "Дрібні спот-ордери (купівля/утримання/продаж) і рідкі ф'ючерсні "
+                "позиції — СТРОГО на парах, де цей акаунт має 0% комісії "
+                "(перевіряється перед кожним відкриттям).\n"
+                "Все рандомізовано: скільки дій на день, які саме, у якому "
+                "порядку, час, суми, плече, час утримання.\n"
+                "Стеля витрат — 5 USDT на весь прогрів; при вичерпанні "
+                "вимикається достроково.\n"
+            )
+            if not _soft_start_live_allowed():
+                text += (
+                    "\n⚠️ Зараз DRY-RUN: змінна SOFT_START_LIVE не виставлена, "
+                    "тож бот лише ЛОГУЄ намір і не шле жодного ордера.\n"
+                )
+        else:
+            text = f"⚪ Soft-start вимкнено для слота {slot_id}.\n"
+        text += "\n"
+        sizing = read_pair_sizing(slot.assigned_pair) if slot.assigned_pair else None
+        slot_ovr = (await store.get_slot_pair_sizing(slot.slot_id, slot.assigned_pair)
+                    if slot.assigned_pair else None)
         text += _fmt_slot_config(slot, wl_lookup, sizing=sizing, override=slot_ovr)
         kb = _kb_slot_config(slot)
         try:

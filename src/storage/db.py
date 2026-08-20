@@ -666,6 +666,14 @@ async def init_db(db_path: str) -> None:
         # Idempotent — no-op if already migrated.
         await _migrate_v5_to_v6(db)
 
+        # v7: per-slot soft-start switch, driven by the panel button.
+        # Deliberately a separate flag from live_enabled: soft-start is account
+        # WARMING (tiny, slow, 0%-fee pairs only), not the arb strategy, and the
+        # operator must be able to run one without the other.
+        await _add_columns_idempotent(db, "webkey_slots", [
+            ("soft_start_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ])
+
         # Whitelist of pairs available for live trading.
         # In v6, this is ADMISSION CONTROL ONLY — sizing comes from pair_configs.
         # "Pair X is allowed for live" / "user should have ≥ N balance" — that's it.

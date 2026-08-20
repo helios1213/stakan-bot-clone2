@@ -139,6 +139,12 @@ class WebkeySlot:
     # trade time — not stored on the slot, not from pair_configs.
     assigned_pair: str | None = None      # which pair this slot trades
     live_enabled: bool = False             # is live ON for this slot
+    # Soft-start (account warming) — DELIBERATELY separate from live_enabled.
+    # It is not the arb strategy: tiny spot buys/sells plus rare futures
+    # open→hold→close, only on pairs this account trades at 0%. The operator
+    # must be able to warm an account without running the strategy, and to run
+    # the strategy without warming. Needs a webkey, but NOT an assigned pair.
+    soft_start_enabled: bool = False
     # УВАГА: колонок slot_margin_*/slot_leverage_* тут БІЛЬШЕ НЕМАЄ.
     # Вони існують у таблиці webkey_slots (2026-07-19), але були замінені тим
     # самим днем на slot_pair_sizing і не читались ніде — при цьому мали ті
@@ -474,7 +480,7 @@ class WebkeyStore:
                    last_health_check, last_latency_ms, last_balance_usdt,
                    last_error, webkey_refreshed_at, created_at, updated_at,
                    assigned_pair, live_enabled,
-                   open_throttle_until
+                   soft_start_enabled, open_throttle_until
               FROM webkey_slots
              WHERE slot_id=?
             """,
@@ -491,7 +497,7 @@ class WebkeyStore:
                    last_health_check, last_latency_ms, last_balance_usdt,
                    last_error, webkey_refreshed_at, created_at, updated_at,
                    assigned_pair, live_enabled,
-                   open_throttle_until
+                   soft_start_enabled, open_throttle_until
               FROM webkey_slots
              ORDER BY slot_id
             """,
@@ -640,6 +646,30 @@ class WebkeyStore:
             """
             UPDATE webkey_slots
                SET live_enabled=?,
+                   enabled=CASE WHEN ?=1 THEN 1 ELSE enabled END,
+                   updated_at=strftime('%s','now')
+             WHERE slot_id=?
+            """,
+            (1 if enabled else 0, 1 if enabled else 0, slot_id),
+        )
+        return True
+
+    async def set_soft_start(self, slot_id: int, enabled: bool) -> bool:
+        """Toggle account-warming (soft-start) for a slot.
+
+        Independent of `live_enabled` on purpose: warming is not the strategy.
+        It places tiny spot buys/sells and rare futures open→hold→close, only on
+        pairs this account trades at 0% — so it needs a webkey but NOT an
+        assigned pair, and it must be runnable on a slot whose live is off.
+
+        Like set_live_enabled, turning it ON also raises the `enabled` display
+        flag, so a warming slot is visible in /balance instead of looking idle.
+        """
+        _validate_slot_id(slot_id)
+        await self.db.execute_write(
+            """
+            UPDATE webkey_slots
+               SET soft_start_enabled=?,
                    enabled=CASE WHEN ?=1 THEN 1 ELSE enabled END,
                    updated_at=strftime('%s','now')
              WHERE slot_id=?
@@ -817,5 +847,6 @@ class WebkeyStore:
             updated_at=int(row["updated_at"]),
             assigned_pair=_safe("assigned_pair"),
             live_enabled=bool(_safe("live_enabled", 0)),
+            soft_start_enabled=bool(_safe("soft_start_enabled", 0)),
             open_throttle_until=_safe("open_throttle_until"),
         )
