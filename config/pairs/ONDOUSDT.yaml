@@ -3,7 +3,7 @@
 
 meta:
   symbol: ONDOUSDT
-  behavioral_epoch: 1785171760
+  behavioral_epoch: 1787188892
   note: behavioral_epoch = unix time the TUNING last changed; bump ONLY on a real
     config change, NOT on re-materialization. Analyze only trades with opened_at >=
     this.
