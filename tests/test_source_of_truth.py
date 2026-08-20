@@ -179,6 +179,9 @@ class TestGetPairSizing:
 
         store = WebkeyStore.__new__(WebkeyStore)
         store.db = mock_db
+        # __new__ skips __init__, so the memo the getter reads must be set here.
+        # Without it the call dies on AttributeError before it ever touches the DB.
+        store._sizing_cache = {}
 
         result = await store.get_pair_sizing("PENGUUSDT")
         # be80f9d: get_pair_sizing is now a pure existence gate (2c dropped the
@@ -205,6 +208,9 @@ class TestGetPairSizing:
 
         store = WebkeyStore.__new__(WebkeyStore)
         store.db = mock_db
+        # __new__ skips __init__, so the memo the getter reads must be set here.
+        # Without it the call dies on AttributeError before it ever touches the DB.
+        store._sizing_cache = {}
 
         assert await store.get_pair_sizing("NOPAIR") is None
 

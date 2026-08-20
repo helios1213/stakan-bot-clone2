@@ -61,23 +61,40 @@ class TestFromSlot:
         # proxy support fully removed
         assert not hasattr(client, "proxy")
 
+    # NOTE on the two tests below: they resolve the class through the module at
+    # CALL time instead of using the names imported at the top of this file.
+    #
+    # `test_order_host.py::test_env_override_reverts_host` calls
+    # `importlib.reload()` on this very module to check the MEXC_API_HOST
+    # override. It cleans up its env and reloads back — but a reload cannot
+    # restore class IDENTITY: afterwards `sys.modules[...].MexcClientError` is a
+    # NEW object, while the top-level import here still points at the original.
+    # `pytest.raises` compares by identity, so it stopped recognising a
+    # perfectly correct exception, and only in a full-suite run (alphabetically
+    # test_order_host goes first). Reading the attribute off the module makes
+    # these immune to that.
+
     def test_from_slot_no_webkey_fails(self):
+        from src.execution.webkey import client as client_mod
+
         slot = WebkeySlot(
             slot_id=1, label=None, enabled=False,
             webkey=None,
             visitor_id=None,
         )
-        with pytest.raises(MexcClientError, match="no webkey"):
-            MexcWebClient.from_slot(slot)
+        with pytest.raises(client_mod.MexcClientError, match="no webkey"):
+            client_mod.MexcWebClient.from_slot(slot)
 
     def test_from_slot_no_visitor_fails(self):
+        from src.execution.webkey import client as client_mod
+
         slot = WebkeySlot(
             slot_id=1, label=None, enabled=False,
             webkey=SAMPLE_WEBKEY,
             visitor_id=None,
         )
-        with pytest.raises(MexcClientError, match="no visitor"):
-            MexcWebClient.from_slot(slot)
+        with pytest.raises(client_mod.MexcClientError, match="no visitor"):
+            client_mod.MexcWebClient.from_slot(slot)
 
 
 class TestHeaders:

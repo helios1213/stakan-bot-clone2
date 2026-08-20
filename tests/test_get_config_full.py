@@ -25,17 +25,53 @@ def _pc(**kw) -> PairConfig:
     )
 
 
+# Поля, які /get_config НЕ показує СВІДОМО. Кожне — з причиною, інакше цей
+# список стане смітником, куди зручно ховати випадково загублені ключі.
+#
+#   margin_*/leverage_*  — мертві з 6b05479/25bc8f7: розмір угоди резолвиться
+#       з таблиці slot_pair_sizing, а не з YAML. Показувати їх = брехати
+#       оператору про те, чим торгує слот.
+#   enabled/scan_interval_sec — службові прапорці детектора, не ворота тюнінгу.
+#   momentum_*           — не підключені до жодного шляху виконання.
+INTENTIONALLY_HIDDEN = {
+    "margin_min_usdt", "margin_max_usdt", "leverage_min", "leverage_max",
+    "enabled", "scan_interval_sec",
+    "momentum_filter", "momentum_tau_sec", "momentum_threshold_bps",
+}
+
+
 def test_every_config_field_is_on_screen():
-    """Сторож повноти: новий ключ у конфізі не може зникнути з команди."""
+    """Сторож повноти: новий ключ у конфізі не може зникнути з команди.
+
+    Прихованим дозволено бути лише тому, що в INTENTIONALLY_HIDDEN — тож
+    новододане поле, яке забули вивести, все одно завалить цей тест.
+    """
     pc = _pc()
     txt = _fmt_pair_config_full("TESTUSDT", pc, live=False)
     missing = [
         f.name
         for obj in (pc.detector, pc.exit_strategy, pc.execution)
         for f in dataclasses.fields(obj)
-        if f.name not in txt
+        if f.name not in txt and f.name not in INTENTIONALLY_HIDDEN
     ]
     assert not missing, f"поля зникли з /get_config: {missing}"
+
+
+def test_hidden_list_does_not_rot():
+    """Якщо приховане поле повернули на екран — прибери його зі списку.
+
+    Без цієї перевірки INTENTIONALLY_HIDDEN тихо накопичує застарілі назви і
+    перестає бути документом про те, що саме приховано і чому.
+    """
+    pc = _pc()
+    txt = _fmt_pair_config_full("TESTUSDT", pc, live=False)
+    all_fields = {
+        f.name
+        for obj in (pc.detector, pc.exit_strategy, pc.execution)
+        for f in dataclasses.fields(obj)
+    }
+    stale = [n for n in INTENTIONALLY_HIDDEN if n in all_fields and n in txt]
+    assert not stale, f"вже показуються, приберіть зі списку прихованих: {stale}"
 
 
 def test_the_entry_gates_are_shown_with_their_values():
@@ -71,27 +107,35 @@ def test_a_zero_exit_bps_shows_the_tick_fallback_it_falls_back_to():
 
 def test_the_slot_override_is_shown_because_the_yaml_size_is_not_what_trades():
     """PENGU 07.08: ямл показував $35-40, слот торгував $95-100, і команда про
-    це мовчала. Подвоєння експозиції має бути видно тут."""
+    це мовчала. Подвоєння експозиції має бути видно тут.
+
+    25bc8f7 змінив спосіб: ямл більше НЕ показується взагалі (він мертвий —
+    розмір резолвиться з slot_pair_sizing), тому й позначки «ПЕРЕКРИВАЄ» вже
+    нема — перекривати нічого. Суть тесту та сама: на екрані мусить бути
+    розмір, яким СЛОТ реально торгує, і його нотіонал."""
     pc = _pc(c={"margin_min_usdt": 35, "margin_max_usdt": 40,
                 "leverage_min": 45, "leverage_max": 50})
     txt = _fmt_pair_config_full(
         "TESTUSDT", pc, live=True,
         overrides=[(2, {"margin_min_usdt": 95.0, "margin_max_usdt": 100.0,
                         "leverage_min": 45, "leverage_max": 50})])
-    assert "ПЕРЕКРИВАЄ" in txt
-    assert "$95-100" in txt
+    assert "$95-100" in txt, "не показано розмір, яким торгує слот"
     assert "$4,275-5,000" in txt, "не показано нотіонал, яким реально торгують"
+    assert "$35-40" not in txt, "ямл-розмір мертвий і не має вводити в оману"
 
 
-def test_a_slot_that_matches_the_yaml_is_not_flagged_as_a_conflict():
+def test_the_slot_number_is_named_so_the_size_is_attributable():
+    """Раніше тут перевірялось «слот 2 = ямл» — порівняння з ямл, якого на
+    екрані вже немає. Що лишилось важливим: коли слотів кілька, розмір мусить
+    бути підписаний НОМЕРОМ слота, інакше незрозуміло, чий він."""
     pc = _pc(c={"margin_min_usdt": 95, "margin_max_usdt": 100,
                 "leverage_min": 45, "leverage_max": 50})
     txt = _fmt_pair_config_full(
         "TESTUSDT", pc, live=True,
         overrides=[(2, {"margin_min_usdt": 95.0, "margin_max_usdt": 100.0,
                         "leverage_min": 45, "leverage_max": 50})])
-    assert "ПЕРЕКРИВАЄ" not in txt
-    assert "слот 2 = ямл" in txt
+    line = next(ln for ln in txt.splitlines() if "$95-100" in ln)
+    assert "слот 2" in line, line
 
 
 def test_an_idle_slot_is_marked_so_its_size_is_not_read_as_live():
@@ -101,7 +145,9 @@ def test_an_idle_slot_is_marked_so_its_size_is_not_read_as_live():
         overrides=[(1, {"margin_min_usdt": 65.0, "margin_max_usdt": 70.0,
                         "leverage_min": 45, "leverage_max": 50,
                         "_active": False})])
-    assert "не торгує" in txt
+    # 25bc8f7 змінив формулювання маркера; сенс той самий — розмір неактивного
+    # слота не можна прочитати як «цим зараз торгують».
+    assert "(не на цій парі)" in txt
 
 
 def test_bps_thresholds_are_translated_into_ticks_when_a_price_is_known():

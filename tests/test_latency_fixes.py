@@ -39,48 +39,36 @@ async def test_warmup_hot_path_skips_lock():
 
 
 @pytest.mark.asyncio
-async def test_warmup_stale_path_takes_lock():
-    """When cookies are stale, warmup() falls through to slow path.
+async def test_stale_warmup_still_never_takes_the_lock_or_the_network():
+    """warmup() is a NO-OP since the warmup-removal patch.
 
-    We verify that the slow path is taken by checking that the lock IS
-    contended — if we hold it externally, the stale warmup blocks until
-    we release. (A fresh warmup would skip the lock entirely.)
+    This test used to assert the opposite: that a stale warmup falls through to
+    a slow path and contends on the lock. That path is gone — the Akamai cookie
+    fetch was proven unnecessary (probe 2026-08-12), so warmup() does nothing.
+
+    What matters now is the guarantee the patch bought us, and it is worth
+    pinning: even with cookies arbitrarily stale, warmup() must NOT touch the
+    lock and must NOT hit the network. If either ever comes back, the cold-start
+    latency it cost us comes back with it.
     """
     from src.execution.webkey.client import MexcWebClient as WebkeyClient
 
     c = object.__new__(WebkeyClient)
     c._session = MagicMock()
     c._lock = asyncio.Lock()
-    c._warmed_at = time.monotonic() - 1000  # very stale → must take lock
+    c._warmed_at = time.monotonic() - 10_000     # arbitrarily stale
     c.cookie_max_age_sec = 60.0
     c._ensure_session = AsyncMock(return_value=c._session)
+    c._session.get = AsyncMock(side_effect=AssertionError("warmup must not hit the network"))
 
-    # Pre-acquire the lock. The stale-path warmup must wait on it.
+    # Hold the lock: a warmup that wanted it would block here and time out.
     await c._lock.acquire()
+    try:
+        await asyncio.wait_for(c.warmup(), timeout=0.5)
+    finally:
+        c._lock.release()
 
-    warmup_completed = [False]
-
-    async def runner():
-        # Mock session.get so we don't try to fetch from network after
-        # the lock is released. We only care about contention, not result.
-        c._session.get = AsyncMock(side_effect=Exception("stop-test"))
-        try:
-            await c.warmup()
-        except Exception:
-            pass
-        warmup_completed[0] = True
-
-    task = asyncio.create_task(runner())
-    # Wait a beat — if warmup were on fast path it would already be done.
-    await asyncio.sleep(0.05)
-    assert not warmup_completed[0], "stale warmup should be blocked on lock"
-
-    c._lock.release()
-    await asyncio.wait_for(task, timeout=1.0)
-    assert warmup_completed[0], "warmup should proceed after lock released"
-
-
-# ─── Fix 2: skip simulate_ioc_entry for live pairs ──────────────────────
+    c._session.get.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_simulate_skipped_for_live_pair():
