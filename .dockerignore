@@ -1,5 +1,8 @@
 # Keep backups, caches, and dev cruft out of the image build context.
 *.bak*
+# Без ** патерн ловить ЛИШЕ корінь контексту — передпатчені копії
+# client.py через це їхали всередину образу.
+**/*.bak*
 *.post-tao
 *.pre-tao
 __pycache__/
