@@ -23,10 +23,13 @@ from src.execution.soft_start_runner import SlotWarmer as RealSlotWarmer
 
 
 class FakeSlot:
-    def __init__(self, slot_id, webkey="WEB" + "0" * 64, soft_start_enabled=False):
+    def __init__(self, slot_id, webkey="WEB" + "0" * 64, soft_start_enabled=False,
+                 live_enabled=False):
         self.slot_id = slot_id
         self.webkey = webkey
         self.soft_start_enabled = soft_start_enabled
+        # The loop refuses a futures warmer while the arb strategy is live here.
+        self.live_enabled = live_enabled
 
 
 class FakeStore:
@@ -77,17 +80,31 @@ class FakeWarmer:
     decide whether a slot should switch ITSELF off.
     """
     made: list["FakeWarmer"] = []
+    # What stop() reports on a freshly built warmer. The loop builds its own
+    # warmers, so a test that needs a stuck slot sets this before the pass.
+    clean_default: bool = True
 
-    def __init__(self, slot_id, webkey, client, universe, *, dry_run, **kw):
+    def __init__(self, slot_id, webkey, client, universe, *, dry_run,
+                 futures_allowed=True, **kw):
         self.slot_id = slot_id
         self.dry_run = dry_run
         self.universe = universe
+        self.futures_allowed = futures_allowed
         self.ticks = 0
         self.started = False
         self.stopped = False
+        self.stop_calls = 0
         self.explode = False
+        # What stop() reports. False = a position is STILL OPEN, which the loop
+        # must treat as "keep this warmer and retry", never as "done".
+        self.clean = FakeWarmer.clean_default
+        self.draining = False
         self.campaign = FakeCampaign()
         self.budget = FakeBudget()
+        self.reporter = None
+        self.futures = None
+        self._stop_attempts = 0
+        self._final_sent = False
         FakeWarmer.made.append(self)
 
     async def start(self):
@@ -100,6 +117,17 @@ class FakeWarmer:
 
     async def stop(self):
         self.stopped = True
+        self.stop_calls += 1
+        self.draining = True
+        if not self.clean:
+            self._stop_attempts += 1
+        return self.clean
+
+    def stuck(self) -> bool:
+        return self.draining and not self.clean
+
+    def _status(self) -> dict:
+        return {"day": 1, "days": 3, "spent": 0.0, "ceiling": 5.0, "position": None}
 
     def finished(self):
         return self.campaign.expired() or self.budget.exhausted()
@@ -108,15 +136,23 @@ class FakeWarmer:
 @pytest.fixture(autouse=True)
 def _patch(monkeypatch):
     FakeWarmer.made = []
+    FakeWarmer.clean_default = True
     monkeypatch.setattr(ssr, "SlotWarmer", FakeWarmer)
 
 
-async def run_one_pass(store, pool, universe=None, sleeps=1):
-    """Drive the loop for `sleeps` iterations, then cancel it."""
+async def run_one_pass(store, pool, universe=None, sleeps=1, on_sleep=None):
+    """Drive the loop for `sleeps` iterations, then cancel it.
+
+    `on_sleep(n)` runs BETWEEN iterations. The loop keeps its warmers in a local
+    dict, so a second call to this helper gets brand-new warmers — anything a
+    test needs to change mid-life has to happen here.
+    """
     calls = {"n": 0}
 
     async def fake_sleep(_):
         calls["n"] += 1
+        if on_sleep is not None:
+            on_sleep(calls["n"])
         if calls["n"] >= sleeps:
             raise asyncio.CancelledError
         return None
@@ -231,36 +267,221 @@ async def test_warmer_stop_closes_an_open_position():
 
     This is the property that keeps the OFF button from orphaning a position.
     """
-    class FakeFutures:
-        def __init__(self):
-            self.state = type("S", (), {"position": {"symbol": "HYPEUSDT"}})()
-            self.closed = False
-
-        async def close_position(self, *, forced=False):
-            self.closed = True
-            self.state.position = None
-            return True
-
-    w = RealSlotWarmer.__new__(RealSlotWarmer)   # bypass __init__ (needs a client)
-    w.slot_id = 1
-    w.futures = FakeFutures()
-    await w.stop()
+    w = _real_warmer(_FakeFutures())
+    assert await w.stop() is True, "a clean close reports the slot as clean"
     assert w.futures.closed is True
 
 
 @pytest.mark.asyncio
 async def test_warmer_stop_is_noop_without_a_position():
-    class FakeFutures:
-        def __init__(self):
-            self.state = type("S", (), {"position": None})()
-            self.closed = False
+    w = _real_warmer(_FakeFutures(position=None))
+    assert await w.stop() is True
+    assert w.futures.closed is False
 
-        async def close_position(self, *, forced=False):
-            self.closed = True
-            return True
 
+@pytest.mark.asyncio
+async def test_stop_reports_NOT_clean_when_the_close_fails():
+    """The money property: a refused close must not look like a finished job.
+
+    close_all_positions returning a non-zero code is not an exception — the old
+    stop() ignored the bool and the loop dropped the warmer, orphaning a live
+    leveraged position with nothing left to retry it.
+    """
+    w = _real_warmer(_FakeFutures(close_ok=False))
+    assert await w.stop() is False
+    assert w.futures.state.position is not None, "the record must survive"
+    assert w.stuck() is True
+
+
+@pytest.mark.asyncio
+async def test_stop_is_not_clean_while_an_open_is_unresolved():
+    """An open we never got an answer for is possible exposure, not 'nothing'."""
+    w = _real_warmer(_FakeFutures(position=None, pending={"symbol": "HYPEUSDT"}))
+    assert await w.stop() is False
+
+
+@pytest.mark.asyncio
+async def test_button_off_keeps_the_warmer_until_the_close_succeeds():
+    """OFF with a stuck position: the warmer STAYS so every poll retries it.
+
+    Dropping it here is the money bug — a live leveraged position with nothing
+    left in the process that knows about it.
+    """
+    FakeWarmer.clean_default = False              # the close keeps failing
+    store = FakeStore([FakeSlot(1, soft_start_enabled=True)])
+
+    def on_sleep(n):
+        if n == 1:
+            store.slots[0].soft_start_enabled = False
+
+    await run_one_pass(store, FakePool(), sleeps=4, on_sleep=on_sleep)
+    w = FakeWarmer.made[0]
+    assert w.stop_calls >= 2, "every poll must retry the close"
+    assert w.ticks == 1, "a draining warmer must never trade again"
+
+
+@pytest.mark.asyncio
+async def test_button_off_drops_the_warmer_once_it_closes_cleanly():
+    store = FakeStore([FakeSlot(1, soft_start_enabled=True)])
+
+    def on_sleep(n):
+        if n == 1:
+            store.slots[0].soft_start_enabled = False
+
+    await run_one_pass(store, FakePool(), sleeps=3, on_sleep=on_sleep)
+    w = FakeWarmer.made[0]
+    assert w.stop_calls == 1, "a clean close is not retried"
+
+
+@pytest.mark.asyncio
+async def test_auto_off_does_not_flip_the_db_flag_while_a_position_is_open():
+    """A finished campaign that cannot close must not claim the slot is idle.
+
+    Flipping soft_start_enabled=0 with a position still open makes the UI lie
+    AND drops the slot out of `wanted`, so nothing ever retries the close.
+    """
+    FakeWarmer.clean_default = False
+    store = FakeStore([FakeSlot(1, soft_start_enabled=True)])
+
+    def on_sleep(n):
+        if n == 1:
+            FakeWarmer.made[0].campaign.done = True
+
+    await run_one_pass(store, FakePool(), sleeps=3, on_sleep=on_sleep)
+    assert store.switched_off == [], "the button must stay ON while exposed"
+    assert FakeWarmer.made[0].stop_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_auto_off_switches_off_once_the_slot_is_clean():
+    store = FakeStore([FakeSlot(1, soft_start_enabled=True)])
+
+    def on_sleep(n):
+        if n == 1:
+            FakeWarmer.made[0].campaign.done = True
+
+    await run_one_pass(store, FakePool(), sleeps=3, on_sleep=on_sleep)
+    assert store.switched_off == [1]
+
+
+@pytest.mark.asyncio
+async def test_live_slot_gets_no_futures_warmer(monkeypatch):
+    """Two systems on one account close each other's positions — refuse.
+
+    The reconciler treats an untracked position as an orphan and market-closes
+    it; soft-start's own close is symbol-wide and would take the arb position
+    down with it.
+    """
+    store = FakeStore([FakeSlot(1, soft_start_enabled=True, live_enabled=True),
+                       FakeSlot(2, soft_start_enabled=True)])
+    await run_one_pass(store, FakePool())
+    by_slot = {w.slot_id: w for w in FakeWarmer.made}
+    assert by_slot[1].futures_allowed is False
+    assert by_slot[2].futures_allowed is True
+
+
+def test_fake_warmer_still_matches_the_real_one():
+    """Guard against the drift that has broken these tests twice.
+
+    Every attribute the loop reads off a warmer must exist on BOTH the real
+    class and the fake — otherwise the loop tests pass against an interface
+    that no longer exists.
+    """
+    import inspect
+    import re
+
+    real = (set(re.findall(r"self\.(\w+)\s*=",
+                           inspect.getsource(RealSlotWarmer.__init__)))
+            | {n for n in dir(RealSlotWarmer) if not n.startswith("__")})
+    fake = FakeWarmer(1, "k", None, [], dry_run=True)
+
+    # Everything the loop reads off a warmer, taken from the loop's own source
+    # rather than from a list someone has to remember to update.
+    src = inspect.getsource(ssr) 
+    reads = set(re.findall(r"\bw\.(\w+)", src)) | set(re.findall(r"\bwarmers\[\w+\]\.(\w+)", src))
+    assert reads, "could not parse what the loop reads — fix this guard"
+    for name in sorted(reads):
+        assert name in real, f"the loop reads w.{name}, which SlotWarmer lacks"
+        assert hasattr(fake, name), f"FakeWarmer is missing {name} — it is lying"
+
+
+class _FakeFutures:
+    """Stands in for FuturesSoftStart in the stop()/drain tests."""
+
+    _DEFAULT = object()
+
+    def __init__(self, position=_DEFAULT, pending=None, close_ok=True,
+                 needs_check=False):
+        if position is _FakeFutures._DEFAULT:
+            position = {"symbol": "HYPEUSDT"}
+        self.state = type("S", (), {})()
+        self.state.position = position
+        self.state.pending = pending
+        self.state.needs_exchange_check = needs_check
+        self.close_ok = close_ok
+        self.closed = False
+
+    def has_exposure(self):
+        return (self.state.position is not None
+                or self.state.pending is not None
+                or self.state.needs_exchange_check)
+
+    async def sweep_exchange(self):
+        self.state.needs_exchange_check = False
+
+    async def reconcile_pending(self):
+        return False
+
+    async def close_position(self, *, forced=False):
+        self.closed = True
+        if not self.close_ok:
+            return False                  # rejected: the record must survive
+        self.state.position = None
+        return True
+
+
+def _real_warmer(futures) -> "RealSlotWarmer":
+    """A real SlotWarmer with only the fields stop() touches (no client needed)."""
     w = RealSlotWarmer.__new__(RealSlotWarmer)
     w.slot_id = 1
-    w.futures = FakeFutures()
-    await w.stop()
-    assert w.futures.closed is False
+    w.draining = False
+    w._stop_attempts = 0
+    w.futures = futures
+    return w
+
+
+@pytest.mark.asyncio
+async def test_an_idle_futures_half_still_drains_a_leftover_position():
+    """A half that stops trading must not stop CLOSING.
+
+    `_fut_viable` goes False when the balance is too small or when the arb
+    strategy is live on the slot. Skipping futures.tick() then also skipped the
+    close, so a position opened before the switch would sit there forever.
+    """
+    w = RealSlotWarmer.__new__(RealSlotWarmer)
+    w.slot_id = 1
+    w.draining = False
+    w._stop_attempts = 0
+    w.reporter = None
+    w.futures = _FakeFutures()
+    w.spot = type("S", (), {"plan": type("P", (), {"buys_done": 0, "sells_done": 0,
+                                                   "buys_target": 0, "sells_target": 0})(),
+                            "tick": _noop})()
+    w.campaign = type("C", (), {"expired": lambda self: False,
+                                "day_weight": lambda self: 1.0,
+                                "finish": lambda self: None,
+                                "state": type("St", (), {"days": 3,
+                                                         "day_index": lambda self: 0})()})()
+    w.budget = type("B", (), {"exhausted": lambda self: False, "spent": 0.0,
+                              "state": type("S2", (), {"max_usdt": 5.0})()})()
+    w._spot_viable = False
+    w._fut_viable = False                       # this half is switched off
+    w.futures.state.orders_done = 0
+    w.futures.state.orders_target = 0
+
+    await w.tick()
+    assert w.futures.closed is True, "the leftover position must be closed"
+
+
+async def _noop(*a, **kw):
+    return None

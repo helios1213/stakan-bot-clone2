@@ -20,6 +20,13 @@ deliberately heavier than the spot one:
     deadline. If the bot restarts mid-hold, `recover()` finds the position and
     closes it on time instead of leaving it to sit.
   * **One position at a time.** No stacking.
+  * **An open that gets no answer is a question, not a failure.** The intent is
+    persisted BEFORE the request leaves; a timeout then asks the exchange
+    whether it filled, and adopts the position if it did. An exchange that
+    cannot be read keeps the question open rather than assuming "nothing
+    happened".
+  * **A dry-run process never erases a live record.** Unsetting SOFT_START_LIVE
+    and restarting cannot make the bot forget a position it really opened.
   * Every order is wrapped: a failure logs and skips, never cascades.
 
 State lives next to the spot state, in data/, so a rebuild does not lose it.
@@ -87,6 +94,10 @@ class OpenPosition:
     leverage: int
     opened_at: float
     close_after: float          # epoch seconds — the hold deadline
+    # Was this position actually SENT to the exchange? The dry path never
+    # persists a position, so any record loaded from disk is a real one —
+    # hence the default. A dry-run process must never erase such a record.
+    opened_live: bool = True
 
     def due(self, now: float | None = None) -> bool:
         return (now or time.time()) >= self.close_after
@@ -102,6 +113,14 @@ class FuturesState:
     orders_done: int = 0
     next_open_at: float = 0.0            # epoch seconds; the 3-10h pause
     position: dict | None = None         # asdict(OpenPosition) while holding
+    # An order we are about to send, or have sent without hearing back. Written
+    # BEFORE the request leaves the process, so a timeout or a crash mid-flight
+    # still leaves a breadcrumb telling us which symbol to ask the exchange
+    # about. An unresolved `pending` is treated as possible live exposure.
+    pending: dict | None = None
+    # Set when the state file could not be read: we no longer know what the
+    # account holds, so the exchange has to be asked before anything is opened.
+    needs_exchange_check: bool = False
 
     def is_today(self) -> bool:
         return self.date == datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -118,13 +137,30 @@ def load_state(path: str) -> FuturesState | None:
     try:
         return FuturesState(**json.loads(p.read_text()))
     except Exception as e:
-        logger.warning("futures soft-start state unreadable (%s)", e)
-        return None
+        # An unreadable file is NOT "no position" — that is exactly how a live
+        # position gets forgotten. Keep the bad file for forensics and hand back
+        # a state that forces an exchange check before anything is opened.
+        logger.error("futures soft-start: STATE UNREADABLE (%s) — the exchange "
+                     "will be asked what this account actually holds", e)
+        try:
+            p.rename(p.with_suffix(p.suffix + f".corrupt.{int(time.time())}"))
+        except Exception as e2:                       # pragma: no cover - fs edge
+            logger.warning("could not preserve the corrupt state file: %s", e2)
+        return FuturesState(needs_exchange_check=True)
 
 
 def save_state(path: str, st: FuturesState) -> None:
+    """Write the state ATOMICALLY.
+
+    A half-written file reads back as corrupt, and corrupt used to mean "no
+    position". tmp + os.replace means a reader sees either the old state or the
+    new one, never a truncated one.
+    """
     try:
-        Path(path).write_text(json.dumps(asdict(st), indent=2))
+        p = Path(path)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(asdict(st), indent=2))
+        os.replace(tmp, p)
     except Exception as e:
         # A lost state file means a forgotten open position, so this is loud.
         logger.error("futures soft-start: STATE SAVE FAILED (%s) — "
@@ -188,7 +224,11 @@ class FuturesSoftStart:
             orders_target=self.rng.randint(c.orders_per_day_min, c.orders_per_day_max),
             orders_done=0,
             next_open_at=0.0,
+            # A new day never clears exposure or an open question about it.
             position=self.state.position if self.state else None,
+            pending=self.state.pending if self.state else None,
+            needs_exchange_check=(self.state.needs_exchange_check
+                                  if self.state else False),
         )
         save_state(c.state_path, self.state)
         logger.info("futures soft-start: %s — %d order(s) planned today",
@@ -310,6 +350,16 @@ class FuturesSoftStart:
         c = self.cfg
         if self.state.position is not None:
             return False                        # one at a time
+        if self.state.pending is not None:
+            # An earlier open never got an answer. Until we know whether it
+            # landed, opening again risks stacking two live positions.
+            logger.info("futures soft-start: an open is still unresolved — "
+                        "not opening another")
+            return False
+        if self.state.needs_exchange_check:
+            logger.error("futures soft-start: account state unknown (unreadable "
+                         "state file) — refusing to open until it is reconciled")
+            return False
         if self.budget is not None and self.budget.exhausted():
             logger.info("futures soft-start: budget exhausted — not opening")
             return False
@@ -336,26 +386,42 @@ class FuturesSoftStart:
             self._schedule_pause()
             return True
 
+        # Breadcrumb FIRST. A market order that fills and then loses its
+        # response (timeout, non-JSON body, process killed) is a real position
+        # nothing would otherwise know about. Persisting the intent before the
+        # send means there is always a symbol to ask the exchange about.
+        self.state.pending = {"symbol": sym, "side": side, "vol": vol,
+                              "leverage": leverage, "hold_min": hold_min,
+                              "notional": notional, "sent_at": time.time()}
+        save_state(c.state_path, self.state)
+
         try:
             from src.exchanges.mexc_rest import to_mexc
             resp = await self.client.submit_order(
                 symbol=to_mexc(sym), side=side, vol=vol,
                 leverage=leverage, order_type=ORDER_TYPE_MARKET)
         except Exception as e:
-            logger.warning("[futures] OPEN %s FAILED: %s — skipped", sym, e)
-            return False
+            # NOT a failure — an UNKNOWN. The order may well be filled.
+            logger.error("[futures] OPEN %s got no answer (%s) — asking the "
+                         "exchange whether it landed", sym, e)
+            return await self.reconcile_pending()
 
         if str((resp or {}).get("code")) != "0":
+            # A definitive refusal from the exchange: nothing was opened.
             logger.warning("[futures] OPEN %s rejected: %s", sym,
                            json.dumps(resp or {})[:200])
+            self.state.pending = None
+            save_state(c.state_path, self.state)
             return False
 
         pos = OpenPosition(symbol=sym, side=side, vol=vol, leverage=leverage,
                            opened_at=time.time(),
-                           close_after=time.time() + hold_min * 60)
+                           close_after=time.time() + hold_min * 60,
+                           opened_live=True)
         # Persist BEFORE anything else can fail: an unrecorded open position is
         # the worst outcome this module can produce.
         self.state.position = asdict(pos)
+        self.state.pending = None
         self.state.orders_done += 1
         save_state(c.state_path, self.state)
         # Charge the round trip up front: both crossings and a possible funding
@@ -377,6 +443,16 @@ class FuturesSoftStart:
         pos = OpenPosition(**self.state.position)
 
         if not self.sending:
+            if pos.opened_live:
+                # The record describes a REAL position. Clearing it here would
+                # send no order and orphan the position permanently — which is
+                # what happens on the documented "unset SOFT_START_LIVE and
+                # restart" way of disarming.
+                logger.error("[futures] %s was opened LIVE but this process is "
+                             "dry-run — NOT touching the record. Close it by "
+                             "hand, or restart with %s=1 to let the bot do it.",
+                             pos.symbol, LIVE_ENV)
+                return False
             logger.info("[DRY futures] CLOSE %s after %.1fmin (nothing sent)",
                         pos.symbol, pos.held_minutes())
             self.state.position = None
@@ -403,8 +479,154 @@ class FuturesSoftStart:
         save_state(self.cfg.state_path, self.state)
         return True
 
+    # ---- asking the exchange --------------------------------------------
+
+    def _universe_contracts(self) -> dict:
+        """{contract symbol -> our symbol} for everything we are allowed to warm."""
+        from src.exchanges.mexc_rest import to_mexc
+        return {to_mexc(s): s for s in self.universe}
+
+    async def _exchange_positions(self) -> list | None:
+        """Open positions per the EXCHANGE, or None when the read failed.
+
+        None means "unknown" and must never be read as "nothing is open" —
+        that confusion is precisely how a live position gets orphaned.
+        """
+        try:
+            resp = await self.client.get_open_positions()
+        except Exception as e:
+            logger.error("futures soft-start: open-positions read failed (%s)", e)
+            return None
+        if str((resp or {}).get("code")) != "0":
+            logger.error("futures soft-start: open-positions rejected: %s",
+                         json.dumps(resp or {})[:200])
+            return None
+        return list((resp or {}).get("data") or [])
+
+    @staticmethod
+    def _held(row: dict) -> bool:
+        try:
+            return float(row.get("holdVol") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    async def reconcile_pending(self) -> bool:
+        """Resolve an open we never got an answer for, by asking the exchange.
+
+        Returns True when a position was found and ADOPTED (so the caller can
+        treat it as an open that happened). The pending record is dropped only
+        on a definitive answer — an unreadable exchange keeps the question open
+        rather than guessing "nothing happened".
+        """
+        pend = self.state.pending
+        if not pend:
+            return False
+        sym = str(pend.get("symbol") or "")
+        from src.exchanges.mexc_rest import to_mexc
+        contract = to_mexc(sym)
+
+        rows = await self._exchange_positions()
+        if rows is None:
+            logger.error("futures soft-start: %s is UNRESOLVED — keeping the "
+                         "pending record and re-checking next tick", sym)
+            return False
+
+        match = next((r for r in rows
+                      if str(r.get("symbol")) == contract and self._held(r)), None)
+        if match is None:
+            logger.info("futures soft-start: %s did not open after all — "
+                        "clearing the pending record", sym)
+            self.state.pending = None
+            save_state(self.cfg.state_path, self.state)
+            return False
+
+        self._adopt(match, sym, hold_min=int(pend.get("hold_min")
+                                             or self.cfg.hold_minutes_min),
+                    opened_at=float(pend.get("sent_at") or time.time()))
+        self.state.pending = None
+        self.state.orders_done += 1
+        save_state(self.cfg.state_path, self.state)
+        # An adopted position costs exactly what a normal one costs — charging
+        # it keeps the ceiling honest whichever way the open was learned about.
+        if self.budget is not None and pend.get("notional"):
+            from .soft_start_budget import futures_round_trip_cost
+            self.budget.charge(futures_round_trip_cost(float(pend["notional"])),
+                               f"futures round-trip {sym} (adopted)")
+        logger.error("futures soft-start: %s DID open despite the error — "
+                     "adopted and scheduled to close", sym)
+        self._schedule_pause()
+        return True
+
+    def _adopt(self, row: dict, sym: str, *, hold_min: int,
+               opened_at: float) -> None:
+        """Turn an exchange position row into our own tracked position."""
+        pos = OpenPosition(
+            symbol=sym,
+            side=SIDE_LONG if int(row.get("positionType") or 1) == 1 else SIDE_SHORT,
+            vol=int(float(row.get("holdVol") or 0)),
+            leverage=int(row.get("leverage") or 0),
+            opened_at=opened_at,
+            close_after=opened_at + hold_min * 60,
+            opened_live=True,
+        )
+        self.state.position = asdict(pos)
+
+    async def sweep_exchange(self) -> None:
+        """After an unreadable state file: find out what the account holds.
+
+        Only positions on symbols WE warm are adopted. Anything else on the
+        account belongs to something other than soft-start and is left strictly
+        alone — closing another system's position would be worse than the
+        problem this is solving.
+        """
+        if not self.state.needs_exchange_check:
+            return
+        rows = await self._exchange_positions()
+        if rows is None:
+            logger.error("futures soft-start: state unreadable AND the exchange "
+                         "could not be read — nothing will be opened until this "
+                         "resolves")
+            return                                # keep the flag, re-check later
+
+        ours = self._universe_contracts()
+        mine = [r for r in rows if str(r.get("symbol")) in ours and self._held(r)]
+        foreign = [r for r in rows if self._held(r) and r not in mine]
+        if foreign:
+            logger.warning("futures soft-start: account holds %d position(s) "
+                           "outside the warming universe — leaving them alone",
+                           len(foreign))
+        if mine:
+            row = mine[0]                          # one at a time, by design
+            sym = ours[str(row.get("symbol"))]
+            logger.error("futures soft-start: found an untracked %s position "
+                         "after an unreadable state file — adopting it and "
+                         "closing it now", sym)
+            # hold_min=0: we do not know when this opened, and money we lost
+            # track of is not something to sit on for another warming window.
+            self._adopt(row, sym, hold_min=0, opened_at=time.time())
+            if len(mine) > 1:
+                logger.error("futures soft-start: %d warming positions are open "
+                             "at once — only %s is tracked, close the rest by "
+                             "hand", len(mine), sym)
+        self.state.needs_exchange_check = False
+        save_state(self.cfg.state_path, self.state)
+
+    def has_exposure(self) -> bool:
+        """True when this engine may have real money on the exchange.
+
+        Deliberately pessimistic: an unresolved pending order counts, because
+        we do not yet know that it did NOT fill.
+        """
+        return (self.state.position is not None
+                or self.state.pending is not None
+                or self.state.needs_exchange_check)
+
     async def recover(self) -> None:
         """Called at startup: adopt or close whatever a restart left behind."""
+        if self.state.needs_exchange_check:
+            await self.sweep_exchange()
+        if self.state.pending is not None:
+            await self.reconcile_pending()
         if self.state.position is None:
             return
         pos = OpenPosition(**self.state.position)
@@ -424,6 +646,12 @@ class FuturesSoftStart:
         try:
             if not self.state.is_today():
                 self._roll_day()
+
+            # Answer open questions before acting on anything else.
+            if self.state.needs_exchange_check:
+                await self.sweep_exchange()
+            if self.state.pending is not None:
+                await self.reconcile_pending()
 
             if self.state.position is not None:
                 if OpenPosition(**self.state.position).due():

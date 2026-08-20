@@ -14,8 +14,11 @@ Safety:
   * DRY-RUN unless `SOFT_START_LIVE=1` is set in the environment. The button
     alone can never start sending orders — two independent gates.
   * Turning the button OFF closes any futures position the slot is holding
-    before the engine is dropped. Otherwise the button would orphan a live
-    position on the exchange.
+    before the engine is dropped — and if that close FAILS, the engine is kept
+    (idle, never trading) so every poll retries it. Dropping it on a failed
+    close is exactly what orphans a live position on the exchange.
+  * A slot where the arb strategy is live does NOT get a futures warmer: two
+    systems on one account close each other's positions.
   * A slot whose engine raises is isolated: it is logged and skipped, and the
     other slots keep running.
 """
@@ -52,12 +55,22 @@ class SlotWarmer:
                  *, dry_run: bool, data_dir: str = "/app/data",
                  max_cost_usdt: float = DEFAULT_MAX_COST_USDT,
                  campaign_days: int = DEFAULT_CAMPAIGN_DAYS,
-                 alerts=None) -> None:
+                 alerts=None, futures_allowed: bool = True) -> None:
         self.slot_id = slot_id
         self.client = client
         self.universe = universe
         self.dry_run = dry_run
         self.data_dir = data_dir
+        # False when the arb strategy is live on this slot: two systems opening
+        # futures positions on one account fight each other — the reconciler
+        # closes the warming position as an orphan, and a symbol-wide close
+        # from soft-start takes the arb position down with it.
+        self.futures_allowed = futures_allowed
+        # Set once OFF has been requested: the slot may still have to be
+        # drained, but it must never trade again.
+        self.draining = False
+        self._stop_attempts = 0
+        self._final_sent = False
         self.fee_gate = FeeGate(client)
         # ONE ceiling for both halves: the operator's limit is on warming as a
         # whole, not per venue.
@@ -123,7 +136,13 @@ class SlotWarmer:
             budget=self.budget, balance_usdt=fut_bal,
         )
         self._spot_viable = spot_bal >= MIN_VIABLE_BALANCE_USDT
-        self._fut_viable = fut_bal >= MIN_VIABLE_BALANCE_USDT
+        self._fut_viable = (fut_bal >= MIN_VIABLE_BALANCE_USDT
+                            and self.futures_allowed)
+        if not self.futures_allowed:
+            logger.warning("soft-start slot %d: the arb strategy is LIVE on this "
+                           "slot — the futures half stays idle (two systems on "
+                           "one account close each other's positions)",
+                           self.slot_id)
         for name, ok, bal in (("spot", self._spot_viable, spot_bal),
                               ("futures", self._fut_viable, fut_bal)):
             if not ok:
@@ -203,6 +222,8 @@ class SlotWarmer:
     async def tick(self) -> None:
         if self.spot is None or self.futures is None:
             return                                  # start() has not run yet
+        if self.draining:
+            return                                  # OFF requested — stop() drains
 
         if self.campaign.expired():
             # Finite job: stop acting the moment the campaign is over. The loop
@@ -219,18 +240,90 @@ class SlotWarmer:
             await self.spot.tick()
         if self._fut_viable:
             await self.futures.tick()
+        elif self.futures.has_exposure():
+            # This half is idle (balance too small, or the slot trades live) but
+            # something is still open from before. Drain it — never open more.
+            await self._drain_futures()
         await self._report_diff(before, self._snapshot())
 
     def finished(self) -> bool:
         """True when this slot has nothing left to do: campaign over or budget spent."""
         return self.campaign.expired() or self.budget.exhausted()
 
-    async def stop(self) -> None:
-        """Close anything still open before this slot stops being warmed."""
-        if self.futures is not None and self.futures.state.position is not None:
-            logger.warning("soft-start slot %d: switching OFF with an open "
-                           "position — closing it first", self.slot_id)
-            await self.futures.close_position(forced=True)
+    async def _drain_futures(self) -> bool:
+        """Resolve any open question, close any open position. True when clean."""
+        f = self.futures
+        if f is None:
+            return True
+        try:
+            if f.state.needs_exchange_check:
+                await f.sweep_exchange()
+            if f.state.pending is not None:
+                await f.reconcile_pending()
+            if f.state.position is not None:
+                await f.close_position(forced=True)
+        except Exception:
+            logger.exception("soft-start slot %d: draining futures failed",
+                             self.slot_id)
+        return not f.has_exposure()
+
+    async def stop(self) -> bool:
+        """Close anything still open before this slot stops being warmed.
+
+        Returns True only when the slot is CLEAN. False means real money is
+        still on the exchange — the caller must keep this warmer alive and
+        retry, because dropping it here is what orphans a live position.
+        """
+        self.draining = True
+        if self.futures is None or not self.futures.has_exposure():
+            return True
+        logger.warning("soft-start slot %d: switching OFF with exposure — "
+                       "closing it first", self.slot_id)
+        clean = await self._drain_futures()
+        if not clean:
+            self._stop_attempts += 1
+            logger.error("soft-start slot %d: close FAILED on OFF (attempt %d) — "
+                         "the position is STILL OPEN; keeping the warmer so the "
+                         "next poll retries", self.slot_id, self._stop_attempts)
+        return clean
+
+    def stuck(self) -> bool:
+        """OFF was requested but exposure remains."""
+        return self.draining and self.futures is not None and self.futures.has_exposure()
+
+
+# How many failed OFF-closes between operator alerts. The retry itself runs
+# every poll; the alert is throttled so a stuck slot does not spam Telegram.
+STUCK_ALERT_EVERY = 30
+
+
+async def _alert_stuck(w, slot_id: int) -> None:
+    """Tell the operator a warming position could not be closed.
+
+    Reporting must never reach the trading loop, so every path is wrapped.
+    """
+    if w.reporter is None or w._stop_attempts % STUCK_ALERT_EVERY != 1:
+        return
+    try:
+        await w.reporter.skipped(
+            f"⚠️ position still OPEN after {w._stop_attempts} close attempt(s) "
+            f"— retrying every poll; close it by hand if this persists",
+            **w._status())
+    except Exception:
+        logger.debug("soft-start slot %d: stuck alert failed", slot_id)
+
+
+async def _final_report(w, slot_id: int, reason: str, *, position_left: bool) -> None:
+    """Closing summary — a message that STAYS, so the operator sees how it went."""
+    w._final_sent = True
+    if w.reporter is None:
+        return
+    try:
+        await w.reporter.final_report(reason, spent=w.budget.spent,
+                                      ceiling=w.budget.state.max_usdt,
+                                      position_left=position_left)
+    except Exception:
+        logger.exception("soft-start slot %d: final report failed", slot_id)
 
 
 async def soft_start_loop(store, client_pool, universe_provider,
@@ -251,13 +344,20 @@ async def soft_start_loop(store, client_pool, universe_provider,
             wanted = {s.slot_id for s in slots
                       if getattr(s, "soft_start_enabled", False) and s.webkey}
 
-            # Stop warmers whose button was switched off.
+            # Stop warmers whose button was switched off. A warmer is dropped
+            # ONLY once it is clean — while a close keeps failing it stays here
+            # (idle, never trading) so that every poll retries it.
             for slot_id in list(warmers):
                 if slot_id not in wanted:
+                    w = warmers[slot_id]
                     try:
-                        await warmers[slot_id].stop()
+                        clean = await w.stop()
                     except Exception:
                         logger.exception("soft-start slot %d: stop failed", slot_id)
+                        clean = False
+                    if not clean:
+                        await _alert_stuck(w, slot_id)
+                        continue
                     warmers.pop(slot_id, None)
                     logger.info("soft-start slot %d: OFF", slot_id)
 
@@ -268,17 +368,25 @@ async def soft_start_loop(store, client_pool, universe_provider,
                     continue
                 try:
                     client = await client_pool.get(sid)
-                    warmers[sid] = SlotWarmer(sid, slot.webkey, client,
-                                              universe_provider(), dry_run=dry_run,
-                                              alerts=alerts)
+                    warmers[sid] = SlotWarmer(
+                        sid, slot.webkey, client, universe_provider(),
+                        dry_run=dry_run, alerts=alerts,
+                        futures_allowed=not getattr(slot, "live_enabled", False))
                     await warmers[sid].start()
                     logger.info("soft-start slot %d: ON (%s)", sid,
                                 "dry-run" if dry_run else "LIVE")
                 except Exception:
                     logger.exception("soft-start slot %d: failed to start", sid)
+                    # Drop it so the next poll retries. Left in place it would
+                    # tick as a no-op forever and the slot would never warm.
+                    w = warmers.pop(sid, None)
+                    if w is not None and getattr(w, "futures", None) is not None:
+                        warmers[sid] = w        # it may already hold a position
 
             # Tick each independently — one bad slot must not stop the others.
             for sid, w in list(warmers.items()):
+                if w.draining:
+                    continue          # OFF requested; the stop path retries it
                 try:
                     await w.tick()
                 except Exception:
@@ -293,31 +401,35 @@ async def soft_start_loop(store, client_pool, universe_provider,
                               else "spend ceiling reached")
                     logger.info("soft-start slot %d: %s — switching the slot off",
                                 sid, reason)
-                    left_open = False
                     try:
-                        await w.stop()
-                        left_open = (w.futures is not None
-                                     and w.futures.state.position is not None)
+                        clean = await w.stop()
+                    except Exception:
+                        logger.exception("soft-start slot %d: auto-off failed", sid)
+                        clean = False
+
+                    # Tell the operator once, the moment we know a position was
+                    # left behind — then keep retrying rather than walking away.
+                    if not w._final_sent and (clean or w.stuck()):
+                        await _final_report(w, sid, reason, position_left=not clean)
+                    if not clean:
+                        # Do NOT switch the button off and do NOT drop the
+                        # warmer: the flag would claim the slot is idle while a
+                        # position is still open, and nothing would retry.
+                        await _alert_stuck(w, sid)
+                        continue
+                    try:
                         await store.set_soft_start(sid, False)
                     except Exception:
                         logger.exception("soft-start slot %d: auto-off failed", sid)
-                        left_open = True
-                    # Closing summary — a message that STAYS, so the operator
-                    # sees how it went without digging through logs.
-                    if w.reporter is not None:
-                        try:
-                            await w.reporter.final_report(
-                                reason, spent=w.budget.spent,
-                                ceiling=w.budget.state.max_usdt,
-                                position_left=left_open)
-                        except Exception:
-                            logger.exception("soft-start slot %d: final report failed", sid)
                     warmers.pop(sid, None)
 
         except asyncio.CancelledError:
-            for w in warmers.values():
+            for sid, w in warmers.items():
                 try:
-                    await w.stop()
+                    if not await w.stop():
+                        logger.error("soft-start slot %d: shutting down with a "
+                                     "position STILL OPEN — close it by hand or "
+                                     "restart the bot to let recover() do it", sid)
                 except Exception:
                     logger.exception("soft-start: shutdown close failed")
             raise

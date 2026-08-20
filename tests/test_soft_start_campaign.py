@@ -198,11 +198,18 @@ async def test_finished_campaign_switches_the_slot_off(monkeypatch):
             made.append(self)
             self.slot_id = slot_id
             self.stopped = False
+            self.draining = False
+            self._stop_attempts = 0
+            self._final_sent = False
             self.campaign = type("C", (), {"expired": lambda self: True})()
             self.budget = type("B", (), {"exhausted": lambda self: False,
                                          "spent": 0.0,
                                          "state": type("S", (), {"max_usdt": 5.0})()})()
-            self.futures = type("F", (), {"state": type("St", (), {"position": None})()})()
+            self.futures = type("F", (), {
+                "state": type("St", (), {"position": None, "pending": None,
+                                         "needs_exchange_check": False})(),
+                "has_exposure": lambda self: False,
+            })()
             self.reported = []
             reported = self.reported
 
@@ -220,6 +227,15 @@ async def test_finished_campaign_switches_the_slot_off(monkeypatch):
 
         async def stop(self):
             self.stopped = True
+            self.draining = True
+            return True                      # clean: nothing left open
+
+        def stuck(self):
+            return False
+
+        def _status(self):
+            return {"day": 3, "days": 3, "spent": 0.0, "ceiling": 5.0,
+                    "position": None}
 
         def finished(self):
             return True

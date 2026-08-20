@@ -43,11 +43,23 @@ class FakeGate:
 
 
 class FakeClient:
-    def __init__(self, open_code="0", close_code="0"):
+    def __init__(self, open_code="0", close_code="0", positions=None,
+                 positions_code="0"):
         self.opened = []
         self.closed = []
         self.open_code = open_code
         self.close_code = close_code
+        # What the EXCHANGE says is open. `positions_code != "0"` (or "raise")
+        # means the read failed — which must never be read as "nothing open".
+        self.positions = positions if positions is not None else []
+        self.positions_code = positions_code
+        self.position_reads = 0
+
+    async def get_open_positions(self):
+        self.position_reads += 1
+        if self.positions_code == "raise":
+            raise ConnectionError("down")
+        return {"code": self.positions_code, "data": list(self.positions)}
 
     async def submit_order(self, **kw):
         self.opened.append(kw)
@@ -62,12 +74,17 @@ class FakeClient:
         return {"code": self.close_code}
 
 
-def mk(tmp_path, fees=None, *, dry_run=True, client=None, seed=3, **cfgkw):
+def mk(tmp_path, fees=None, *, dry_run=True, client=None, seed=3, budget=None,
+       **cfgkw):
     cfg = FuturesSoftStartConfig(state_path=str(tmp_path / "fs.json"), **cfgkw)
     gate = FakeGate(fees if fees is not None else {"HYPEUSDT": (0, 0)})
     cl = client or FakeClient()
     ss = FuturesSoftStart(cl, gate, list(gate.fees) or ["HYPEUSDT"], cfg,
-                          dry_run=dry_run, rng=random.Random(seed))
+                          dry_run=dry_run, rng=random.Random(seed),
+                          budget=budget)
+    # No network in tests: contract_meta otherwise calls contract.mexc.com, and
+    # a rate limit there turned into a spurious "no contract meta — skipping".
+    ss.contract_meta = lambda contract: (0.1, 40.0)
     return ss, cl, gate
 
 
@@ -235,10 +252,77 @@ async def test_rejected_open_does_not_record_a_position(tmp_path, live):
 
 
 @pytest.mark.asyncio
-async def test_open_exception_is_contained(tmp_path, live):
-    ss, _, _ = mk(tmp_path, dry_run=False, client=FakeClient(open_code="raise"))
+async def test_open_exception_asks_the_exchange_and_adopts_a_real_fill(tmp_path, live):
+    """A lost response is a QUESTION, not a failure.
+
+    A market order can fill and still raise on the way back (timeout, non-JSON
+    body). The old code logged "skipped" and returned before writing any state,
+    leaving a real leveraged position nothing in the process knew about.
+    """
+    from src.execution.soft_start_budget import SoftStartBudget
+    cl = FakeClient(open_code="raise",
+                    positions=[{"symbol": "HYPE_USDT", "holdVol": "3",
+                                "positionType": 1, "leverage": 10}])
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl,
+                  budget=SoftStartBudget(str(tmp_path / "b.json"), 5.0))
+    assert await ss.open_position() is True, "the position is real — adopt it"
+    assert ss.state.position is not None
+    assert ss.state.position["symbol"] == "HYPEUSDT"
+    assert ss.state.position["vol"] == 3
+    assert ss.state.pending is None, "the question is answered"
+    assert ss.budget.spent > 0, "an adopted position costs what any other does"
+    # and it survives a restart
+    assert load_state(ss.cfg.state_path).position is not None
+
+
+@pytest.mark.asyncio
+async def test_open_exception_with_nothing_open_clears_cleanly(tmp_path, live):
+    cl = FakeClient(open_code="raise", positions=[])
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl)
     assert await ss.open_position() is False
     assert ss.state.position is None
+    assert ss.state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_unreadable_exchange_keeps_the_question_open(tmp_path, live):
+    """"Could not read" must never collapse into "nothing is open"."""
+    cl = FakeClient(open_code="raise", positions_code="raise")
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl)
+    assert await ss.open_position() is False
+    assert ss.state.pending is not None, "the pending record must survive"
+    assert ss.has_exposure() is True
+    assert load_state(ss.cfg.state_path).pending is not None
+
+    # ...and the next tick re-asks, adopting once the exchange answers.
+    cl.positions_code = "0"
+    cl.positions = [{"symbol": "HYPE_USDT", "holdVol": "2",
+                     "positionType": 2, "leverage": 5}]
+    await ss.tick()
+    assert ss.state.position is not None
+    assert ss.state.position["side"] == SIDE_SHORT
+    assert ss.state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_open_blocks_a_second_one(tmp_path, live):
+    """Never stack: opening again while a fill is unconfirmed risks two positions."""
+    cl = FakeClient(open_code="raise", positions_code="raise")
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl)
+    await ss.open_position()
+    sent = len(cl.opened)
+    assert await ss.open_position() is False
+    assert len(cl.opened) == sent, "nothing new may be sent"
+
+
+@pytest.mark.asyncio
+async def test_rejected_open_clears_the_breadcrumb(tmp_path, live):
+    """A definitive rejection is not ambiguity — no exchange round-trip needed."""
+    cl = FakeClient(open_code="9999")
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl)
+    assert await ss.open_position() is False
+    assert ss.state.pending is None
+    assert cl.position_reads == 0
 
 
 # ---- restart recovery -----------------------------------------------------
@@ -286,3 +370,112 @@ def test_sides_are_both_reachable(tmp_path):
         ss, _, _ = mk(tmp_path, seed=seed)
         seen.add(SIDE_LONG if ss.rng.random() < ss.cfg.long_ratio else SIDE_SHORT)
     assert seen == {SIDE_LONG, SIDE_SHORT}
+
+
+# ---- disarming must not lose a position -----------------------------------
+
+@pytest.mark.asyncio
+async def test_dry_run_close_refuses_to_erase_a_live_position(tmp_path, live,
+                                                              monkeypatch):
+    """Unsetting SOFT_START_LIVE and restarting must not orphan a position.
+
+    The dry branch sent no order but cleared the record and persisted that —
+    so the bot forgot a real position, permanently. This is reachable from
+    recover(), tick() and stop().
+    """
+    ss, cl, _ = mk(tmp_path, dry_run=False)
+    assert await ss.open_position() is True
+    saved = dict(ss.state.position)
+
+    monkeypatch.delenv("SOFT_START_LIVE", raising=False)   # operator disarms
+    ss2, cl2, _ = mk(tmp_path, dry_run=False)              # restart
+    assert ss2.state.position is not None, "loaded from disk"
+    assert await ss2.close_position(forced=True) is False, "refuse, do not erase"
+    assert ss2.state.position == saved, "the record must survive untouched"
+    assert cl2.closed == [], "and nothing was sent"
+    assert load_state(ss.cfg.state_path).position is not None
+
+    await ss2.recover()
+    assert ss2.state.position is not None, "recover must not erase it either"
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_position_is_still_disposable(tmp_path):
+    """The refusal is about LIVE records only — a dry one may be cleared."""
+    ss, _, _ = mk(tmp_path, dry_run=True)
+    pos = OpenPosition(symbol="HYPEUSDT", side=SIDE_LONG, vol=1, leverage=5,
+                       opened_at=time.time(), close_after=time.time() - 1,
+                       opened_live=False)
+    ss.state.position = json.loads(json.dumps(pos.__dict__))
+    assert await ss.close_position() is True
+    assert ss.state.position is None
+
+
+# ---- an unreadable state file ---------------------------------------------
+
+@pytest.mark.asyncio
+async def test_corrupt_state_file_asks_the_exchange(tmp_path, live):
+    """A truncated state file used to read as "no position"."""
+    path = tmp_path / "fs.json"
+    path.write_text('{"date": "2026-08-20", "orders_do')      # torn write
+    cl = FakeClient(positions=[{"symbol": "HYPE_USDT", "holdVol": "4",
+                                "positionType": 1, "leverage": 7}])
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl)
+    assert ss.state.needs_exchange_check is True
+    assert ss.has_exposure() is True, "unknown is not the same as empty"
+
+    await ss.recover()
+    # Adopted AND closed straight away: we do not know when it opened, and
+    # money we lost track of is not something to sit on.
+    assert cl.closed == ["HYPE_USDT"]
+    assert ss.state.position is None
+    assert ss.state.needs_exchange_check is False
+    assert ss.has_exposure() is False
+    assert list(tmp_path.glob("fs.json.corrupt.*")), "the bad file is kept"
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_orphan_is_not_erased_by_a_dry_run_process(tmp_path):
+    """Same refusal as any live record — disarming must not lose it."""
+    (tmp_path / "fs.json").write_text("torn")
+    cl = FakeClient(positions=[{"symbol": "HYPE_USDT", "holdVol": "4",
+                                "positionType": 1, "leverage": 7}])
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl)     # no SOFT_START_LIVE
+    await ss.recover()
+    assert cl.closed == [], "dry-run sends nothing"
+    assert ss.state.position is not None, "and forgets nothing"
+    assert ss.has_exposure() is True
+
+
+@pytest.mark.asyncio
+async def test_corrupt_state_leaves_foreign_positions_alone(tmp_path, live):
+    """Only symbols WE warm are adopted — never another system's position."""
+    path = tmp_path / "fs.json"
+    path.write_text("not json at all")
+    cl = FakeClient(positions=[{"symbol": "ONDO_USDT", "holdVol": "50",
+                                "positionType": 1, "leverage": 50}])
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl)
+    await ss.recover()
+    assert ss.state.position is None, "not ours — do not touch it"
+    assert cl.closed == []
+
+
+@pytest.mark.asyncio
+async def test_corrupt_state_and_unreadable_exchange_refuses_to_open(tmp_path, live):
+    (tmp_path / "fs.json").write_text("{{{")
+    cl = FakeClient(positions_code="raise")
+    ss, _, _ = mk(tmp_path, dry_run=False, client=cl)
+    await ss.recover()
+    assert ss.state.needs_exchange_check is True, "still unknown — keep asking"
+    assert await ss.open_position() is False
+    assert cl.opened == [], "never open into an unknown account state"
+
+
+def test_state_is_written_atomically(tmp_path):
+    """A reader must see the old state or the new one, never a torn one."""
+    from src.execution.futures_soft_start import FuturesState, save_state
+    path = str(tmp_path / "fs.json")
+    save_state(path, FuturesState(date="2026-08-20", orders_target=2))
+    save_state(path, FuturesState(date="2026-08-21", orders_target=3))
+    assert load_state(path).orders_target == 3
+    assert not list(tmp_path.glob("*.tmp")), "no temp file left behind"
