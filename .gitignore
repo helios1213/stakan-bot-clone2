@@ -37,6 +37,7 @@ venv/
 # ─── Clone-local leftover backups (present on clone disk, not primary) ───
 *.bak
 *.bak-*
+*.bak.*
 *.removed
 *.backup*
 src.before-cleanup/
