@@ -125,6 +125,10 @@ class BinanceWSClient:
         # than depth diff). Bounded to avoid unbounded memory.
         self._bt_latency_advantage_ms: deque[int] = deque(maxlen=2000)
         self.book_ticker_messages = 0
+        # How many bookTicker frames actually MOVED the top (feed mode). The
+        # gap between this and book_ticker_messages is the throttle we get for
+        # free: most frames only restate a top we already have.
+        self.book_ticker_top_updates = 0
         # Number of depth diffs where a matching bookTicker observation
         # was found (and thus a latency sample was recorded).
         self.book_ticker_matched = 0
@@ -556,38 +560,29 @@ class BinanceWSClient:
         if getattr(self, '_book_ticker_feed', False):
             ob = self.ob_manager.get("binance", symbol)
             if ob is not None and ob.is_synced:
-                bid_size = 0.0
-                ask_size = 0.0
                 try:
                     bid_size = float(data.get("B", 0))
                     ask_size = float(data.get("A", 0))
                 except (ValueError, TypeError):
-                    pass
-                changed = False
-                if bid_p > 0 and bid_size > 0:
-                    if bid_p != ob._top_bid_price:
-                        ob._top_bid_price = bid_p
-                        # Ensure the price exists in _bids for best_bid() lookup
-                        ob._bids[bid_p] = bid_size
-                        changed = True
-                    elif bid_p in ob._bids:
-                        ob._bids[bid_p] = bid_size
-                if ask_p > 0 and ask_size > 0:
-                    if ask_p != ob._top_ask_price:
-                        ob._top_ask_price = ask_p
-                        ob._asks[ask_p] = ask_size
-                        changed = True
-                    elif ask_p in ob._asks:
-                        ob._asks[ask_p] = ask_size
-                if changed:
-                    # Restore the top-of-book invariant (_top_bid==max(_bids),
-                    # _top_ask==min(_asks)). Writing _top_* directly can leave a
-                    # stale higher bid / lower ask in the ladder, drifting the
-                    # cached top away from the book (entry-signal + gap consumers
-                    # read it). O(n) once per top change; this feed is off by
-                    # default so the cost is dormant.
-                    ob._recompute_top()
-                    ob.last_update_ts_ms = seen_at_ms
+                    return
+                try:
+                    upd_id = int(data.get("u") or 0)
+                except (TypeError, ValueError):
+                    upd_id = 0
+                try:
+                    event_ts = int(data.get("T") or 0)
+                except (TypeError, ValueError):
+                    event_ts = 0
+                # The book owns its own invariants: bookTicker is authoritative
+                # for the TOP, so applying it must also PRUNE the levels it
+                # supersedes. Poking _top_*/_bids from out here is what left a
+                # stale higher bid in the ladder and crossed the book.
+                if ob.apply_top_of_book(
+                    bid_p, bid_size, ask_p, ask_size,
+                    update_id=upd_id, event_ts_ms=event_ts,
+                    seen_at_ms=seen_at_ms,
+                ):
+                    self.book_ticker_top_updates += 1
                     ob._notify_listeners()
 
     def _record_book_ticker_latency_sample(
@@ -651,11 +646,16 @@ class BinanceWSClient:
                 logger.info(
                     "[BOOK_TICKER_DIAG] advantage_ms n=%d mean=%.1f "
                     "p50=%d p90=%d p99=%d max=%d "
-                    "(bt_msgs=%d matched=%d depth_msgs=%d)",
+                    "(bt_msgs=%d matched=%d depth_msgs=%d top_moves=%d feed=%s)",
                     n, mean, p50, p90, p99, samples[-1],
                     self.book_ticker_messages,
                     self.book_ticker_matched,
                     self.depth_messages,
+                    # top_moves = frames that actually MOVED the top, i.e. the
+                    # real extra detector load the feed costs. bt_msgs alone
+                    # overstates it (most frames only restate a size).
+                    self.book_ticker_top_updates,
+                    "ON" if self._book_ticker_feed else "off",
                 )
             except asyncio.CancelledError:
                 return

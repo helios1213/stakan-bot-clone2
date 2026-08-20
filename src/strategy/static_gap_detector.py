@@ -137,7 +137,13 @@ class StaticGapDetector:
         self.scans_run = 0
         self.signals_emitted = 0
         self.signals_skip_cooldown = 0
-        self.signals_skip_no_ob = 0
+        # Four DIFFERENT reasons used to share one counter, so a crossed book
+        # (a bug) was indistinguishable from an unsynced one (normal at start).
+        # `signals_skip_no_ob` below still reports their sum for old consumers.
+        self.signals_skip_unsynced = 0
+        self.signals_skip_zero_price = 0
+        self.signals_skip_crossed_mexc = 0
+        self.signals_skip_crossed_binance = 0
         self.signals_skip_below_threshold = 0
         self.signals_skip_wide_spread = 0
         self.signals_skip_wide_spread_t = 0
@@ -498,7 +504,7 @@ class StaticGapDetector:
             binance_ob is None or not binance_ob.is_synced or
             mexc_ob is None or not mexc_ob.is_synced
         ):
-            self.signals_skip_no_ob += 1
+            self.signals_skip_unsynced += 1
             return
 
         # Hot path: avoid the OrderBookLevel allocations that best_bid()/
@@ -510,7 +516,7 @@ class StaticGapDetector:
         m_bid_p = mexc_ob.best_bid_price()
         m_ask_p = mexc_ob.best_ask_price()
         if b_bid_p == 0.0 or b_ask_p == 0.0 or m_bid_p == 0.0 or m_ask_p == 0.0:
-            self.signals_skip_no_ob += 1
+            self.signals_skip_zero_price += 1
             return
 
         # Corrupt-book guard: a crossed MEXC book (bid >= ask) is impossible
@@ -519,7 +525,7 @@ class StaticGapDetector:
         # gap (HYPE: frozen 68.843 bid vs live 66.3 ask -> endless fake shorts,
         # +3.7% per shadow trade). Skip until the book self-heals.
         if m_bid_p >= m_ask_p:
-            self.signals_skip_no_ob += 1
+            self.signals_skip_crossed_mexc += 1
             return
 
         # The SAME guard for the Binance side. It was missing, and a crossed
@@ -529,7 +535,7 @@ class StaticGapDetector:
         # phantom signal — 60x a normal PEPE gap — and a real $2977 live SHORT
         # was opened on it. Skip until the feed self-heals.
         if b_bid_p >= b_ask_p:
-            self.signals_skip_no_ob += 1
+            self.signals_skip_crossed_binance += 1
             if not hasattr(self, "_bx_last") or time.time() - self._bx_last > 60:
                 self._bx_last = time.time()
                 logger.warning(
@@ -859,6 +865,12 @@ class StaticGapDetector:
         except asyncio.CancelledError:
             return
 
+    @property
+    def signals_skip_no_ob(self) -> int:
+        """Sum of the four book-unusable reasons — the number this used to be."""
+        return (self.signals_skip_unsynced + self.signals_skip_zero_price
+                + self.signals_skip_crossed_mexc + self.signals_skip_crossed_binance)
+
     def _log_gate_skips(self) -> None:
         """Скільки сигналів відкинули ворота — кумулятивно і за останні 30с.
 
@@ -875,6 +887,13 @@ class StaticGapDetector:
             "direction_filter": self.signals_skip_direction_filter,
             "below_min_ticks":  self.signals_skip_below_threshold,
             "cooldown":         self.signals_skip_cooldown,
+            # A crossed book is never a market state — it is always our bug.
+            # The log line for it is rate-limited to 1/60s, so the counter is
+            # the only way to know the real rate.
+            "unsynced":         self.signals_skip_unsynced,
+            "zero_price":       self.signals_skip_zero_price,
+            "crossed_mexc":     self.signals_skip_crossed_mexc,
+            "crossed_binance":  self.signals_skip_crossed_binance,
         }
         prev = self._gate_skips_prev
         self._gate_skips_prev = dict(cur)
@@ -893,6 +912,10 @@ class StaticGapDetector:
             "signals_emitted": self.signals_emitted,
             "signals_skip_cooldown": self.signals_skip_cooldown,
             "signals_skip_no_ob": self.signals_skip_no_ob,
+            "signals_skip_unsynced": self.signals_skip_unsynced,
+            "signals_skip_zero_price": self.signals_skip_zero_price,
+            "signals_skip_crossed_mexc": self.signals_skip_crossed_mexc,
+            "signals_skip_crossed_binance": self.signals_skip_crossed_binance,
             "signals_skip_below_threshold": self.signals_skip_below_threshold,
             "signals_skip_wide_spread":      self.signals_skip_wide_spread,
             "signals_skip_wide_spread_t":    self.signals_skip_wide_spread_t,

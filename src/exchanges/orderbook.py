@@ -57,6 +57,10 @@ class OrderBook:
 
     last_update_id: int = 0
     last_update_ts_ms: int = 0
+    # Event-time (Binance T) останнього bookTicker-оновлення топу, коли
+    # feed-режим увімкнений. 0 = не оновлювався з bookTicker. Для виміру
+    # віку лідерського сигналу (binance_signal_age_ms), НЕ для торгівлі.
+    top_lead_ts_ms: int = 0
     is_synced: bool = False
 
     # Sync price-update listeners. Invoked after each apply_snapshot /
@@ -73,6 +77,78 @@ class OrderBook:
         """Refresh cached top-of-book prices. O(n) once per diff."""
         self._top_bid_price = max(self._bids) if self._bids else 0.0
         self._top_ask_price = min(self._asks) if self._asks else 0.0
+
+    # Highest bookTicker updateId applied to the top. bookTicker and depth are
+    # SEPARATE streams, so a late/out-of-order bookTicker frame must never be
+    # allowed to prune levels that still exist.
+    _top_update_id: int = 0
+    # The last authoritative top, kept so a depth diff that is OLDER than it
+    # cannot resurrect the levels it already removed.
+    _bt_bid: float = 0.0
+    _bt_ask: float = 0.0
+
+    # ---- authoritative top-of-book (Binance bookTicker) ----
+    def apply_top_of_book(
+        self,
+        bid_price: float,
+        bid_size: float,
+        ask_price: float,
+        ask_size: float,
+        *,
+        update_id: int = 0,
+        event_ts_ms: int = 0,
+        seen_at_ms: int | None = None,
+    ) -> bool:
+        """Apply a bookTicker quote as the authoritative top of book.
+
+        bookTicker names the WHOLE top, so every level BETTER than it is known
+        to be gone. Inserting the new top without REMOVING those stale levels
+        is what produced ~3000 false crossed books/hr on 2026-08-13: when the
+        price ticked DOWN, the old (higher) bid stayed in the ladder and
+        `max(_bids)` kept returning it, eventually crossing the cached ask —
+        and a crossed book makes the detector skip signals. Recomputing
+        max/min over an unpruned ladder cannot fix that; pruning can.
+
+        Depth still owns everything below the top: `last_update_id` and
+        `is_synced` are deliberately NOT touched here.
+
+        Returns True when the top actually moved (callers notify listeners).
+        """
+        if bid_price <= 0 or ask_price <= 0 or bid_size <= 0 or ask_size <= 0:
+            return False
+        if bid_price >= ask_price:
+            # A crossed quote from the feed itself: never let it into the book.
+            return False
+        if update_id and update_id <= self._top_update_id:
+            return False                      # stale / replayed frame
+
+        changed = (bid_price != self._top_bid_price
+                   or ask_price != self._top_ask_price)
+
+        for p in [p for p in self._bids if p > bid_price]:
+            del self._bids[p]
+        self._bids[bid_price] = bid_size
+        self._top_bid_price = bid_price
+
+        for p in [p for p in self._asks if p < ask_price]:
+            del self._asks[p]
+        self._asks[ask_price] = ask_size
+        self._top_ask_price = ask_price
+
+        if update_id:
+            self._top_update_id = update_id
+            self._bt_bid = bid_price
+            self._bt_ask = ask_price
+        if changed:
+            self.last_update_ts_ms = (seen_at_ms if seen_at_ms is not None
+                                      else int(time.time() * 1000))
+            self.top_lead_ts_ms = event_ts_ms
+        return changed
+
+    def is_crossed(self) -> bool:
+        """True when the cached top is inverted — always a bug, never a market."""
+        return (self._top_bid_price > 0 and self._top_ask_price > 0
+                and self._top_bid_price >= self._top_ask_price)
 
     # ---- snapshot ----
     def apply_snapshot(
@@ -124,6 +200,18 @@ class OrderBook:
         if len(self._asks) > self.max_levels * 4:
             top_prices = heapq.nsmallest(self.max_levels * 2, self._asks.keys())
             self._asks = {p: self._asks[p] for p in top_prices}
+
+        # depth@100ms lags bookTicker by 10-50ms, so a diff can arrive carrying
+        # levels bookTicker already knows are gone and put a stale bid back
+        # above a fresh ask — a crossed book again, from the other direction.
+        # bookTicker's `u` and depth's `U`/`u` share ONE updateId sequence on
+        # Binance futures, so "which one is newer" is decidable rather than
+        # guessed: the older source never gets to override the newer one.
+        if self._top_update_id > final_update_id and self._bt_bid > 0:
+            for price in [p for p in self._bids if p > self._bt_bid]:
+                del self._bids[price]
+            for price in [p for p in self._asks if p < self._bt_ask]:
+                del self._asks[price]
 
         self._recompute_top()
         self._notify_listeners()
