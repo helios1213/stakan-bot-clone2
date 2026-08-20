@@ -18,6 +18,7 @@ Commands:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -1195,9 +1196,73 @@ async def _send_status_text(query, context) -> None:
     await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+def slot_no(label: Any) -> str:
+    """'slot2' / 2 / '2' -> '2'.  None or unparseable -> '?'.
+
+    Live rows carry the slot as a STRING in `live_trades.account_label`
+    ('slot1'), while `live_open_misses` carries it as an INT in `slot_id`.
+    Both are funnelled through here so the two can be keyed together.
+    Never returns None: an unlabelled trade must still be SHOWN (under '?'),
+    because silently dropping it would understate a slot's PnL.
+    """
+    if label is None:
+        return "?"
+    m = re.search(r"(\d+)", str(label))
+    return m.group(1) if m else "?"
+
+
+def render_live_section(title: str, rows, expired_map: dict) -> list[str]:
+    """LIVE, split per slot. `expired_map` is keyed (symbol, slot)."""
+    n = sum(r["n"] for r in rows)
+    if n == 0:
+        return [f"{title} — <i>none</i>"]
+    pnl = sum((r["pnl"] or 0) for r in rows)
+    wins = sum((r["wins"] or 0) for r in rows)
+    tot_exp = sum(expired_map.get((r["symbol"], slot_no(r["account_label"])), 0)
+                  for r in rows)
+    sec_exp = tot_exp / (n + tot_exp) * 100 if (n + tot_exp) else 0
+    out = [f"{title} ({n} trades, WR={wins / n * 100:.1f}%, "
+           f"exp={sec_exp:.0f}%, PnL=<b>${pnl:+.3f}</b>)"]
+
+    by_slot: dict[str, list] = {}
+    for r in rows:
+        by_slot.setdefault(slot_no(r["account_label"]), []).append(r)
+
+    # '?' (unlabelled) sorts last so real slots read first.
+    for slot in sorted(by_slot, key=lambda s: (s == "?", s)):
+        srows = by_slot[slot]
+        sn = sum(r["n"] for r in srows)
+        spnl = sum((r["pnl"] or 0) for r in srows)
+        swins = sum((r["wins"] or 0) for r in srows)
+        se = "🟢" if spnl > 0 else "🔴" if spnl < 0 else "➖"
+        name = f"slot {slot}" if slot != "?" else "unlabelled"
+        out.append(f"  {se} <b>{name}</b> — {sn} trades, "
+                   f"WR={swins / sn * 100:.0f}%, PnL=<b>${spnl:+.3f}</b>")
+        for r in srows:
+            p = r["pnl"] or 0
+            rwr = r["wins"] / r["n"] * 100 if r["n"] else 0
+            ex = expired_map.get((r["symbol"], slot), 0)
+            att = r["n"] + ex
+            epct = ex / att * 100 if att else 0
+            e = "🟢" if p > 0 else "🔴" if p < 0 else "➖"
+            out.append(
+                f"     {e} <code>{r['symbol']:<10}</code> n={r['n']:<3} "
+                f"WR={rwr:>3.0f}% exp={epct:>3.0f}% PnL=<b>${p:+.3f}</b>"
+            )
+    return out
+
+
+
 async def _send_trades_today(query, context) -> None:
     # Live and Shadow trades live in separate DBs: live → live_db.live_trades,
     # shadow → db.shadow_trades. Show them as two separate sections.
+    #
+    # LIVE is broken down PER SLOT: the same pair can be assigned to slot 1 and
+    # slot 2 at once, and summing them into one row hides which account made or
+    # lost the money. (shadow_engine's heartbeat already keys by
+    # (symbol, account_label) for the same reason — see the note there.)
+    # SHADOW is NOT split: shadow trades are not slot-bound, `account_label` is
+    # NULL on every one of them and `shadow_open_misses` has no slot column.
     db = context.bot_data["db"]
     live_db = context.bot_data.get("live_db")
     today_start = int(datetime.now(ZoneInfo("Europe/Kyiv")).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -1208,6 +1273,13 @@ async def _send_trades_today(query, context) -> None:
         "SUM(net_pnl_usdt) as pnl "
         "FROM {table} WHERE closed_at >= ? AND closed_at IS NOT NULL "
         "GROUP BY symbol ORDER BY pnl DESC"
+    )
+    LIVE_SQL = (
+        "SELECT symbol, account_label, COUNT(*) as n, "
+        "SUM(CASE WHEN net_pnl_usdt > 0 THEN 1 ELSE 0 END) as wins, "
+        "SUM(net_pnl_usdt) as pnl "
+        "FROM live_trades WHERE closed_at >= ? AND closed_at IS NOT NULL "
+        "GROUP BY symbol, account_label ORDER BY pnl DESC"
     )
 
     def _section(title: str, rows, expired_map: dict) -> list[str]:
@@ -1238,7 +1310,7 @@ async def _send_trades_today(query, context) -> None:
     live_rows = []
     if live_db is not None:
         try:
-            live_rows = await live_db.fetchall(SQL.format(table="live_trades"), (today_start,))
+            live_rows = await live_db.fetchall(LIVE_SQL, (today_start,))
         except Exception:
             logger.debug("live trades query failed", exc_info=True)
 
@@ -1250,6 +1322,10 @@ async def _send_trades_today(query, context) -> None:
     # shadow → shadow_open_misses. exp% shown = expired / (filled + expired).
     _EXP_SQL = ("SELECT symbol, COUNT(*) c FROM {t} "
                 "WHERE ts >= ? AND reason='ioc_expired_no_fill' GROUP BY symbol")
+    # live_open_misses HAS a slot_id, so live exp% can be attributed per slot.
+    _LIVE_EXP_SQL = ("SELECT symbol, slot_id, COUNT(*) c FROM live_open_misses "
+                     "WHERE ts >= ? AND reason='ioc_expired_no_fill' "
+                     "GROUP BY symbol, slot_id")
 
     async def _exp_map(conn, table):
         try:
@@ -1258,11 +1334,19 @@ async def _send_trades_today(query, context) -> None:
         except Exception:
             return {}
 
-    live_exp = await _exp_map(live_db, "live_open_misses") if live_db is not None else {}
+    async def _live_exp_map(conn):
+        try:
+            rows = await conn.fetchall(_LIVE_EXP_SQL, (today_start,))
+            return {(r["symbol"], slot_no(r["slot_id"])): r["c"] for r in rows}
+        except Exception:
+            logger.debug("live misses query failed", exc_info=True)
+            return {}
+
+    live_exp = await _live_exp_map(live_db) if live_db is not None else {}
     shadow_exp = await _exp_map(db, "shadow_open_misses")
 
     lines = ["<b>📋 Today</b>  <i>(exp = IOC expired %)</i>", ""]
-    lines += _section("🔴 <b>LIVE</b>", live_rows, live_exp)
+    lines += render_live_section("🔴 <b>LIVE</b>", live_rows, live_exp)
     lines.append("")
     lines += _section("⚡ <b>SHADOW</b>", shadow_rows, shadow_exp)
     await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
