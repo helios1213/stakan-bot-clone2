@@ -1229,6 +1229,11 @@ class LiveExecutor:
         # True, якщо остання спроба завершилась БЕЗ відповіді біржі про долю
         # ордера (ні WS-філ, ні WS-термінал, а REST-полл вийшов у таймаут).
         _outcome_unknown = False
+        # Присвоюється всередині циклу спроб, а читається на виході з нього
+        # (для shadow_twin). Якщо кожна ітерація вийде раніше через continue,
+        # ім'я лишиться незвʼязаним -> NameError НА ЖИВОМУ ОРДЕРНОМУ ШЛЯХУ.
+        # 0.0 читається як «ліміт невідомий», і twin такий рядок просто пропускає.
+        limit_scaled = 0.0
         for attempt in range(1, max_attempts + 1):
             # Safety: don't open a duplicate if a previous attempt partially filled.
             # Skipped on attempt #1 (no prior order possible).
@@ -1645,6 +1650,13 @@ class LiveExecutor:
             order_id=last_order_id,
             error_msg=self.last_error,
             latency_ms=total_latency_ms,
+            # ПОТРІБНО і на цьому шляху. shadow_twin порівнює симулятор із
+            # біржею на тому самому ліміті, а поле заповнювалось ЛИШЕ на
+            # успішному філі — тож у таблицю потрапляли самі лише випадки,
+            # де live налився. Звідси «100% збіг» на 255 рядках: ми просто
+            # ніколи не дивились на протухлі. А саме вони й показують, чи
+            # симулятор філиться там, де біржа не змогла.
+            limit_price_scaled=limit_scaled,
             raw_response=last_response,
         )
 

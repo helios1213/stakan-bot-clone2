@@ -129,3 +129,33 @@ def test_orderbook_is_imported():
 @pytest.mark.parametrize("name", ["_schedule_twin", "_record_twin"])
 def test_methods_are_reachable(name):
     assert callable(getattr(ShadowEngine, name))
+
+
+# ---- the expired case is the one that matters ---------------------------
+
+def test_expiry_path_also_carries_the_limit():
+    """255 twin rows showed 100% agreement — because only FILLED live orders
+    ever produced a row: `limit_price_scaled` was populated on the success
+    return only, and the recorder skips rows without a limit. The interesting
+    case (live expired, would the simulator have filled?) was invisible."""
+    ex = Path("src/execution/live_executor.py").read_text()
+    i = ex.index('"[IOC OPEN] %s SKIPPED after %d attempts')
+    seg = ex[i:i + 3000]      # the comment block before the return is long
+    assert "limit_price_scaled=limit_scaled" in seg, (
+        "the expiry return drops the limit, so expired orders never get a twin"
+    )
+
+
+def test_limit_is_bound_before_the_attempt_loop():
+    """It is assigned INSIDE the loop but read AFTER it. If every iteration
+    exits early via continue, the name is unbound — NameError on the live
+    order path."""
+    ex = Path("src/execution/live_executor.py").read_text()
+    init = ex.index("limit_scaled = 0.0")
+    loop = ex.index("for attempt in range(1, max_attempts + 1):")
+    assert init < loop, "limit_scaled must be initialised before the loop"
+
+
+def test_twin_skips_rows_without_a_limit():
+    body = _fn("_record_twin")
+    assert "if limit <= 0:" in body
