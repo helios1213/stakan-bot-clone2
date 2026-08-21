@@ -122,6 +122,10 @@ async def test_max_attempts_one_skips_retry_sleep_on_expiry(monkeypatch):
     executor.alerts = None
     executor.webkey_store = None
     executor.order_timeout_sec = 15.0
+    # Phantom-gate state (2026-08-21). __new__ skips __init__, so anything
+    # added there must be mirrored here or every open raises AttributeError.
+    executor._phantom_unknown = set()
+    executor._phantom_tasks = set()
 
     # Mock client: submit accepts (code=0, orderId), but poll never finds fill.
     client = MagicMock()
@@ -190,6 +194,10 @@ async def test_max_attempts_two_does_sleep_retry_once_on_expiry(monkeypatch):
     executor.alerts = None
     executor.webkey_store = None
     executor.order_timeout_sec = 15.0
+    # Phantom-gate state (2026-08-21). __new__ skips __init__, so anything
+    # added there must be mirrored here or every open raises AttributeError.
+    executor._phantom_unknown = set()
+    executor._phantom_tasks = set()
 
     client = MagicMock()
     client.submit_order = AsyncMock(return_value={

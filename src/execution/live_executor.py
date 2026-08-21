@@ -742,6 +742,10 @@ class LiveExecutor:
         # Fire-and-forget phantom-fill checks (strong refs so the GC can't kill
         # an in-flight check before it flattens a naked position).
         self._phantom_tasks: set[asyncio.Task] = set()
+        # Символи, де останній IOC завершився НЕВІДОМО (біржа не сказала ні
+        # 'налився', ні 'протух') і фантом-перевірка ще не дала відповіді.
+        # Поки триває — нових відкриттів по цьому символу не робимо.
+        self._phantom_unknown: set[str] = set()
 
         # Stats
         self.opens_attempted = 0
@@ -1174,6 +1178,27 @@ class LiveExecutor:
                 error_msg=f"invalid direction: {direction}",
             )
 
+        # The previous IOC on this symbol ended with the exchange telling us
+        # NOTHING — no fill push, no terminal state, REST poll timed out — and
+        # the phantom re-check has not answered yet. Sending another order now
+        # means stacking on a position that may already exist: on 2026-08-21
+        # 12:03 that produced FIVE phantom fills in 34 seconds plus
+        # api_error_2021 ("leverage inconsistent with the existing position").
+        # Bounded wait: the check gives up after its last window (~12s).
+        # A CONFIRMED expiry never lands here — 211 of those in the log, zero
+        # phantoms — so the normal path keeps its full speed.
+        if symbol in self._phantom_unknown:
+            self.opens_failed += 1
+            self.last_error = "phantom_check_pending"
+            logger.warning(
+                "[PHANTOM] %s: попередній IOC без відповіді біржі — новий ордер "
+                "відкладено до кінця перевірки", symbol,
+            )
+            return LiveOrderResult(
+                success=False,
+                error_msg="phantom_check_pending: previous IOC outcome unknown",
+            )
+
         if mexc_ob is None or not getattr(mexc_ob, "is_synced", False):
             self.opens_failed += 1
             self.last_error = "ioc_orderbook_not_synced"
@@ -1201,6 +1226,9 @@ class LiveExecutor:
 
         # Sticky across attempts — see the final verdict below.
         freq_error_msg: str | None = None
+        # True, якщо остання спроба завершилась БЕЗ відповіді біржі про долю
+        # ордера (ні WS-філ, ні WS-термінал, а REST-полл вийшов у таймаут).
+        _outcome_unknown = False
         for attempt in range(1, max_attempts + 1):
             # Safety: don't open a duplicate if a previous attempt partially filled.
             # Skipped on attempt #1 (no prior order possible).
@@ -1464,6 +1492,10 @@ class LiveExecutor:
                     fee_out=_fee_box,
                 )
             t_after_poll = time.monotonic()
+            # Біржа не сказала нічого певного: WS промовчав, REST-полл вичерпав
+            # таймаут. Саме цей клас дає фантоми — див. коментар нижче на виході.
+            _outcome_unknown = (_fill_via == "rest"
+                                and not (fill_price_scaled > 0 and real_filled_vol > 0))
             if _fill_via == "ws":
                 logger.info(
                     "[FILL SRC] %s via=ws price=%.8f vol=%d %.0fms (poll-free)",
@@ -1596,7 +1628,18 @@ class LiveExecutor:
         # this to ioc_* verdicts skipped exactly that case, which is the
         # -$25.82 liquidation class.
         if last_order_id:
-            self._schedule_phantom_check(last_order_id, symbol, direction, leverage)
+            # Класифікація має значення. `ws_expired` — це ВІДПОВІДЬ біржі
+            # (terminal state, dealVol=0): за 211 таких випадків у логу жодного
+            # фантома. А ось коли WS промовчав і REST-полл вийшов у таймаут, ми
+            # не знаємо нічого — у логу таких 28, і 5 із них НАСПРАВДІ налились.
+            # Тому блокуємо нові відкриття по символу лише в другому випадку:
+            # інакше стріляємо поверх позиції, якої «нема», і ловимо каскад
+            # (2026-08-21 12:03 — 5 фантомів за 34с) плюс api_error_2021
+            # 'leverage inconsistent with existing position'.
+            if _outcome_unknown:
+                self._phantom_unknown.add(symbol)
+            self._schedule_phantom_check(last_order_id, symbol, direction, leverage,
+                                         unknown=_outcome_unknown)
         return LiveOrderResult(
             success=False,
             order_id=last_order_id,
@@ -1605,9 +1648,15 @@ class LiveExecutor:
             raw_response=last_response,
         )
 
-    def _schedule_phantom_check(self, order_id, symbol, direction, leverage) -> None:
+    def _schedule_phantom_check(self, order_id, symbol, direction, leverage,
+                                unknown: bool = False) -> None:
         """Fire-and-forget scheduler — the caller returns immediately (hot path
-        untouched). Strong-refs the task so it can't be GC'd mid-flight."""
+        untouched). Strong-refs the task so it can't be GC'd mid-flight.
+
+        `unknown=True` means the slot is BLOCKED on this symbol until the check
+        finishes, so the release must happen whatever the outcome — including a
+        crash in the check itself, otherwise the symbol would be blocked forever.
+        """
         try:
             task = asyncio.create_task(
                 self._phantom_open_check(order_id, symbol, direction, leverage),
@@ -1615,8 +1664,14 @@ class LiveExecutor:
             )
             self._phantom_tasks.add(task)
             task.add_done_callback(self._phantom_tasks.discard)
+            if unknown:
+                task.add_done_callback(
+                    lambda _t, _s=symbol: self._phantom_unknown.discard(_s))
         except Exception:
             logger.exception("[PHANTOM] failed to schedule check for %s order %s", symbol, order_id)
+            # Планувальник упав — блокування нікому знімати. Знімаємо самі,
+            # інакше символ мовчки випадає з торгівлі назавжди.
+            self._phantom_unknown.discard(symbol)
 
     async def _phantom_open_check(self, order_id, symbol, direction, leverage) -> None:
         """Re-check the order's REAL deals at widening windows. A fill can appear
