@@ -274,3 +274,38 @@ def test_held_seconds_are_shown_in_the_alert():
     """Without it you cannot tell a 3-minute move from a 30-minute one."""
     b = _burst_src()
     assert '_trigger += f" ({_held}с)"' in b
+
+
+# ---- the movement gate went blind on a sustained good period -------------
+
+def test_movement_gate_has_an_absolute_path():
+    """2026-08-21: SOXL made +$120 in 3 minutes, three of four triggers said
+    yes, and the mandatory movement gate said no — because the whole HOUR had
+    been just as active, so the baseline had risen to meet it (2.35t against a
+    3.03t norm = x0.78). Same blindness already fixed for bps: a purely
+    relative test cannot see a period that is uniformly good."""
+    b = _burst_src()
+    assert "or (pk1000_abs > 0 and rpk10 >= pk1000_abs)" in b
+    assert 'BURST_PK1000_ABS", "2.4"' in b
+
+
+def test_absolute_movement_threshold_can_be_switched_off():
+    b = _burst_src()
+    assert "pk1000_abs > 0" in b
+
+
+def test_null_movement_is_unknown_not_zero():
+    """22-30% of rows carry a NULL peak_ticks. Counting them as 0 movement
+    understated the gate systematically — on both sides of the ratio."""
+    b = _burst_src()
+    assert 'if r["peak_ticks_at_1000ms"] is not None' in b
+    assert '(r["peak_ticks_at_1000ms"] or 0.0) for r in w' not in b, (
+        "the window average still treats NULL as zero"
+    )
+
+
+def test_movement_still_gates_the_alert():
+    """It must stay mandatory — dropping it entirely took the replay from 100%
+    profitable to 88-90%."""
+    b = _burst_src()
+    assert "_candidate = _move_ok and (" in b

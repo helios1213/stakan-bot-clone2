@@ -567,6 +567,7 @@ class ShadowEngine:
         self._mexc_feed_lag_ms = max(0, int(getattr(cfg, "mexc_feed_lag_ms", 0)))
         # Сильні посилання на twin-задачі, щоб GC не прибрав їх у польоті.
         self._twin_tasks: set = set()
+        self._burst_diag_ts = 0.0
         self._max_book_age_ms = max(0, int(getattr(cfg, "max_book_age_ms", 0)))
         # T1.2; 1.0 = вимкнено. Обмежено (0, 1] — 0 означав би «жодної
         # ліквідності», тобто тихо вимкнув би shadow-торгівлю цілком.
@@ -826,6 +827,15 @@ class ShadowEngine:
         conf_min = float(os.environ.get("BURST_CONF_MIN", "0.62"))  # лише для показу
         pk1000_min = float(os.environ.get("BURST_PK1000_MIN", "1.0"))  # абс. підлога (сан.)
         pk1000_mult = float(os.environ.get("BURST_PK1000_MULT", "1.5"))  # відносний гейт (самокалібр.)
+        # Гейт руху був ЧИСТО ВІДНОСНИМ, і через це сліпнув на затяжному
+        # хорошому періоді: 2026-08-21 SOXL робив +$120 за 3 хв, три тригери з
+        # чотирьох казали «так», а рух 2.35т проти годинної норми 3.03т давав
+        # x0.78 — бо ВСЯ година була такою ж активною. Норма підтягувалась і
+        # перекривала сплеск. Той самий клас сліпоти, що вже виправляли для bps.
+        # Тепер є другий шлях: абсолютний рух. Поріг 2.4 — це МІНІМУМ по топ-5
+        # найприбутковіших вікон трьох еталонних днів (08-13, 08-18, 08-21).
+        # Реплей: 6 алертів/4 вартих -> 9/6 при тій самій точності 67%.
+        pk1000_abs = float(os.environ.get("BURST_PK1000_ABS", "2.4"))
         min_trades = int(os.environ.get("BURST_MIN_TRADES", "8"))
         # ДРУГИЙ тригер: аномально хороша торгівля НЕЗАЛЕЖНО ВІД РОЗМІРУ.
         # Частотний гейт ловить «торгує багато», але пара може торгувати зі
@@ -918,7 +928,12 @@ class ShadowEngine:
                         rate = n_win / (win_sec / 60.0)
                         rpnl = sum((r["net_pnl_usdt"] or 0.0) for r in w)
                         rconf = sum((r["confidence"] or 0.0) for r in w) / n_win
-                        rpk10 = sum((r["peak_ticks_at_1000ms"] or 0.0) for r in w) / n_win
+                        # NULL — це «невідомо», а не «руху не було». 22-30%
+                        # рядків мають порожній peak_ticks, і рахувати їх нулем
+                        # означало систематично занижувати рух.
+                        _pw = [r["peak_ticks_at_1000ms"] for r in w
+                               if r["peak_ticks_at_1000ms"] is not None]
+                        rpk10 = (sum(_pw) / len(_pw)) if _pw else 0.0
                         # Розмір САМЕ в цьому сплеску, а не абстрактний конфіг:
                         # порада «збільшити» має вимірюватись від того, чим ми
                         # торгуємо просто зараз.
@@ -933,9 +948,9 @@ class ShadowEngine:
                         base_bps = ((sum((r["net_pnl_usdt"] or 0.0) for r in tr)
                                      / _bn * 1e4) if _bn > 0 else 0.0)
                         # base pk1000 за годину = НОРМА пари (для самокалібрації)
-                        base_pk10 = max(
-                            sum((r["peak_ticks_at_1000ms"] or 0.0) for r in tr) / len(tr),
-                            0.5)
+                        _pb = [r["peak_ticks_at_1000ms"] for r in tr
+                               if r["peak_ticks_at_1000ms"] is not None]
+                        base_pk10 = max((sum(_pb) / len(_pb)) if _pb else 0.0, 0.5)
                         # Розрізнювач real-burst vs fake = СПРИЯТЛИВИЙ РУХ (pk1000)
                         # ВІДНОСНО власної норми пари (самокалібрація під БУДЬ-ЯКУ
                         # пару). Валідовано на 08-13+08-18: rpk >= 1.5x норми ловить
@@ -944,8 +959,11 @@ class ShadowEngine:
                         # нього якість падає з 100% до 88-90% і зʼявляються
                         # збиткові спрацювання. Це єдиний гейт, що відрізняє
                         # реальний рух від чопу.
-                        _move_ok = (rpk10 >= pk1000_mult * base_pk10
-                                    and rpk10 >= pk1000_min)
+                        # Відносний АБО абсолютний. Абсолютний потрібен саме
+                        # тоді, коли норма вже висока — тобто коли добре давно.
+                        _move_ok = ((rpk10 >= pk1000_mult * base_pk10
+                                     and rpk10 >= pk1000_min)
+                                    or (pk1000_abs > 0 and rpk10 >= pk1000_abs))
                         _by_rate = rate >= rate_mult * base_rate and rpnl > 0
                         _by_bps = (rate >= bps_rate_mult * base_rate
                                    and rbps >= bps_mult * max(base_bps, 0.2)
@@ -964,6 +982,21 @@ class ShadowEngine:
                             run_since.pop(key, None)
                         _held = (now - run_since[key]) if key in run_since else 0
                         is_burst = _candidate and _held >= persist_sec
+                        # ДІАГНОСТИКА (2026-08-21): детектор мовчав, хоча всі
+                        # гейти рахувались правильно поза ботом. Статичний огляд
+                        # коду нічого не дав, тож пишемо стан раз на хвилину —
+                        # без цього неможливо відрізнити «умова не виконалась»
+                        # від «цикл сюди не доходить».
+                        if now - self._burst_diag_ts >= 60:
+                            self._burst_diag_ts = now
+                            logger.info(
+                                "[BURST_DIAG] %s n_win=%d rate=%.1f/%.1f move=%s "
+                                "rate_ok=%s bps=%.2f/%.2f abs=%s sust=%s cand=%s "
+                                "held=%ds/%ds",
+                                symbol, n_win, rate, base_rate, _move_ok,
+                                _by_rate, rbps, base_bps, _by_abs, _by_sustain,
+                                _candidate, _held, persist_sec,
+                            )
                         _trigger = "+".join(
                             n for n, ok in (("частота", _by_rate), ("bps", _by_bps),
                                             ("абс.bps", _by_abs),
