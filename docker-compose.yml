@@ -10,6 +10,10 @@ services:
     env_file: .env
     environment:
       - TZ=Europe/Kyiv
+      # Тримати однаковим з primary: 3.0 виявився налаштованим під більший
+      # сплеск, ніж буває — за 3 доби до 2026-08-21 спрацював НУЛЬ разів і
+      # проґавив прогін SOXL на +$147.78 (пік x2.70 від медіани пари).
+      - BURST_RATE_MULT=2.25
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

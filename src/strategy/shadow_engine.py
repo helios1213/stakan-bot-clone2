@@ -722,33 +722,48 @@ class ShadowEngine:
         PUSHOVER_TOKEN/PUSHOVER_USER не задані. Ніколи не кидає — лише сповіщення."""
         import os
         token = os.environ.get("PUSHOVER_TOKEN", "").strip()
-        user = os.environ.get("PUSHOVER_USER", "").strip()
-        if not token or not user:
+        user_raw = os.environ.get("PUSHOVER_USER", "").strip()
+        if not token or not user_raw:
             return
+        # PUSHOVER_USER may hold SEVERAL keys separated by commas (one per
+        # device/person). Pushover's `user` parameter takes exactly ONE key —
+        # a comma-joined value is rejected with HTTP 400 "user key is invalid",
+        # which is how this alert stayed silent even when it did fire. Send one
+        # request per recipient instead of one request for all of them.
+        users = [u.strip() for u in user_raw.split(",") if u.strip()]
         priority = int(os.environ.get("PUSHOVER_PRIORITY", "1"))
-        params = {
-            "token": token, "user": user, "title": title[:250],
-            "message": message[:1024], "priority": priority,
-            "sound": os.environ.get("PUSHOVER_SOUND", "siren"),
-        }
-        if priority == 2:  # emergency: repeats until acknowledged
-            params["retry"] = int(os.environ.get("PUSHOVER_RETRY", "60"))
-            params["expire"] = int(os.environ.get("PUSHOVER_EXPIRE", "3600"))
 
-        def _post():
+        def _post(one_user: str):
             import urllib.request, urllib.parse
+            params = {
+                "token": token, "user": one_user, "title": title[:250],
+                "message": message[:1024], "priority": priority,
+                "sound": os.environ.get("PUSHOVER_SOUND", "siren"),
+            }
+            if priority == 2:  # emergency: repeats until acknowledged
+                params["retry"] = int(os.environ.get("PUSHOVER_RETRY", "60"))
+                params["expire"] = int(os.environ.get("PUSHOVER_EXPIRE", "3600"))
             data = urllib.parse.urlencode(params).encode()
             req = urllib.request.Request(
                 "https://api.pushover.net/1/messages.json", data=data)
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status
 
-        try:
-            loop = asyncio.get_running_loop()
-            status = await loop.run_in_executor(None, _post)
-            logger.info("[BURST] pushover надіслано (HTTP %s)", status)
-        except Exception:
-            logger.exception("[BURST] pushover send failed")
+        loop = asyncio.get_running_loop()
+        sent = 0
+        for idx, one in enumerate(users, 1):
+            # One bad key must not silence the others.
+            try:
+                status = await loop.run_in_executor(None, _post, one)
+                sent += 1
+                logger.info("[BURST] pushover -> отримувач %d/%d (HTTP %s)",
+                            idx, len(users), status)
+            except Exception:
+                logger.exception("[BURST] pushover send failed (отримувач %d/%d)",
+                                 idx, len(users))
+        if not sent:
+            logger.error("[BURST] pushover: ЖОДЕН з %d отримувачів не отримав "
+                         "сповіщення", len(users))
 
     async def _burst_alert_loop(self) -> None:
         """Детектор сплеску волатильності → Telegram-алерт. РОЗМІР НЕ ЧІПАЄ —
