@@ -205,3 +205,22 @@ def test_base_trades_gate_lowered_with_the_reason_recorded():
 def test_trigger_label_lists_every_firing_condition():
     b = _burst_src()
     assert '("абс.bps", _by_abs)' in b
+
+
+def test_compose_pins_the_recalibrated_thresholds():
+    """First calibration produced alerts on $1.9-2.8 windows — noise dressed as
+    a burst. The mistake was the METRIC: thresholds were picked for "was there
+    profit after" (90% yes) instead of "was it worth acting on" (19%). The fix
+    is deliberately SIZE-INDEPENDENT: more trades in the window, not a dollar
+    floor. 5 trades give a random bps; 10 do not.
+    Replay over 5 days: 21 alerts / 19% worth acting on -> 8 / 88%."""
+    from pathlib import Path
+    import re
+    c = Path("docker-compose.yml").read_text()
+    def val(k):
+        m = re.search(rf"{k}=([\d.]+)", c)
+        assert m, f"{k} must stay pinned in compose"
+        return float(m.group(1))
+    assert val("BURST_MIN_TRADES") >= 10, "fewer trades = the bps is noise"
+    assert val("BURST_BPS_ABS") >= 3.0
+    assert val("BURST_BPS_MULT") >= 3.0
