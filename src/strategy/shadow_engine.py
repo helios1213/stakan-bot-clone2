@@ -1389,6 +1389,7 @@ class ShadowEngine:
             # Re-check orderbook is still synced
             if not mexc_ob.is_synced:
                 self.signals_skipped_no_book += 1
+                await self._record_shadow_miss(symbol, "book_desynced")
                 return
 
             # Check if price moved adversely during latency
@@ -1405,6 +1406,7 @@ class ShadowEngine:
                             "[LATENCY DRIFT] %s LONG: price moved +%.4f%% during %.0fms → skip",
                             symbol, drift_pct, latency_ms,
                         )
+                        await self._record_shadow_miss(symbol, "latency_drift")
                         return
                 else:
                     # adverse if mid went DOWN significantly
@@ -1414,6 +1416,7 @@ class ShadowEngine:
                             "[LATENCY DRIFT] %s SHORT: price moved %.4f%% during %.0fms → skip",
                             symbol, drift_pct, latency_ms,
                         )
+                        await self._record_shadow_miss(symbol, "latency_drift")
                         return
 
         # Randomize position size per trade (within configured bounds)
@@ -1442,6 +1445,7 @@ class ShadowEngine:
                     "[REJECTED] %s %s reason=%s",
                     symbol, signal.direction, reject_reason,
                 )
+                await self._record_shadow_miss(symbol, "sim_reject")
                 return
 
         # === REALISM Level 6: server error / timeout simulation ===
@@ -1463,6 +1467,7 @@ class ShadowEngine:
                     "[SERVER_ERROR] %s %s — entry treated as failed (+%dms)",
                     symbol, signal.direction, extra_latency_ms,
                 )
+                await self._record_shadow_miss(symbol, "sim_server_error")
                 return
 
         # === REALISM: latency before order reaches MEXC ===
@@ -1483,6 +1488,7 @@ class ShadowEngine:
             if mexc_ob is None or not mexc_ob.is_synced:
                 self.entries_rejected += 1
                 logger.debug("[REJECTED] %s orderbook stale after latency", symbol)
+                await self._record_shadow_miss(symbol, "book_desynced")
                 return
 
         last_result = None
@@ -1571,18 +1577,31 @@ class ShadowEngine:
         # Trades Today view can show shadow expired%. Shadow pairs only; live
         # pairs record via _record_live_miss into live_open_misses. Best-effort.
         if not _is_live_pair:
-            try:
-                await self.db.execute(
-                    "INSERT INTO shadow_open_misses (ts, symbol, reason) VALUES (?, ?, ?)",
-                    (int(time.time()), symbol, "ioc_expired_no_fill"),
-                )
-            except Exception:
-                pass
+            await self._record_shadow_miss(symbol, "ioc_expired_no_fill")
         if last_result:
             logger.debug(
                 "[IOC EXPIRED] %s %s after %d attempts (%s)",
                 symbol, signal.direction, cfg.ioc_max_attempts, last_result.expired_reason,
             )
+
+    async def _record_shadow_miss(self, symbol: str, reason: str) -> None:
+        """Record a shadow entry that never became a trade.
+
+        Only `ioc_expired_no_fill` used to be written here, so every OTHER way a
+        shadow entry can die (latency drift, simulated reject, simulated server
+        error) left no trace at all — and shadow's fill-rate is computed as
+        fills/(fills+misses). Missing denominators made shadow look better at
+        getting filled than it actually is, which is one half of why shadow
+        results read sweeter than live. Best-effort: the trading loop must never
+        break because a stats row failed to insert.
+        """
+        try:
+            await self.db.execute(
+                "INSERT INTO shadow_open_misses (ts, symbol, reason) VALUES (?, ?, ?)",
+                (int(time.time()), symbol, reason),
+            )
+        except Exception:
+            logger.debug("shadow miss not recorded (%s/%s)", symbol, reason, exc_info=True)
 
     async def _open_position(
         self,
@@ -1942,6 +1961,20 @@ class ShadowEngine:
                         # Recalculate qty based on real fill notional (not planned)
                         if pos.entry_price > 0:
                             pos.qty = pos.notional_usdt / pos.entry_price
+
+                        # Re-measure entry slippage against the limit we ACTUALLY
+                        # sent. It was computed far above against a stub equal to
+                        # the signal price, and then never revisited once the real
+                        # fill arrived — which is why the column read 0.00 on every
+                        # live row ever written. Sign convention matches the shadow
+                        # path: positive = we got a WORSE price than we asked for.
+                        _lim = live_result.limit_price_scaled
+                        if _lim > 0:
+                            pos.entry_limit_price = _lim
+                            if pos.direction == "long":
+                                pos.entry_slippage_pct = (pos.entry_price - _lim) / _lim * 100
+                            else:
+                                pos.entry_slippage_pct = (_lim - pos.entry_price) / _lim * 100
                     safety.record_open(signal.symbol)
                     # Log both planned and actual when there's a partial fill
                     if pos.notional_usdt < live_notional * 0.99:
@@ -3521,7 +3554,7 @@ class ShadowEngine:
                     exit_price, exit_slippage_pct, closed_at, exit_reason,
                     pnl_usdt, roi_pct, duration_sec, duration_ms,
                     mfe_pct, mae_pct, peak_roi_pct, trough_roi_pct,
-                    entry_target_price, entry_filled_pct, entry_status, entry_attempted_at,
+                    entry_target_price, entry_limit_price, entry_filled_pct, entry_status, entry_attempted_at,
                     detector_source, confidence,
                     binance_price_at_entry, mexc_price_at_entry, mexc_lag_at_entry_pct,
                     entry_fees_usdt, exit_fees_usdt, net_pnl_usdt,
@@ -3534,7 +3567,7 @@ class ShadowEngine:
                     peak_ticks_at_1500ms, peak_ticks_at_2000ms,
                     adverse_ticks_at_1000ms)
                    VALUES (?,?,?,?,?,?,?, ?,?,?, ?,?,?,?,
-                           ?,?,?,?, ?,?,?,?, ?,?,?,?,
+                           ?,?,?,?, ?,?,?,?, ?,?,?,?,?,
                            ?,?, ?,?,?,
                            ?,?,?, ?,?,?,
                            ?,?,
@@ -3550,7 +3583,7 @@ class ShadowEngine:
                     pos.exit_reason,
                     pos.pnl_usdt, pos.current_roi_pct, pos.duration_sec, pos.duration_ms,
                     pos.mfe_pct, pos.mae_pct, pos.peak_roi_pct, pos.trough_roi_pct,
-                    pos.entry_target_price, pos.entry_filled_pct, pos.entry_status,
+                    pos.entry_target_price, pos.entry_limit_price, pos.entry_filled_pct, pos.entry_status,
                     pos.entry_attempted_at_ms // 1000,
                     pos.detector_source, pos.confidence,
                     pos.binance_price_at_entry, pos.mexc_price_at_entry,

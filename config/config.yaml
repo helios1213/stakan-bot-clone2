@@ -125,7 +125,11 @@ shadow:
 
 # ---- Risk management ----
 risk:
-  max_concurrent_shadow_positions: 5
+  # max_concurrent_shadow_positions ПРИБРАНО 2026-08-21: RiskConf його ніколи не
+  # читав (жодної згадки в src/), тобто ключ роками описував неіснуючу поведінку —
+  # «shadow тримає 5 позицій», хоча реальний кеп 1/символ у ОБОХ режимах, ось він
+  # нижче. НЕ вмикати його назад: з cap=5 shadow візьме ще ~109k угод і розрив із
+  # live виросте до ~40x. Див. shadow_realism_audit_2026-08-21.md.
   max_positions_per_symbol: 1
   daily_max_signals: 500               # circuit breaker — log and pause if exceeded
   pause_on_anomaly: true               # auto-pause if win-rate drops below threshold

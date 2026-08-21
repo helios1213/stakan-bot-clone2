@@ -53,8 +53,14 @@ class ShadowPosition:
 
     # Entry
     entry_target_price: float = 0.0    # what we asked for (IOC limit)
+    # The limit price REALLY submitted to MEXC (live only; 0.0 in shadow).
+    # Separate from entry_target_price on purpose: for live pairs the latter is
+    # a stub equal to the signal price, so slippage measured against it came out
+    # identically 0.0 on all 86,719 live rows. Kept as its OWN column so the
+    # historical meaning of entry_target_price stays intact.
+    entry_limit_price: float = 0.0
     entry_price: float = 0.0           # what we got (avg fill)
-    entry_slippage_pct: float = 0.0    # vs target
+    entry_slippage_pct: float = 0.0    # vs target (live: vs entry_limit_price)
     entry_status: str = "filled"       # 'filled' | 'partial'
     entry_filled_pct: float = 1.0
     entry_fees_usdt: float = 0.0       # 0 for IOC limit on MEXC

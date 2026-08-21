@@ -251,6 +251,13 @@ async def init_live_db(live_db: LiveDatabase) -> None:
     await _add_columns_idempotent_live(live_db, "live_trades", LIVE_TRADES_LATENCY_COLUMNS)
     # 2026-07-20: per-signal join key (signal.created_at_ms) — no FK, links trade→signal_features.
     await _add_columns_idempotent_live(live_db, "live_trades", [("signal_uid", "INTEGER")])
+    # 2026-08-21: the limit price we ACTUALLY submitted. entry_slippage_pct used
+    # to be measured against a stub equal to the signal price and so came out
+    # identically 0.0 on all 86,719 rows written before this date — the column
+    # was write-only and we could not see how much worse than our own limit we
+    # really fill. New column rather than redefining entry_target_price, so old
+    # rows keep their original meaning. Rows before this stay NULL by design.
+    await _add_columns_idempotent_live(live_db, "live_trades", [("entry_limit_price", "REAL")])
     # 2026-06: misses log moved bps → tick-exact offset.
     await _add_columns_idempotent_live(live_db, "live_open_misses", [("ioc_offset_ticks", "INTEGER")])
     await _drop_column_idempotent_live(live_db, "live_open_misses", "ioc_offset_bps")

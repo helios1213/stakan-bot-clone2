@@ -1656,6 +1656,25 @@ class StakanTelegramBot:
 # Live PnL handlers (separate isolated DB)
 # ============================================================
 
+def fmt_pnl_row(row, label: str) -> str:
+    """One PnL line for the Shadow/Live summaries — in $ AND in bps of notional.
+
+    bps is the only figure that compares the two: shadow and live trade
+    DIFFERENT notional (measured 2026-08-21: live SOXL 2933 vs shadow 1470), so
+    a dollar total silently rewards whoever traded bigger. On SOXL that made the
+    shadow-vs-live gap read as 1.9x when in bps it is 3.7x — the dollars were
+    hiding it. Both summaries share this renderer so they cannot drift apart.
+    """
+    if not row or not row["n"]:
+        return f"<b>{label}:</b> no trades"
+    n = row["n"]
+    pnl = row["pnl"] or 0.0
+    noc = row["noc"] if "noc" in row.keys() else None
+    wr = ((row["wins"] or 0) / n * 100) if n else 0
+    bps = f", {pnl / noc * 1e4:+.3f} bps" if noc else ""
+    return f"<b>{label}:</b> {n} trades, WR {wr:.1f}%, PnL ${pnl:+.2f}{bps}"
+
+
 async def _send_shadow_pnl(update, context) -> None:
     """Show shadow PnL summary (today + last 7d + all-time) from shadow_trades.
 
@@ -1681,6 +1700,7 @@ async def _send_shadow_pnl(update, context) -> None:
             """SELECT COUNT(*) AS n,
                       SUM(CASE WHEN pnl_usdt>0 THEN 1 ELSE 0 END) AS wins,
                       SUM(pnl_usdt) AS pnl,
+                      SUM(notional_usdt) AS noc,
                       SUM(CASE WHEN pnl_usdt>0 THEN pnl_usdt ELSE 0 END) AS gp,
                       SUM(CASE WHEN pnl_usdt<0 THEN ABS(pnl_usdt) ELSE 0 END) AS gl
                  FROM shadow_trades
@@ -1690,7 +1710,8 @@ async def _send_shadow_pnl(update, context) -> None:
         week_row = await db.fetchone(
             """SELECT COUNT(*) AS n,
                       SUM(CASE WHEN pnl_usdt>0 THEN 1 ELSE 0 END) AS wins,
-                      SUM(pnl_usdt) AS pnl
+                      SUM(pnl_usdt) AS pnl,
+                      SUM(notional_usdt) AS noc
                  FROM shadow_trades
                 WHERE closed_at >= ? AND closed_at IS NOT NULL""",
             (week_ago,),
@@ -1698,7 +1719,8 @@ async def _send_shadow_pnl(update, context) -> None:
         total_row = await db.fetchone(
             """SELECT COUNT(*) AS n,
                       SUM(CASE WHEN pnl_usdt>0 THEN 1 ELSE 0 END) AS wins,
-                      SUM(pnl_usdt) AS pnl
+                      SUM(pnl_usdt) AS pnl,
+                      SUM(notional_usdt) AS noc
                  FROM shadow_trades
                 WHERE closed_at IS NOT NULL"""
         )
@@ -1706,14 +1728,7 @@ async def _send_shadow_pnl(update, context) -> None:
         await update.message.reply_text(f"⚠️ Shadow DB query failed: {e}")
         return
 
-    def fmt(row, label):
-        if not row or not row["n"]:
-            return f"<b>{label}:</b> no trades"
-        n = row["n"]
-        wins = row["wins"] or 0
-        pnl = row["pnl"] or 0.0
-        wr = (wins / n * 100) if n else 0
-        return f"<b>{label}:</b> {n} trades, WR {wr:.1f}%, PnL ${pnl:+.2f}"
+    fmt = fmt_pnl_row
 
     text = "<b>🧪 SHADOW PnL</b>  <i>(sim)</i>\n\n"
     text += fmt(today_row, "Today (Kyiv)") + "\n"
@@ -1748,6 +1763,7 @@ async def _send_live_pnl(update, context) -> None:
             """SELECT COUNT(*) AS n,
                       SUM(CASE WHEN net_pnl_usdt>0 THEN 1 ELSE 0 END) AS wins,
                       SUM(net_pnl_usdt) AS pnl,
+                      SUM(notional_usdt) AS noc,
                       SUM(CASE WHEN net_pnl_usdt>0 THEN net_pnl_usdt ELSE 0 END) AS gp,
                       SUM(CASE WHEN net_pnl_usdt<0 THEN ABS(net_pnl_usdt) ELSE 0 END) AS gl
                  FROM live_trades
@@ -1757,7 +1773,8 @@ async def _send_live_pnl(update, context) -> None:
         week_row = await live_db.fetchone(
             """SELECT COUNT(*) AS n,
                       SUM(CASE WHEN net_pnl_usdt>0 THEN 1 ELSE 0 END) AS wins,
-                      SUM(net_pnl_usdt) AS pnl
+                      SUM(net_pnl_usdt) AS pnl,
+                      SUM(notional_usdt) AS noc
                  FROM live_trades
                 WHERE closed_at >= ? AND closed_at IS NOT NULL""",
             (week_ago,),
@@ -1765,7 +1782,8 @@ async def _send_live_pnl(update, context) -> None:
         total_row = await live_db.fetchone(
             """SELECT COUNT(*) AS n,
                       SUM(CASE WHEN net_pnl_usdt>0 THEN 1 ELSE 0 END) AS wins,
-                      SUM(net_pnl_usdt) AS pnl
+                      SUM(net_pnl_usdt) AS pnl,
+                      SUM(notional_usdt) AS noc
                  FROM live_trades
                 WHERE closed_at IS NOT NULL"""
         )
@@ -1773,14 +1791,7 @@ async def _send_live_pnl(update, context) -> None:
         await update.message.reply_text(f"⚠️ Live DB query failed: {e}")
         return
 
-    def fmt(row, label):
-        if not row or not row["n"]:
-            return f"<b>{label}:</b> no trades"
-        n = row["n"]
-        wins = row["wins"] or 0
-        pnl = row["pnl"] or 0.0
-        wr = (wins / n * 100) if n else 0
-        return f"<b>{label}:</b> {n} trades, WR {wr:.1f}%, PnL ${pnl:+.2f}"
+    fmt = fmt_pnl_row
 
     text = "<b>🔴 LIVE PnL</b>  <i>(isolated DB)</i>\n\n"
     text += fmt(today_row, "Today (Kyiv)") + "\n"

@@ -151,6 +151,13 @@ class LiveOrderResult:
     submit_latency_ms: int = 0       # t0 → POST returned (= response received)
     response_latency_ms: int = 0     # POST returned → parse done
     fill_poll_latency_ms: int = 0    # parse done → fill confirmed via poll
+    # The limit price we ACTUALLY submitted, in the scaled domain (same domain
+    # as fill_price). Computed inside place_ioc_open but never surfaced, so
+    # entry_slippage_pct was written from a stub and came out identically 0.0 on
+    # all 86,719 live rows — i.e. the column was write-only and we were blind to
+    # how much worse than our limit we really fill. WRITE-ONLY for the order
+    # path: nothing in placement or risk reads it.
+    limit_price_scaled: float = 0.0
 
 
 @dataclass
@@ -1548,6 +1555,7 @@ class LiveExecutor:
                     submit_latency_ms=submit_lat,
                     response_latency_ms=response_lat,
                     fill_poll_latency_ms=fill_poll_lat,
+                    limit_price_scaled=limit_scaled,
                     raw_response=response,
                 )
 

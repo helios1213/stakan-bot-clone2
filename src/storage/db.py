@@ -529,6 +529,12 @@ async def init_db(db_path: str) -> None:
         await db.executescript(SCHEMA_V1)
         await db.executescript(SCHEMA_V2)
         await _add_columns_idempotent(db, "shadow_trades", SHADOW_TRADES_V2_COLUMNS)
+        # 2026-08-21: the limit price actually submitted. Added to BOTH trade
+        # tables because shadow and live share one INSERT statement — omitting it
+        # here would make that statement fail for shadow rows. In shadow it
+        # simply mirrors entry_target_price (which there really IS the submitted
+        # limit); in live it is the fix for entry_slippage_pct being write-only.
+        await _add_columns_idempotent(db, "shadow_trades", [("entry_limit_price", "REAL")])
         # v2.1: add strategy_type to existing pair_configs (for existing installs)
         await _add_columns_idempotent(db, "pair_configs",
                                        [("strategy_type", "TEXT NOT NULL DEFAULT 'sniper'")])
