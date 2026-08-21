@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 
 import logging
+import time
 
 from src.execution.live_executor import LiveExecutor
 from src.execution.live_safety import LiveSafetyController
@@ -71,20 +72,81 @@ class LiveExecutorPool:
         # them may still be used to touch an account.
         self._active_slot_ids: set[int] = set()
 
+    @staticmethod
+    def _kill_release_key(slot_id: int) -> str:
+        return f"kill_released_at:slot{slot_id}"
+
+    async def persist_kill_release(self, slot_id: int) -> None:
+        """Запамʼятати, що оператор ЗНЯВ кіл вручну.
+
+        Контролер живе в памʼяті, а `_hydrate_safety` після рестарту переграє
+        всі денні угоди наново — і разом із ними відновлює ДОРЕЛІЗНИЙ пік, після
+        чого просадка знову виявляється пробитою і кіл вмикається САМ. Тобто
+        кнопка «зняти» діяла рівно до наступного перезапуску. Маркер у live_state
+        (таблиця саме для recovery) дає відновленню знати, де перебазувати пік.
+        Best-effort: не змогли записати — гірший наслідок рівно старий.
+        """
+        if self.live_db is None:
+            return
+        try:
+            await self.live_db.execute(
+                "INSERT OR REPLACE INTO live_state (key, value, updated_at) "
+                "VALUES (?, ?, ?)",
+                (self._kill_release_key(slot_id), str(int(time.time())),
+                 int(time.time())),
+            )
+        except Exception:
+            logger.exception("[KILL RESET] slot %d: не вдалось зберегти маркер",
+                             slot_id)
+
+    async def release_kill(self, slot_id: int) -> tuple[bool, str]:
+        """Зняти кіл І зафіксувати це так, щоб воно пережило рестарт.
+
+        Єдина точка входу: раніше знімали напряму через контролер із двох різних
+        місць UI, і жодне з них нічого не зберігало.
+        """
+        ctl = self._safety_controllers.get(slot_id)
+        if ctl is None:
+            return False, ""
+        was, why = ctl.release_kill()
+        await self.persist_kill_release(slot_id)
+        return was, why
+
     async def _hydrate_safety(self, slot_id: int) -> None:
         """Відновити добу слота з live_trades (00:00 локальних → зараз)."""
         ctl = self._safety_controllers.get(slot_id)
         if ctl is None or self.live_db is None:
             return
         try:
+            released_at = 0
+            try:
+                row = await self.live_db.fetchone(
+                    "SELECT value FROM live_state WHERE key = ?",
+                    (self._kill_release_key(slot_id),),
+                )
+                if row and row[0]:
+                    _ts = int(row[0])
+                    # Маркер діє лише в межах ТІЄЇ САМОЇ доби: вчорашнє зняття не
+                    # має гасити сьогоднішній запобіжник.
+                    if _ts >= ctl.session_start_ts():
+                        released_at = _ts
+            except Exception:
+                logger.exception("[SESSION] slot %d: маркер зняття не прочитано",
+                                 slot_id)
             rows = await self.live_db.fetchall(
-                "SELECT net_pnl_usdt, notional_usdt FROM live_trades "
+                "SELECT net_pnl_usdt, notional_usdt, closed_at FROM live_trades "
                 "WHERE account_label = ? AND closed_at IS NOT NULL "
                 "  AND closed_at >= ? ORDER BY closed_at",
                 (f"slot{slot_id}", ctl.session_start_ts()),
             )
             if rows:
-                ctl.hydrate_session([(r[0], r[1]) for r in rows])
+                ctl.hydrate_session([(r[0], r[1], r[2]) for r in rows],
+                                    released_at=released_at)
+                if released_at:
+                    logger.warning(
+                        "[SESSION] slot %d: враховано ручне зняття кіла о %d — "
+                        "пік перебазовано, кіл НЕ вмикається повторно",
+                        slot_id, released_at)
         except Exception:
             # Не даємо збою читання завалити підняття слота: гірший наслідок —
             # день починається з нуля, тобто рівно стара поведінка.

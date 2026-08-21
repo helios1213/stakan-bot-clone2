@@ -500,7 +500,9 @@ async def handle_slot_callback(query, context, data: str) -> None:
                 if _safety is None:
                     _err = f"слот {slot_id} не має контролера безпеки"
                 else:
-                    _was, _why = _safety.release_kill()
+                    # Через пул — він зберігає маркер зняття, щоб рестарт не
+                    # ввімкнув кіл назад (див. live_pool.release_kill).
+                    _was, _why = await live_pool.release_kill(slot_id)
                     _summary = _safety.state_summary()
             except Exception as _e:
                 # Раніше тут стояв `pass`, і будь-яка помилка перевдягалась у

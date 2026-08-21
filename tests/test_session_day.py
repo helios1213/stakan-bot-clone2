@@ -85,7 +85,7 @@ def test_a_restart_no_longer_erases_the_session_peak():
     """Було: контролер створювався заново, пік $73.88 зникав, і просадка
     рахувалась із нуля — тобто рестарт знімав запобіжник."""
     fresh = ctl()
-    fresh.hydrate_session([(80.0, 4000.0), (-6.12, 4000.0)])
+    fresh.hydrate_session([(80.0, 4000.0, 1060), (-6.12, 4000.0, 1120)])
     assert fresh.state.today_pnl == pytest.approx(73.88)
     assert fresh.state.peak_pnl == pytest.approx(80.0)
     assert not fresh.is_killed()
@@ -95,8 +95,9 @@ def test_hydration_reproduces_exactly_what_the_live_run_would_hold():
     """Відновлення має давати той самий стан, що й послідовність
     record_close — інакше після рестарту межа поїде."""
     live = ctl()
-    closes = [(3.0, 4000.0), (-1.0, 3000.0), (7.5, 5000.0), (-2.25, 4500.0)]
-    for pnl, n in closes:
+    closes = [(3.0, 4000.0, 1000), (-1.0, 3000.0, 1060),
+              (7.5, 5000.0, 1120), (-2.25, 4500.0, 1180)]
+    for pnl, n, _ts in closes:
         live.record_close("X", pnl, notional_usdt=n)
 
     restored = ctl()
@@ -113,7 +114,7 @@ def test_a_breach_that_was_live_before_the_restart_is_re_engaged():
     """Найважливіше: якщо на момент підняття просадка вже пробита, кіл має
     стояти ОДРАЗУ, а не чекати наступного закриття."""
     c = ctl()
-    c.hydrate_session([(30.0, 4000.0), (-26.0, 4000.0)])
+    c.hydrate_session([(30.0, 4000.0, 1060), (-26.0, 4000.0, 1120)])
     assert c.is_killed()
     assert "відновлено після рестарту" in c.state.kill_reason
 
@@ -122,8 +123,8 @@ def test_hydration_is_idempotent_so_a_rebuild_cannot_double_the_day():
     """rebuild_from_store викликається періодично — другий прохід не має
     додати день ще раз."""
     c = ctl()
-    assert c.hydrate_session([(5.0, 4000.0)]) is True
-    assert c.hydrate_session([(5.0, 4000.0)]) is False
+    assert c.hydrate_session([(5.0, 4000.0, 1060)]) is True
+    assert c.hydrate_session([(5.0, 4000.0, 1060)]) is False
     assert c.state.today_pnl == pytest.approx(5.0)
     assert c.state.today_trades == 1
 
@@ -138,6 +139,6 @@ def test_hydration_of_an_empty_day_changes_nothing():
 def test_hydration_survives_null_pnl_rows():
     """У базі трапляються рядки з NULL — вони не мають валити підняття слота."""
     c = ctl()
-    c.hydrate_session([(None, 4000.0), (2.0, None), (-1.0, 4000.0)])
+    c.hydrate_session([(None, 4000.0, 1060), (2.0, None, 1120), (-1.0, 4000.0, 1180)])
     assert c.state.today_pnl == pytest.approx(1.0)
     assert c.state.today_trades == 3

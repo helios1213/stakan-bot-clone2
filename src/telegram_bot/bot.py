@@ -711,7 +711,10 @@ async def cmd_unkill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for sid in sorted(getattr(live_pool, "_safety_controllers", {})):
         safety = live_pool.get_safety(sid)
         if safety is not None and safety.is_killed():
-            if safety.release_kill()[0]:
+            # Через пул, а не напряму через контролер: пул ще й ЗБЕРІГАЄ факт
+            # зняття, інакше найближчий рестарт відновить дорелізний пік і
+            # ввімкне кіл назад.
+            if (await live_pool.release_kill(sid))[0]:
                 released.append(sid)
     # 💀 KILL ALL flips shadow_engine.cfg.enabled and nothing else ever flips it
     # back — the engine stayed dead until the container restarted, while this

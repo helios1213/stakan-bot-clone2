@@ -87,6 +87,8 @@ class LiveSafetyController:
         self.max_margin_per_trade_usdt = max_margin_per_trade_usdt
 
         self.state = SafetyState()
+        # Чи вже застосовано ручне зняття кіла під час відновлення сесії.
+        self._release_applied = False
         self._tz = self._resolve_tz()
         self._daily_reset_at_ts = self._next_reset_ts()
 
@@ -131,11 +133,12 @@ class LiveSafetyController:
         return int(datetime.datetime.combine(
             tomorrow, datetime.time(0, 0), tzinfo=self._tz).timestamp())
 
-    def hydrate_session(self, closes) -> bool:
+    def hydrate_session(self, closes, released_at: int = 0) -> bool:
         """Відновити сесію з уже закритих угод цієї доби.
 
-        `closes` — [(net_pnl_usdt, notional_usdt), ...] у хронологічному
-        порядку, від 00:00 локальних до зараз.
+        `closes` — [(net_pnl_usdt, notional_usdt, closed_at), ...] у
+        хронологічному порядку, від 00:00 локальних до зараз.
+        `released_at` — коли оператор ВРУЧНУ зняв кіл цієї доби (0 = не знімав).
 
         Навіщо: контролер живе лише в памʼяті й створюється заново на кожному
         рестарті, тож перезапуск о 14:00 стирав і денний PnL, і пік — після
@@ -147,8 +150,18 @@ class LiveSafetyController:
         """
         if self.state.today_trades or self.state.today_pnl:
             return False
-        for pnl, notional in closes:
+        for pnl, notional, closed_at in closes:
             pnl = float(pnl or 0.0)
+            # Оператор зняв кіл вручну о `released_at` — і саме тоді пік було
+            # перебазовано на поточний PnL (див. release_kill). Без цього кроку
+            # рестарт відновлював ДОРЕЛІЗНИЙ пік, просадка знову виявлялась
+            # пробитою, і кіл вмикався сам — тобто кнопка «зняти» діяла лише до
+            # наступного перезапуску. Відтворюємо перебазування в тій самій
+            # точці історії, тож ручне рішення переживає рестарт.
+            if released_at and not self._release_applied and closed_at and \
+                    int(closed_at) >= released_at:
+                self.state.peak_pnl = self.state.today_pnl
+                self._release_applied = True
             self.state.today_pnl += pnl
             self.state.today_trades += 1
             if self.state.today_pnl > self.state.peak_pnl:
@@ -159,6 +172,11 @@ class LiveSafetyController:
                 a = self.state.avg_notional_usdt
                 self.state.avg_notional_usdt = (
                     float(notional) if a <= 0 else 0.9 * a + 0.1 * float(notional))
+        # Зняття сталося вже після останнього закриття цієї доби — перебазувати
+        # на кінцевий стан, інакше маркер мовчки б загубився.
+        if released_at and not self._release_applied:
+            self.state.peak_pnl = self.state.today_pnl
+            self._release_applied = True
         self.state._logged_peak = self.state.peak_pnl
         if not self.state.today_trades:
             return False
