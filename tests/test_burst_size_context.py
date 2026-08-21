@@ -139,7 +139,7 @@ def test_either_trigger_can_fire_but_movement_gate_is_mandatory():
     """pk1000 is what separates a real move from chop — dropping it took the
     replay from 100% profitable to 88-90% with losing alerts."""
     b = _burst_src()
-    assert "is_burst = _move_ok and (_by_rate or _by_bps)" in b
+    assert "is_burst = _move_ok and (_by_rate or _by_bps or _by_abs)" in b
 
 
 def test_bps_trigger_uses_a_lower_frequency_bar():
@@ -160,10 +160,48 @@ def test_alert_says_which_trigger_fired():
     """6 of 8 replayed alerts came from bps — without this you cannot tell
     which half of the detector is earning its keep."""
     b = _burst_src()
-    assert '_trigger = ("частота+bps"' in b
+    assert '("частота", _by_rate)' in b and '("bps", _by_bps)' in b
     assert "тригер: %s" in b
 
 
 def test_bps_and_norm_are_both_shown():
     b = _burst_src()
     assert "rbps, base_bps" in b
+
+
+# ---- the blind spot: a uniformly good period is its own baseline ---------
+
+def test_absolute_bps_trigger_exists():
+    """Replaying 2026-08-18 — the day the docstring claims was caught — the
+    relative-only detector fired ZERO times: window bps +1.21 against a norm of
+    +0.96 is only x1.26, far under the x2.5 bar. The norm is the trailing hour,
+    so a day that is good ALL DAY becomes its own baseline and nothing looks
+    anomalous. An absolute floor is the only thing that sees it."""
+    b = _burst_src()
+    assert 'BURST_BPS_ABS' in b
+    assert "_by_abs = (bps_abs > 0 and rbps >= bps_abs" in b
+
+
+def test_absolute_trigger_can_be_switched_off():
+    b = _burst_src()
+    assert "bps_abs > 0" in b, "0 must disable it, like every other knob here"
+
+
+def test_absolute_trigger_still_requires_movement_and_some_activity():
+    """Left alone it would fire on a single lucky trade in a dead market."""
+    b = _burst_src()
+    assert "is_burst = _move_ok and (_by_rate or _by_bps or _by_abs)" in b
+    i = b.index("_by_abs = ")
+    assert "rate >= bps_rate_mult * base_rate" in b[i:i + 220]
+
+
+def test_base_trades_gate_lowered_with_the_reason_recorded():
+    """20/hour blocked 1950 scans on 08-18 — the detector never even got to
+    evaluate the day it was supposed to catch."""
+    b = _burst_src()
+    assert 'BURST_MIN_BASE_TRADES", "10"' in b
+
+
+def test_trigger_label_lists_every_firing_condition():
+    b = _burst_src()
+    assert '("абс.bps", _by_abs)' in b

@@ -834,7 +834,17 @@ class ShadowEngine:
         bps_min = float(os.environ.get("BURST_BPS_MIN", "1.0"))
         # Планка частоти для bps-тригера НИЖЧА: тут доказом є якість, а не обсяг.
         bps_rate_mult = float(os.environ.get("BURST_BPS_RATE_MULT", "1.5"))
-        min_base_trades = int(os.environ.get("BURST_MIN_BASE_TRADES", "20"))
+        # ТРЕТІЙ тригер: АБСОЛЮТНИЙ bps. Норма рахується за попередню годину,
+        # тож рівномірно хороший період стає ВЛАСНОЮ нормою і на її тлі ніщо не
+        # виглядає аномальним — детектор сліпне саме тоді, коли все добре.
+        # Реплей 2026-08-18 (день, який у докстрінгу значиться як зловлений):
+        # поточний конфіг дає НУЛЬ алертів, бо bps вікна +1.21 проти норми
+        # +0.96 = лише x1.26 при потрібних x2.5. Абсолютна планка це ловить.
+        # 0 = вимкнено.
+        bps_abs = float(os.environ.get("BURST_BPS_ABS", "1.5"))
+        # 20/год блокувало 1950 сканів 2026-08-18 — на рідких парах детектор
+        # не встигав навіть дійти до перевірок. 10 достатньо для медіани.
+        min_base_trades = int(os.environ.get("BURST_MIN_BASE_TRADES", "10"))
         alert_count = int(os.environ.get("BURST_ALERT_COUNT", "1"))
         repeat_sec = int(os.environ.get("BURST_REPEAT_SEC", "600"))
         logger.info("[BURST] детектор запущено: rate>=%.1fx/год-медіана, conf>=%.2f, "
@@ -918,9 +928,12 @@ class ShadowEngine:
                         _by_bps = (rate >= bps_rate_mult * base_rate
                                    and rbps >= bps_mult * max(base_bps, 0.2)
                                    and rbps >= bps_min)
-                        is_burst = _move_ok and (_by_rate or _by_bps)
-                        _trigger = ("частота+bps" if (_by_rate and _by_bps)
-                                    else ("частота" if _by_rate else "bps"))
+                        _by_abs = (bps_abs > 0 and rbps >= bps_abs
+                                   and rate >= bps_rate_mult * base_rate)
+                        is_burst = _move_ok and (_by_rate or _by_bps or _by_abs)
+                        _trigger = "+".join(
+                            n for n, ok in (("частота", _by_rate), ("bps", _by_bps),
+                                            ("абс.bps", _by_abs)) if ok) or "?"
                         if is_burst:
                             first = key not in active
                             if first or (now - active.get(key, 0)) >= repeat_sec:
