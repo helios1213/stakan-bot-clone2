@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 from src.config import ShadowConf
 from src.exchanges.mexc_rest import to_mexc, get_binance_scale
-from src.exchanges.orderbook import OrderBookManager
+from src.exchanges.orderbook import OrderBook, OrderBookManager
 from src.execution.funding_guard import FundingGuard
 from src.execution.ioc_executor import IOCExecutor, IOCAttemptResult
 from src.execution.live_executor import (
@@ -565,6 +565,8 @@ class ShadowEngine:
         self._max_acceptable_drift_pct = 0.05
         # T1.1/T1.3 (2026-08-21). Both default to 0 = behaviour unchanged.
         self._mexc_feed_lag_ms = max(0, int(getattr(cfg, "mexc_feed_lag_ms", 0)))
+        # Сильні посилання на twin-задачі, щоб GC не прибрав їх у польоті.
+        self._twin_tasks: set = set()
         self._max_book_age_ms = max(0, int(getattr(cfg, "max_book_age_ms", 0)))
         if self._latency_enabled:
             logger.info(
@@ -1756,6 +1758,74 @@ class ShadowEngine:
                 symbol, signal.direction, cfg.ioc_max_attempts, last_result.expired_reason,
             )
 
+
+    def _schedule_twin(self, signal, cfg, mexc_symbol, slot_id, snap,
+                       live_result, notional) -> None:
+        """Поставити в чергу порівняння shadow-симулятора з живим філом.
+
+        Ніколи не кидає і нічого не чекає: якщо не вдалось запланувати —
+        просто немає рядка для аналітики, живий шлях це не обходить.
+        """
+        try:
+            task = asyncio.create_task(
+                self._record_twin(signal, cfg, mexc_symbol, slot_id, snap,
+                                  live_result, notional),
+                name=f"twin:{mexc_symbol}",
+            )
+            self._twin_tasks.add(task)
+            task.add_done_callback(self._twin_tasks.discard)
+        except Exception:
+            logger.debug("[TWIN] не вдалось запланувати", exc_info=True)
+
+    async def _record_twin(self, signal, cfg, mexc_symbol, slot_id, snap,
+                           live_result, notional) -> None:
+        """Що вирішив би симулятор на ТІЙ САМІЙ книзі і з ТИМ САМИМ лімітом.
+
+        Це і є те, чого досі не існувало: перетин signal_uid між shadow_trades
+        і live_trades був РІВНО НУЛЬ, бо пара або live, або shadow. Будь-яке
+        «чи стало чесніше» порівнювало різні календарні вікна. Тепер обидві
+        відповіді стоять в одному рядку, на одному сигналі.
+
+        Ліміт беремо той, що РЕАЛЬНО пішов на біржу (`limit_price_scaled`), а не
+        перерахований — інакше порівнювали б із чимось, чого не було.
+        """
+        try:
+            bids, asks = snap
+            if not bids or not asks:
+                return
+            limit = getattr(live_result, "limit_price_scaled", 0.0) or 0.0
+            if limit <= 0:
+                return                      # нема з чим порівнювати
+            ob = OrderBook(symbol=mexc_symbol, exchange="mexc", max_levels=20)
+            ob.apply_snapshot(list(bids.items()), list(asks.items()), update_id=1)
+            res = self.ioc_executor.simulate_ioc_entry(
+                mexc_ob=ob,
+                direction=signal.direction,
+                notional_usdt=notional,
+                limit_price=limit,
+                contract_size=CONTRACT_SIZES.get(mexc_symbol, 1.0),
+            )
+            live_ok = 1 if (live_result.success and live_result.fill_price > 0) else 0
+            await self.db.execute(
+                """INSERT INTO shadow_twin
+                   (ts, signal_uid, symbol, direction, slot_id, limit_price,
+                    live_filled, live_price, live_filled_pct, live_error,
+                    shadow_filled, shadow_price, shadow_filled_pct,
+                    shadow_reason, notional_usdt)
+                   VALUES (?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?)""",
+                (int(time.time()), getattr(signal, "created_at_ms", None),
+                 signal.symbol, signal.direction, slot_id, limit,
+                 live_ok, live_result.fill_price or 0.0,
+                 (live_result.notional_usdt / notional) if notional > 0 else 0.0,
+                 live_result.error_msg,
+                 1 if res.status in ("filled", "partial") else 0,
+                 res.avg_fill_price or 0.0, res.filled_pct or 0.0,
+                 res.status if res.status in ("filled", "partial") else (res.expired_reason or "expired"),
+                 notional),
+            )
+        except Exception:
+            logger.debug("[TWIN] запис не вдався", exc_info=True)
+
     async def _record_shadow_miss(self, symbol: str, reason: str) -> None:
         """Record a shadow entry that never became a trade.
 
@@ -2041,6 +2111,18 @@ class ShadowEngine:
                         _skip_reason, _skip_sid = "slot_busy", sid
                     continue
                 chosen_slot_id = sid
+                # T2.2: знімок книги ДО відправки. Це все, що робиться на
+                # живому шляху — дві копії dict по <=40 записів, мікросекунди.
+                # Уся симуляція виконується ПІСЛЯ, окремою задачею: прохід по
+                # драбині коштував 5-15мс на сигнал, і саме тому його свого
+                # часу прибрали з live fast-path. Сюди він не повертається.
+                _twin_snap = None
+                try:
+                    _ob = _mexc_ob_for_open
+                    if _ob is not None and _ob.is_synced:
+                        _twin_snap = (dict(_ob._bids), dict(_ob._asks))
+                except Exception:
+                    _twin_snap = None
                 async with _slot_lock:
                     live_result = await executor.place_ioc_open(
                         symbol=mexc_symbol,
@@ -2060,6 +2142,12 @@ class ShadowEngine:
                         retry_delay_ms=cfg.ioc_attempt_interval_ms,  # per-pair (was global env IOC_RETRY_DELAY_MS)
                         t_signal_created=t_sig,
                     )
+                # T2.2: fire-and-forget. Викликається ПІСЛЯ того, як живий
+                # ордер уже відправлено й відповідь отримано, тож на шлях до
+                # submit не впливає нічим.
+                if _twin_snap is not None:
+                    self._schedule_twin(signal, cfg, mexc_symbol, sid,
+                                        _twin_snap, live_result, live_notional)
                 # Видимість у панелі: писати РЕАЛЬНУ причину відмови
                 # відкриття (api_error_2006 leverage, throttle 9082/10014,
                 # 510, …) у колонку ПОМИЛКА і чистити при успіху. Рутинні

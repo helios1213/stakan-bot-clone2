@@ -77,7 +77,10 @@ def test_recording_is_best_effort_and_cannot_break_trading():
 # ---- 2. live entry slippage is measured against the real limit -----------
 
 def test_live_slippage_recomputed_against_submitted_limit():
-    seg = ENGINE[ENGINE.index("live_result.fill_price > 0"):][:1400]
+    # Anchor on the T0.2 comment, not on a bare expression: `_record_twin`
+    # (T2.2, added later) contains the same expression and sits EARLIER in the
+    # file, so a substring search silently pointed at the wrong block.
+    seg = ENGINE[ENGINE.index("Re-measure entry slippage against the limit"):][:1400]
     assert "limit_price_scaled" in seg
     assert "pos.entry_limit_price" in seg
     # sign convention must match the shadow path: positive = worse than asked

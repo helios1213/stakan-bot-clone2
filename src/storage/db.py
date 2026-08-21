@@ -535,6 +535,35 @@ async def init_db(db_path: str) -> None:
         # simply mirrors entry_target_price (which there really IS the submitted
         # limit); in live it is the fix for entry_slippage_pct being write-only.
         await _add_columns_idempotent(db, "shadow_trades", [("entry_limit_price", "REAL")])
+        # 2026-08-21 (T2.2): парне порівняння shadow проти live на ОДНОМУ сигналі.
+        # Досі перетин signal_uid між shadow_trades і live_trades був РІВНО НУЛЬ:
+        # пара або live, або shadow, тож будь-яке «чи стало чесніше» порівнювало
+        # різні календарні вікна, а не однакові умови. Тут для КОЖНОЇ живої
+        # спроби пишеться, що вирішив би симулятор на ТІЙ САМІЙ книзі і з ТИМ
+        # САМИМ лімітом. Окрема таблиця, не shadow_trades — щоб жоден наявний
+        # агрегат, алерт чи відбір пар не зачепило.
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS shadow_twin (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                INTEGER NOT NULL,
+                signal_uid        INTEGER,
+                symbol            TEXT NOT NULL,
+                direction         TEXT,
+                slot_id           INTEGER,
+                limit_price       REAL,
+                live_filled       INTEGER,
+                live_price        REAL,
+                live_filled_pct   REAL,
+                live_error        TEXT,
+                shadow_filled     INTEGER,
+                shadow_price      REAL,
+                shadow_filled_pct REAL,
+                shadow_reason     TEXT,
+                notional_usdt     REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_twin_sym_ts
+                ON shadow_twin(symbol, ts);
+        """)
         # v2.1: add strategy_type to existing pair_configs (for existing installs)
         await _add_columns_idempotent(db, "pair_configs",
                                        [("strategy_type", "TEXT NOT NULL DEFAULT 'sniper'")])
