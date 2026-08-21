@@ -765,6 +765,44 @@ class ShadowEngine:
             logger.error("[BURST] pushover: ЖОДЕН з %d отримувачів не отримав "
                          "сповіщення", len(users))
 
+    async def _size_context(self, slot_id: int, symbol: str, cur_margin: float,
+                            cur_notional: float) -> str:
+        """Один рядок про РОЗМІР для burst-алерту.
+
+        Алерт радить «збільшити розмір», але сам про розмір нічого не знав, тож
+        оператор мусив піти й подивитись, чи є куди рости. Дістаємо стелю з
+        slot_pair_sizing і баланс слота, щоб порада була дією, а не гаслом.
+        Ніколи не кидає — це прикраса, а не торговий шлях.
+        """
+        try:
+            cap = None
+            row = await self.db.fetchone(
+                "SELECT margin_max_usdt FROM slot_pair_sizing "
+                "WHERE slot_id = ? AND symbol = ?", (slot_id, symbol))
+            if row and row[0]:
+                cap = float(row[0])
+            bal = None
+            brow = await self.db.fetchone(
+                "SELECT last_balance_usdt FROM webkey_slots WHERE slot_id = ?",
+                (slot_id,))
+            if brow and brow[0]:
+                bal = float(brow[0])
+            parts = [f"розмір ${cur_notional:.0f} (маржа ${cur_margin:.1f}"]
+            parts.append(f" з ліміту ${cap:.0f})" if cap else ")")
+            line = "".join(parts)
+            if bal:
+                line += f" · баланс ${bal:.0f} → маржа {100 * cur_margin / bal:.0f}%"
+            # Порада має відрізняти «є куди рости в межах ліміту» від «ліміт уже
+            # вибрано» — у другому випадку крутити треба сам ліміт, а не розмір.
+            if cap and cur_margin >= 0.95 * cap:
+                line += "\n⚠️ вибрано ліміт конфіга — піднімати треба сам ліміт у /slot"
+            elif cap:
+                line += f"\n👉 у межах ліміту можна ще до ${cap:.0f}"
+            return line
+        except Exception:
+            logger.debug("[BURST] size context failed", exc_info=True)
+            return ""
+
     async def _burst_alert_loop(self) -> None:
         """Детектор сплеску волатильності → Telegram-алерт. РОЗМІР НЕ ЧІПАЄ —
         лише сповіщає, щоб оператор сам збільшив розмір. Валідовано причинно на
@@ -784,6 +822,18 @@ class ShadowEngine:
         pk1000_min = float(os.environ.get("BURST_PK1000_MIN", "1.0"))  # абс. підлога (сан.)
         pk1000_mult = float(os.environ.get("BURST_PK1000_MULT", "1.5"))  # відносний гейт (самокалібр.)
         min_trades = int(os.environ.get("BURST_MIN_TRADES", "8"))
+        # ДРУГИЙ тригер: аномально хороша торгівля НЕЗАЛЕЖНО ВІД РОЗМІРУ.
+        # Частотний гейт ловить «торгує багато», але пара може торгувати зі
+        # звичайною частотою і при цьому заробляти в рази краще за свою норму —
+        # такий сплеск ми не бачили взагалі. bps (PnL на одиницю ноціоналу)
+        # не залежить від розміру за побудовою, тож $500 і $5000 міряються
+        # однією лінійкою. Реплей за 7 днів: обʼєднання двох тригерів дає 8
+        # алертів (проти 5), 100% перед прибутковими 10 хв, найгірший +$0.13 —
+        # і 6 з 8 спрацювали саме по bps, тобто частотний їх не бачив.
+        bps_mult = float(os.environ.get("BURST_BPS_MULT", "2.5"))
+        bps_min = float(os.environ.get("BURST_BPS_MIN", "1.0"))
+        # Планка частоти для bps-тригера НИЖЧА: тут доказом є якість, а не обсяг.
+        bps_rate_mult = float(os.environ.get("BURST_BPS_RATE_MULT", "1.5"))
         min_base_trades = int(os.environ.get("BURST_MIN_BASE_TRADES", "20"))
         alert_count = int(os.environ.get("BURST_ALERT_COUNT", "1"))
         repeat_sec = int(os.environ.get("BURST_REPEAT_SEC", "600"))
@@ -812,7 +862,7 @@ class ShadowEngine:
                     ph = ",".join("?" * len(live_pairs))
                     rows = await self.live_db.fetchall(
                         f"SELECT symbol, account_label, opened_at, confidence, net_pnl_usdt, "
-                        f"       peak_ticks_at_1000ms "
+                        f"       peak_ticks_at_1000ms, notional_usdt, margin_usdt "
                         f"FROM live_trades WHERE symbol IN ({ph}) AND opened_at >= ? "
                         f"ORDER BY opened_at",
                         tuple(live_pairs) + (now - base_sec,))
@@ -837,6 +887,19 @@ class ShadowEngine:
                         rpnl = sum((r["net_pnl_usdt"] or 0.0) for r in w)
                         rconf = sum((r["confidence"] or 0.0) for r in w) / n_win
                         rpk10 = sum((r["peak_ticks_at_1000ms"] or 0.0) for r in w) / n_win
+                        # Розмір САМЕ в цьому сплеску, а не абстрактний конфіг:
+                        # порада «збільшити» має вимірюватись від того, чим ми
+                        # торгуємо просто зараз.
+                        rnoc = sum((r["notional_usdt"] or 0.0) for r in w) / n_win
+                        rmar = sum((r["margin_usdt"] or 0.0) for r in w) / n_win
+                        # bps вікна проти bps норми пари — метрика, нечутлива
+                        # до розміру. Підлога 0.2 на нормі: коли пара ледве в
+                        # плюсі, ділення на неї роздуло б будь-який шум.
+                        _wn = sum((r["notional_usdt"] or 0.0) for r in w)
+                        _bn = sum((r["notional_usdt"] or 0.0) for r in tr)
+                        rbps = (rpnl / _wn * 1e4) if _wn > 0 else 0.0
+                        base_bps = ((sum((r["net_pnl_usdt"] or 0.0) for r in tr)
+                                     / _bn * 1e4) if _bn > 0 else 0.0)
                         # base pk1000 за годину = НОРМА пари (для самокалібрації)
                         base_pk10 = max(
                             sum((r["peak_ticks_at_1000ms"] or 0.0) for r in tr) / len(tr),
@@ -845,20 +908,40 @@ class ShadowEngine:
                         # ВІДНОСНО власної норми пари (самокалібрація під БУДЬ-ЯКУ
                         # пару). Валідовано на 08-13+08-18: rpk >= 1.5x норми ловить
                         # обидва сплески, відкидає чоп/норму. conf — НЕ розрізнювач.
-                        is_burst = (rate >= rate_mult * base_rate and rpnl > 0
-                                    and rpk10 >= pk1000_mult * base_pk10
+                        # pk1000 лишається обовʼязковим для ОБОХ тригерів: без
+                        # нього якість падає з 100% до 88-90% і зʼявляються
+                        # збиткові спрацювання. Це єдиний гейт, що відрізняє
+                        # реальний рух від чопу.
+                        _move_ok = (rpk10 >= pk1000_mult * base_pk10
                                     and rpk10 >= pk1000_min)
+                        _by_rate = rate >= rate_mult * base_rate and rpnl > 0
+                        _by_bps = (rate >= bps_rate_mult * base_rate
+                                   and rbps >= bps_mult * max(base_bps, 0.2)
+                                   and rbps >= bps_min)
+                        is_burst = _move_ok and (_by_rate or _by_bps)
+                        _trigger = ("частота+bps" if (_by_rate and _by_bps)
+                                    else ("частота" if _by_rate else "bps"))
                         if is_burst:
                             first = key not in active
                             if first or (now - active.get(key, 0)) >= repeat_sec:
                                 ratio = rate / base_rate if base_rate else 0
                                 lbl = (" · <b>" + label.upper() + "</b>") if label else ""
+                                _sid = None
+                                try:
+                                    _sid = int(str(label).strip().lower().replace("slot", ""))
+                                except (TypeError, ValueError):
+                                    pass
+                                _size = (await self._size_context(_sid, symbol, rmar, rnoc)
+                                         if _sid else "")
                                 msg = ("🚨🚨🚨 <b>СПЛЕСК ВОЛАТИЛЬНОСТІ</b>" + lbl + "\n"
                                        "Пара: <code>" + symbol + "</code>\n"
                                        "Частота: <b>%.1f/хв</b> (×%.1f норми)\n"
-                                       "Рух(pk1s): <b>%.1fт</b> · conf %.2f · 5хв PnL: <b>$%+.1f</b>\n"
-                                       "👉 <b>МОЖНА ВРУЧНУ ЗБІЛЬШИТИ РОЗМІР</b>"
-                                       % (rate, ratio, rpk10, rconf, rpnl))
+                                       "Рух(pk1s): <b>%.1fт</b> · conf %.2f · PnL: <b>$%+.1f</b>\n"
+                                       "Дохідність: <b>%+.2f bps</b> (норма %+.2f) · тригер: %s\n"
+                                       % (rate, ratio, rpk10, rconf, rpnl,
+                                          rbps, base_bps, _trigger)
+                                       + (_size + "\n" if _size else "")
+                                       + "👉 <b>МОЖНА ВРУЧНУ ЗБІЛЬШИТИ РОЗМІР</b>")
                                 reps = alert_count if first else 1
                                 for i in range(reps):
                                     try:
@@ -871,14 +954,17 @@ class ShadowEngine:
                                 if first:
                                     await self._send_pushover(
                                         "🚨 СПЛЕСК " + symbol,
-                                        "%s%s частота %.1f/хв (×%.1f), conf %.2f, "
-                                        "5хв PnL $%+.1f — можна збільшити розмір"
+                                        "%s%s частота %.1f/хв (×%.1f), %+.2f bps "
+                                        "(норма %+.2f), PnL $%+.1f\n"
+                                        "маржа $%.1f / ноціонал $%.0f · тригер: %s"
                                         % (symbol, ("/" + label) if label else "",
-                                           rate, ratio, rconf, rpnl))
+                                           rate, ratio, rbps, base_bps, rpnl,
+                                           rmar, rnoc, _trigger))
                                 active[key] = now
-                                logger.info("[BURST] %s%s ON rate=%.1f/min (x%.1f) conf=%.2f "
-                                            "pnl=$%.1f", symbol, ("/" + label) if label else "",
-                                            rate, ratio, rconf, rpnl)
+                                logger.info("[BURST] %s%s ON rate=%.1f/min (x%.1f) "
+                                            "bps=%+.2f (norm %+.2f) pnl=$%.1f trigger=%s",
+                                            symbol, ("/" + label) if label else "",
+                                            rate, ratio, rbps, base_bps, rpnl, _trigger)
                         else:
                             if key in active:
                                 try:
