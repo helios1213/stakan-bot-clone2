@@ -563,6 +563,9 @@ class ShadowEngine:
         # If price moved more adversely → consider sigal stale, skip.
         # 0.05% on $80k BTC = $40 — reasonable threshold
         self._max_acceptable_drift_pct = 0.05
+        # T1.1/T1.3 (2026-08-21). Both default to 0 = behaviour unchanged.
+        self._mexc_feed_lag_ms = max(0, int(getattr(cfg, "mexc_feed_lag_ms", 0)))
+        self._max_book_age_ms = max(0, int(getattr(cfg, "max_book_age_ms", 0)))
         if self._latency_enabled:
             logger.info(
                 "Shadow IOC latency window = %d..%d ms (uniform) — calibrated to live PENGU submit p10..p90",
@@ -1491,6 +1494,23 @@ class ShadowEngine:
                 await self._record_shadow_miss(symbol, "book_desynced")
                 return
 
+        # T1.1: undo the tautological lag cancellation (SHADOW ONLY).
+        # `_sig_limit` was frozen against our reconstruction of the MEXC book,
+        # and the ladder walk below reads that SAME reconstruction — so however
+        # far behind the exchange our feed runs, both sides of the comparison
+        # are shifted by it and the lag disappears from the result. The exchange
+        # had no such luxury: by the time our IOC arrived, the level we are
+        # about to "fill" on may already have been taken. Waiting the feed lag
+        # out lets the book catch up to what MEXC actually saw, so the walk is
+        # judged against reality rather than against our own delay.
+        if self._mexc_feed_lag_ms and not _is_live_pair:
+            await asyncio.sleep(self._mexc_feed_lag_ms / 1000)
+            mexc_ob = self.ob_manager.get("mexc", symbol)
+            if mexc_ob is None or not mexc_ob.is_synced:
+                self.signals_skipped_no_book += 1
+                await self._record_shadow_miss(symbol, "book_desynced")
+                return
+
         last_result = None
         for attempt in range(cfg.ioc_max_attempts):
             # LIVE FAST-PATH:
@@ -1543,6 +1563,7 @@ class ShadowEngine:
                     # with the same contractSize the live path uses, else shadow
                     # mis-sizes fills (10x small for PENGU, 100x big for ZEC/BCH).
                     contract_size=CONTRACT_SIZES.get(to_mexc(symbol), 1.0),
+                    max_book_age_ms=self._max_book_age_ms,   # T1.3; 0 = off
                 )
             last_result = result
 
@@ -1975,6 +1996,31 @@ class ShadowEngine:
                                 pos.entry_slippage_pct = (pos.entry_price - _lim) / _lim * 100
                             else:
                                 pos.entry_slippage_pct = (_lim - pos.entry_price) / _lim * 100
+
+                        # ─── T1.0: how stale is our MEXC book at the moment we
+                        # actually fill? Shadow anchors its limit AND judges the
+                        # fill against the same reconstruction, so any feed lag
+                        # cancels out and shadow fills where live could not.
+                        # Calibrating that away needs the real lag, and this is
+                        # the only place it is observable without live probes:
+                        # `age_ms` is how old our top-of-book was, `touch_gap_bps`
+                        # is how far the exchange's fill sat from the touch we
+                        # believed in. Pure logging — nothing reads it back.
+                        try:
+                            _ob = _mexc_ob_for_open
+                            if _ob is not None and _ob.last_update_ts_ms:
+                                _age = int(time.time() * 1000) - _ob.last_update_ts_ms
+                                _our = (_ob.best_ask_price() if pos.direction == "long"
+                                        else _ob.best_bid_price())
+                                _gap = ((pos.entry_price - _our) / _our * 1e4) if _our else 0.0
+                                logger.info(
+                                    "[BOOKLAG] %s %s age_ms=%d our_touch=%s fill=%s "
+                                    "touch_gap_bps=%+.2f limit=%s",
+                                    pos.symbol, pos.direction, _age, _our,
+                                    pos.entry_price, _gap, _lim,
+                                )
+                        except Exception:
+                            logger.debug("[BOOKLAG] sample failed", exc_info=True)
                     safety.record_open(signal.symbol)
                     # Log both planned and actual when there's a partial fill
                     if pos.notional_usdt < live_notional * 0.99:

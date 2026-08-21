@@ -85,6 +85,13 @@ def _make_engine(*, is_live: bool, realism: RealismProfile | None = None) -> Sha
     eng._latency_min_ms = 100
     eng._latency_max_ms = 250
     eng._max_acceptable_drift_pct = 0.05
+    # T1.1/T1.3 knobs (2026-08-21). Both default to 0 = off, which is what these
+    # bypass tests want: they assert that SHADOW-only gates do not run for live
+    # pairs, and an active feed-lag wait would add a second shadow-only gate to
+    # reason about. __new__ skips __init__, so anything added there must be
+    # mirrored here — this fixture has now broken that way twice.
+    eng._mexc_feed_lag_ms = 0
+    eng._max_book_age_ms = 0
 
     # Counters touched by _try_enter
     eng.signals_skipped_no_book = 0

@@ -112,6 +112,18 @@ class ShadowConf(BaseModel):
     entry_latency_min_ms: int = 150      # shadow IOC sleep window low  (PENGU submit p10)
     entry_latency_max_ms: int = 205      # shadow IOC sleep window high (PENGU submit p90)
     fill_latency_ms: int = 50
+    # How far BEHIND the real MEXC book our WS reconstruction runs.
+    # Shadow anchors its IOC limit AND judges the fill against the SAME
+    # reconstruction, so this lag cancels itself out and shadow fills on
+    # liquidity the exchange had already taken — measured 2026-08-21 as
+    # 1.55-1.63x more fills per attempt than live on the same pairs.
+    # Waiting this much longer before walking the ladder removes the
+    # cancellation. 0 = off; set it only from measured [BOOKLAG] data,
+    # otherwise it is just another unvalidated fudge factor.
+    mexc_feed_lag_ms: int = 0
+    # Refuse to fill against a book that has not ticked for this long. A synced
+    # book is not a fresh one. 0 = off.
+    max_book_age_ms: int = 0
 
 
 class RiskConf(BaseModel):

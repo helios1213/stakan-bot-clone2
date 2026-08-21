@@ -27,6 +27,7 @@ Latency model:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from src.exchanges.orderbook import OrderBook
@@ -69,6 +70,7 @@ class IOCExecutor:
         notional_usdt: float,
         limit_price: float | None = None,
         contract_size: float = 1.0,       # base-asset units per contract (MEXC contractSize)
+        max_book_age_ms: int = 0,         # 0 = disabled (default: unchanged behaviour)
     ) -> IOCAttemptResult:
         """
         Simulate one IOC limit attempt against `mexc_ob`.
@@ -82,6 +84,19 @@ class IOCExecutor:
         if not mexc_ob.is_synced:
             return IOCAttemptResult(status="expired", target_price=0.0,
                                     expired_reason="orderbook_not_synced")
+
+        # A book that has not ticked in a long time is not evidence that the
+        # levels are still there — it is evidence that we stopped hearing about
+        # them. Walking a stale ladder invents liquidity, and the invented fills
+        # are exactly what makes shadow look better at getting filled than live.
+        # `is_synced` does NOT cover this: a book can be perfectly synced and
+        # simply not have received an update for seconds.
+        # 0 keeps the historical behaviour, so enabling this is a deliberate act.
+        if max_book_age_ms > 0 and mexc_ob.last_update_ts_ms:
+            age_ms = int(time.time() * 1000) - mexc_ob.last_update_ts_ms
+            if age_ms > max_book_age_ms:
+                return IOCAttemptResult(status="expired", target_price=0.0,
+                                        expired_reason="orderbook_stale")
 
         best_bid = mexc_ob.best_bid()
         best_ask = mexc_ob.best_ask()

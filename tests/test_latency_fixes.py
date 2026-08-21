@@ -95,6 +95,10 @@ async def test_simulate_skipped_for_live_pair():
     eng.state_manager = MagicMock()
     eng.state_manager.is_in_live = MagicMock(return_value=True)
     eng._latency_enabled = False
+    # T1.1/T1.3 knobs — 0 = off, matching the shipped defaults. __new__
+    # skips __init__, so new engine attributes must be mirrored here.
+    eng._mexc_feed_lag_ms = 0
+    eng._max_book_age_ms = 0
     eng.ob_manager = MagicMock()
 
     # Fake MEXC orderbook with best_bid / best_ask
@@ -164,6 +168,10 @@ async def test_simulate_called_for_shadow_pair():
     eng.state_manager = MagicMock()
     eng.state_manager.is_in_live = MagicMock(return_value=False)  # SHADOW
     eng._latency_enabled = False
+    # T1.1/T1.3 knobs — 0 = off, matching the shipped defaults. __new__
+    # skips __init__, so new engine attributes must be mirrored here.
+    eng._mexc_feed_lag_ms = 0
+    eng._max_book_age_ms = 0
     eng.ob_manager = MagicMock()
 
     fake_ob = MagicMock()
