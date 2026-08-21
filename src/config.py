@@ -124,6 +124,13 @@ class ShadowConf(BaseModel):
     # Refuse to fill against a book that has not ticked for this long. A synced
     # book is not a fresh one. 0 = off.
     max_book_age_ms: int = 0
+    # Яка ЧАСТКА показаного обсягу рівня реально дістається нам у симуляції.
+    # Симулятор забирає рівень цілком, ніби ми єдиний покупець — звідси 5.7%
+    # часткових філів у shadow проти 46% у live на PEPE.
+    # 1.0 = вимкнено. Вмикати ЛИШЕ з даних shadow_twin (T2.2): там видно, чи
+    # розходження в частці заповнення, а не вгадувати. На відміну від
+    # mexc_feed_lag_ms це плавний регулятор — він міняє РОЗМІР філу, а не факт.
+    queue_frac: float = 1.0
 
 
 class RiskConf(BaseModel):

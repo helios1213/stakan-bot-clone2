@@ -71,6 +71,7 @@ class IOCExecutor:
         limit_price: float | None = None,
         contract_size: float = 1.0,       # base-asset units per contract (MEXC contractSize)
         max_book_age_ms: int = 0,         # 0 = disabled (default: unchanged behaviour)
+        queue_frac: float = 1.0,          # 1.0 = disabled (take the whole level)
     ) -> IOCAttemptResult:
         """
         Simulate one IOC limit attempt against `mexc_ob`.
@@ -80,6 +81,14 @@ class IOCExecutor:
         so if price moved past the fixed limit during latency the ladder walk
         finds no liquidity and the IOC EXPIRES — exactly like a real IOC.
         If limit_price is None, fall back to the current touch (no-latency mode).
+
+        `queue_frac` — яка ЧАСТКА показаного обсягу рівня реально дістається нам.
+        Симулятор забирав рівень цілком, ніби ми єдиний покупець; насправді там
+        стоїть черга, і IOC вигрібає лише хвіст. Виміряно 2026-08-21: у live 46%
+        філів на PEPE часткові проти 5.7% у shadow. Впливає на РОЗМІР філу, а не
+        на його ФАКТ (факт вирішує min(_asks) <= limit) — тому це плавний
+        регулятор, на відміну від mexc_feed_lag_ms, який виявився вимикачем.
+        1.0 = поведінка без змін.
         """
         if not mexc_ob.is_synced:
             return IOCAttemptResult(status="expired", target_price=0.0,
@@ -106,10 +115,10 @@ class IOCExecutor:
 
         if direction == "long":
             lp = limit_price if limit_price is not None else best_ask.price
-            return self._simulate_buy_ioc(mexc_ob, lp, notional_usdt, contract_size)
+            return self._simulate_buy_ioc(mexc_ob, lp, notional_usdt, contract_size, queue_frac)
         elif direction == "short":
             lp = limit_price if limit_price is not None else best_bid.price
-            return self._simulate_sell_ioc(mexc_ob, lp, notional_usdt, contract_size)
+            return self._simulate_sell_ioc(mexc_ob, lp, notional_usdt, contract_size, queue_frac)
         else:
             raise ValueError(f"Invalid direction: {direction}")
 
@@ -119,6 +128,7 @@ class IOCExecutor:
         limit_price: float,
         notional_usdt: float,
         contract_size: float = 1.0,
+        queue_frac: float = 1.0,
     ) -> IOCAttemptResult:
         """Walk the asks ladder, fill up to limit_price.
 
@@ -141,7 +151,11 @@ class IOCExecutor:
             if price > limit_price:
                 # Past our limit — IOC stops here
                 break
-            level_notional = price * size * contract_size
+            # Черга на рівні: нам дістається лише ЧАСТИНА показаного обсягу.
+            avail = size * queue_frac
+            if avail <= 0:
+                continue
+            level_notional = price * avail * contract_size
             if remaining <= level_notional:
                 qty = remaining / price
                 filled_qty += qty
@@ -149,7 +163,7 @@ class IOCExecutor:
                 remaining = 0
                 break
             else:
-                filled_qty += size * contract_size
+                filled_qty += avail * contract_size
                 spent_usdt += level_notional
                 remaining -= level_notional
 
@@ -175,6 +189,7 @@ class IOCExecutor:
         limit_price: float,
         notional_usdt: float,
         contract_size: float = 1.0,
+        queue_frac: float = 1.0,
     ) -> IOCAttemptResult:
         """Walk the bids ladder, fill down to limit_price.
 
@@ -193,7 +208,11 @@ class IOCExecutor:
         for price, size in levels:
             if price < limit_price:
                 break
-            level_notional = price * size * contract_size
+            # Черга на рівні: нам дістається лише ЧАСТИНА показаного обсягу.
+            avail = size * queue_frac
+            if avail <= 0:
+                continue
+            level_notional = price * avail * contract_size
             if remaining <= level_notional:
                 qty = remaining / price
                 filled_qty += qty
@@ -201,7 +220,7 @@ class IOCExecutor:
                 remaining = 0
                 break
             else:
-                filled_qty += size * contract_size
+                filled_qty += avail * contract_size
                 received_usdt += level_notional
                 remaining -= level_notional
 

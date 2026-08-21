@@ -92,6 +92,7 @@ def _make_engine(*, is_live: bool, realism: RealismProfile | None = None) -> Sha
     # mirrored here — this fixture has now broken that way twice.
     eng._mexc_feed_lag_ms = 0
     eng._max_book_age_ms = 0
+    eng._queue_frac = 1.0          # T1.2; 1.0 = вимкнено
 
     # Counters touched by _try_enter
     eng.signals_skipped_no_book = 0

@@ -568,6 +568,9 @@ class ShadowEngine:
         # Сильні посилання на twin-задачі, щоб GC не прибрав їх у польоті.
         self._twin_tasks: set = set()
         self._max_book_age_ms = max(0, int(getattr(cfg, "max_book_age_ms", 0)))
+        # T1.2; 1.0 = вимкнено. Обмежено (0, 1] — 0 означав би «жодної
+        # ліквідності», тобто тихо вимкнув би shadow-торгівлю цілком.
+        self._queue_frac = min(1.0, max(0.01, float(getattr(cfg, "queue_frac", 1.0))))
         if self._latency_enabled:
             logger.info(
                 "Shadow IOC latency window = %d..%d ms (uniform) — calibrated to live PENGU submit p10..p90",
@@ -1717,6 +1720,7 @@ class ShadowEngine:
                     # mis-sizes fills (10x small for PENGU, 100x big for ZEC/BCH).
                     contract_size=CONTRACT_SIZES.get(to_mexc(symbol), 1.0),
                     max_book_age_ms=self._max_book_age_ms,   # T1.3; 0 = off
+                    queue_frac=self._queue_frac,            # T1.2; 1.0 = off
                 )
             last_result = result
 
@@ -1804,6 +1808,7 @@ class ShadowEngine:
                 notional_usdt=notional,
                 limit_price=limit,
                 contract_size=CONTRACT_SIZES.get(mexc_symbol, 1.0),
+                queue_frac=self._queue_frac,
             )
             live_ok = 1 if (live_result.success and live_result.fill_price > 0) else 0
             await self.db.execute(
