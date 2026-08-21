@@ -76,6 +76,19 @@ universe:
   # SOL/ADA/XRP/HYPE/PUMP/AAVE/LINK/(BTC traded-on): historical net losses or other reasons.
   blacklist_symbols:
     - ETHUSDT       # no 0% maker promo on user's MEXC account
+    # BCHUSDT — прибрано 2026-08-22 (рішення оператора). Систематичний мінус у
+    # shadow, який ПОГЛИБИВСЯ після 20.08:
+    #   08-19  n= 7344  -$1762  -3.03 bps  трив 4.0с
+    #   08-20  n=11780  -$9415  -6.74 bps  трив 2.8с
+    #   08-21  n=12733  -$9331  -6.61 bps  трив 2.3с
+    # Одна пара зʼїдала більше, ніж заробляли три найкращі разом. Тривалість
+    # угоди падає — тобто вона все швидше вилітає в мінус.
+    # Через BLACKLIST, а не видаленням із whitelist_priority: рядок із
+    # причиною лишається в історії, і жодна майбутня правка whitelist не
+    # поверне пару випадково.
+    # ВИДАЛЯТИ З live_pair_whitelist У БД МАРНО — _sync_live_pair_whitelist
+    # приводить таблицю у відповідність до конфігу і додасть пару назад.
+    - BCHUSDT
     # (BTCUSDT NOT blacklisted here — it's reference-only, see below)
 
   # Reference-only: WS subscribed (we monitor prices for context) but detectors
