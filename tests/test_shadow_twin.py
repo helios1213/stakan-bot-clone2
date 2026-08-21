@@ -35,20 +35,25 @@ def _fn(name):
 
 # ---- the live path must stay untouched ----------------------------------
 
-def test_only_a_dict_snapshot_happens_before_submit():
-    """Everything between the snapshot and place_ioc_open is what live pays."""
-    i = SRC.index("_twin_snap = None")
+def test_nothing_but_a_set_add_happens_before_submit():
+    """Everything between registering the symbol and place_ioc_open is what live
+    pays. The dict snapshot is GONE — the tape now supplies the book, so the
+    live path got cheaper, not dearer."""
+    i = SRC.index("self._twin_tape_symbols.add(signal.symbol)")
     j = SRC.index("live_result = await executor.place_ioc_open(")
     between = SRC[i:j]
+    assert j > i, "symbol registration must precede submit"
     assert "simulate_ioc_entry" not in between, "the 5-15ms walk crept back in"
     assert "await" not in between, "no awaits may be added before submit"
-    assert "dict(_ob._bids)" in between and "dict(_ob._asks)" in between
+    assert "create_task" not in between
+    assert "random." not in between
 
 
-def test_snapshot_failure_cannot_break_the_order():
-    i = SRC.index("_twin_snap = None")
-    seg = SRC[i:i + 400]
-    assert "try:" in seg and "except Exception:" in seg
+def test_the_old_self_anchored_snapshot_is_gone():
+    """The tautology: the snapshot was taken from the SAME book object live
+    derived the limit from, so min(asks) <= best_ask+offset*tick held by
+    construction and the simulator could never expire (0 of 360 rows)."""
+    assert "_twin_snap" not in SRC
 
 
 def test_the_walk_runs_only_after_the_live_result_exists():
@@ -89,12 +94,13 @@ def test_it_compares_against_the_limit_that_really_went_to_the_exchange():
     assert "if limit <= 0:" in body, "no limit means nothing to compare"
 
 
-def test_it_replays_the_snapshot_not_the_current_book():
+def test_it_replays_a_taped_frame_not_the_current_book():
     """By the time the task runs the real book has moved on — using it would
     measure the delay, not the simulator."""
     body = _fn("_record_twin")
-    assert "ob.apply_snapshot(list(bids.items()), list(asks.items())" in body
+    assert "self._tape_frame_at(" in body
     assert "self.ob_manager.get" not in body
+    assert "self._ob_from_frame(" in body
 
 
 def test_both_verdicts_land_on_one_row():

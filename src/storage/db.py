@@ -564,6 +564,37 @@ async def init_db(db_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_shadow_twin_sym_ts
                 ON shadow_twin(symbol, ts);
         """)
+        # 2026-08-21: КРИВА ВІДГУКУ замість одного числа.
+        # Стара форма таблиці була ТАВТОЛОГІЄЮ: знімок книги брався в t0, а
+        # ліміт live виводився з ТОГО САМОГО обʼєкта книги мікросекундами
+        # пізніше, тож умова філу min(asks) <= best_ask+offset*tick була
+        # тотожно істинна — shadow_filled=0 не траплялось ЖОДНОГО разу
+        # (0 рядків із 360). «Головне число» дорівнювало 1/(живий fill-rate)
+        # і про симулятор не казало нічого.
+        # Тепер вердикт рахується на ТРЬОХ затримках від миті ціноутворення:
+        #   d0    — 0мс, стара тавтологія, лишена як КОНТРОЛЬ (має бути ~100%)
+        #   draw  — uniform(entry_latency_min_ms, max_ms) = продакшн-shadow
+        #   rtt   — реальний submit RTT цього ж ордера
+        # Стара колонка shadow_filled лишається = d0, щоб історія не поламалась.
+        await _add_columns_idempotent(db, "shadow_twin", [
+            ("shadow_filled_d0", "INTEGER"),
+            ("shadow_filled_draw", "INTEGER"),
+            ("shadow_filled_rtt", "INTEGER"),
+            # Строгий поріг: status='partial' зараз означає БУДЬ-ЯКЕ ненульове
+            # заповнення (у даних є рядок із shadow_filled_pct=0.0341, і він
+            # рахувався філом). Від цієї угоди відношення рухається на ~25%,
+            # тож рахуємо обидва пороги й вирішуємо на даних, а не на смаку.
+            ("shadow_strict_draw", "INTEGER"),
+            ("shadow_pct_draw", "REAL"),
+            ("shadow_reason_draw", "TEXT"),
+            ("delay_draw_ms", "INTEGER"),
+            ("delay_rtt_ms", "INTEGER"),
+            # Якість стрічки: наскільки книга, яку реально знайшли, відрізняється
+            # віком від замовленої. Без цього неможливо відрізнити «симулятор
+            # протух» від «стрічка не дала потрібного кадру».
+            ("tape_status", "TEXT"),
+            ("tape_age_ms", "INTEGER"),
+        ])
         # v2.1: add strategy_type to existing pair_configs (for existing installs)
         await _add_columns_idempotent(db, "pair_configs",
                                        [("strategy_type", "TEXT NOT NULL DEFAULT 'sniper'")])

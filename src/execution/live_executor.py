@@ -158,6 +158,14 @@ class LiveOrderResult:
     # how much worse than our limit we really fill. WRITE-ONLY for the order
     # path: nothing in placement or risk reads it.
     limit_price_scaled: float = 0.0
+    # `time.perf_counter()` у ТУ САМУ мить, коли з книги знято BBO, з якого
+    # виведено limit_price_scaled. Потрібен shadow_twin: без нього неможливо
+    # дістати зі стрічки книгу віком «момент ціноутворення + затримка».
+    # Раніше twin брав знімок книги на t0 і судив філ проти ліміту, виведеного
+    # з ТОГО САМОГО обʼєкта книги, — тобто min(asks) <= best_ask+offset*tick
+    # тотожно істинне, і симулятор не міг протухнути ЖОДНОГО разу (0 із 360).
+    # WRITE-ONLY для ордерного шляху: нічого в розміщенні чи ризику це не читає.
+    priced_at_perf: float = 0.0
 
 
 @dataclass
@@ -1234,6 +1242,10 @@ class LiveExecutor:
         # ім'я лишиться незвʼязаним -> NameError НА ЖИВОМУ ОРДЕРНОМУ ШЛЯХУ.
         # 0.0 читається як «ліміт невідомий», і twin такий рядок просто пропускає.
         limit_scaled = 0.0
+        # Ініціалізується ПЕРЕД циклом із тієї ж причини, що й limit_scaled:
+        # присвоєння живе всередині циклу, а читається після нього, і в циклі є
+        # гілки з continue → інакше NameError на живому ордері.
+        priced_at_perf = 0.0
         for attempt in range(1, max_attempts + 1):
             # Safety: don't open a duplicate if a previous attempt partially filled.
             # Skipped on attempt #1 (no prior order possible).
@@ -1317,6 +1329,11 @@ class LiveExecutor:
             #   offset_ticks  < 0 → rest INSIDE the spread (maker-style, less aggressive).
             tick_raw = get_tick_size(symbol)
             tick_scaled = tick_raw * scale if scale > 0 else tick_raw
+            # Мітка миті ціноутворення — знімається РАЗОМ із BBO, з якого
+            # виводиться ліміт. shadow_twin бере зі стрічки книгу віком
+            # (ця мітка + модельована затримка); без спільної точки відліку
+            # порівняння знову стало б тавтологією.
+            priced_at_perf = time.perf_counter()
             if direction == "long":
                 limit_scaled = best_ask.price + offset_ticks * tick_scaled
             else:
@@ -1593,6 +1610,7 @@ class LiveExecutor:
                     response_latency_ms=response_lat,
                     fill_poll_latency_ms=fill_poll_lat,
                     limit_price_scaled=limit_scaled,
+                    priced_at_perf=priced_at_perf,
                     raw_response=response,
                 )
 
@@ -1657,6 +1675,7 @@ class LiveExecutor:
             # ніколи не дивились на протухлі. А саме вони й показують, чи
             # симулятор філиться там, де біржа не змогла.
             limit_price_scaled=limit_scaled,
+            priced_at_perf=priced_at_perf,
             raw_response=last_response,
         )
 

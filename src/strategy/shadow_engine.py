@@ -25,7 +25,7 @@ import math
 import os
 import random
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from src.config import ShadowConf
@@ -567,6 +567,27 @@ class ShadowEngine:
         self._mexc_feed_lag_ms = max(0, int(getattr(cfg, "mexc_feed_lag_ms", 0)))
         # Сильні посилання на twin-задачі, щоб GC не прибрав їх у польоті.
         self._twin_tasks: set = set()
+        # ── СТРІЧКА КНИГИ для shadow_twin ───────────────────────────────────
+        # Кільцевий буфер знімків MEXC-книги по кожному символу, що зараз у
+        # live. Потрібен, бо twin мусить судити філ проти книги ВІКОМ
+        # «мить ціноутворення + модельована затримка», а не проти книги, з
+        # якої той самий ліміт і виведено (це давало тавтологію: 0 протухань
+        # із 360 рядків).
+        # Чому стрічка, а не «доспати всередині twin-задачі»: задача стартує
+        # ПІСЛЯ відповіді біржі, тож дедлайн t0+150..205мс на той момент у
+        # половині випадків уже в минулому. Книгу за минулу мить можна лише
+        # ПАМʼЯТАТИ, а не дочекатись.
+        self._twin_tape: dict[str, deque] = {}
+        # Символи, які варто писати у стрічку. Наповнюється самим живим шляхом
+        # (перша спроба по символу дає рядок tape_status='no_tape', далі є
+        # історія) і додатково звіряється зі станом live — так немає залежності
+        # від внутрішнього формату state_manager.
+        self._twin_tape_symbols: set[str] = set()
+        self._twin_tape_task: asyncio.Task | None = None
+        # 10мс крок / 250 кадрів = ~2.5с історії. Вікно навмисно більше за
+        # найгірший латентність-дроу (205мс) і за p99 submit RTT (~625мс).
+        self._twin_tape_interval_s = self._env_float("TWIN_TAPE_INTERVAL_MS", 10.0) / 1000.0
+        self._twin_tape_len = int(self._env_float("TWIN_TAPE_LEN", 250.0))
         self._burst_diag_ts = 0.0
         self._max_book_age_ms = max(0, int(getattr(cfg, "max_book_age_ms", 0)))
         # T1.2; 1.0 = вимкнено. Обмежено (0, 1] — 0 означав би «жодної
@@ -643,6 +664,10 @@ class ShadowEngine:
         # Детектор СПЛЕСКУ ВОЛАТИЛЬНОСТІ → Telegram-алерт (оператор сам
         # збільшує розмір). РОЗМІР/ОРДЕРИ НЕ ЧІПАЄ. Валідовано на 08-13/08-18.
         self._burst_alert_task = asyncio.create_task(self._burst_alert_loop())
+        # Стрічка книги для shadow_twin. Нічого не торгує і нічого не блокує —
+        # лише памʼятає нещодавні кадри, щоб twin міг судити філ проти книги
+        # потрібного ВІКУ. Живий шлях її не чекає.
+        self._twin_tape_task = asyncio.create_task(self._twin_tape_loop())
         # every 60s log signal funnel counters at INFO
         # level so we can see WHERE signals are dropping (cooldown / lag /
         # latency_drift / max_positions / no_book / etc.) without enabling DEBUG.
@@ -661,6 +686,12 @@ class ShadowEngine:
             self._burst_alert_task.cancel()
             try:
                 await self._burst_alert_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if getattr(self, "_twin_tape_task", None) is not None:
+            self._twin_tape_task.cancel()
+            try:
+                await self._twin_tape_task
             except (asyncio.CancelledError, Exception):
                 pass
         if hasattr(self, "_heartbeat_task") and self._heartbeat_task is not None:
@@ -1796,7 +1827,106 @@ class ShadowEngine:
             )
 
 
-    def _schedule_twin(self, signal, cfg, mexc_symbol, slot_id, snap,
+    async def _twin_tape_loop(self) -> None:
+        """Памʼятати нещодавні кадри MEXC-книги по символах, що торгують live.
+
+        Єдиний споживач — `_record_twin`. Живий шлях сюди не заглядає і на цю
+        задачу не чекає: якщо стрічка помре, зникнуть рядки аналітики, а не
+        торгівля. Тому цикл ніколи не піднімає виняток назовні, але й НЕ мовчить
+        — падіння пишеться `logger.error` (урок T0.1: тиха гілка = брехливий
+        знаменник, і ми довго не бачили б, що семплер мертвий).
+
+        Дедуп за `last_update_id`: кадр кладеться, лише коли книга справді
+        змінилась, тож при тихому ринку буфер не забивається копіями.
+        """
+        logger.info("[TWIN TAPE] старт: крок %.0fмс, глибина %d кадрів",
+                    self._twin_tape_interval_s * 1000, self._twin_tape_len)
+        _last_id: dict[str, int] = {}
+        while not self._stop.is_set():
+            try:
+                for sym in tuple(self._twin_tape_symbols):
+                    try:
+                        live_now = self.state_manager.is_in_live(sym)
+                    except Exception:
+                        live_now = False
+                    if not live_now:
+                        # Пара пішла з live — стрічка більше не потрібна.
+                        # Без цього буфери мертвих пар жили б до рестарту.
+                        self._twin_tape_symbols.discard(sym)
+                        self._twin_tape.pop(sym, None)
+                        _last_id.pop(sym, None)
+                        continue
+                    ob = self.ob_manager.get("mexc", sym)
+                    if ob is None:
+                        continue
+                    uid = getattr(ob, "last_update_id", 0)
+                    if uid and _last_id.get(sym) == uid:
+                        continue                      # книга не змінилась
+                    _last_id[sym] = uid
+                    tape = self._twin_tape.get(sym)
+                    if tape is None:
+                        tape = deque(maxlen=self._twin_tape_len)
+                        self._twin_tape[sym] = tape
+                    # Зберігаємо ОРИГІНАЛЬНИЙ last_update_ts_ms: apply_snapshot
+                    # при відновленні штампує його поточним часом, і без цього
+                    # вік книги у twin завжди виходив би ~0, тобто гейт
+                    # max_book_age_ms був би структурно інертний.
+                    tape.append((
+                        time.perf_counter(),
+                        uid,
+                        bool(getattr(ob, "is_synced", False)),
+                        int(getattr(ob, "last_update_ts_ms", 0) or 0),
+                        dict(ob._bids),
+                        dict(ob._asks),
+                    ))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("[TWIN TAPE] ітерація впала", exc_info=True)
+            try:
+                await asyncio.sleep(self._twin_tape_interval_s)
+            except asyncio.CancelledError:
+                raise
+        logger.info("[TWIN TAPE] зупинено")
+
+    def _tape_frame_at(self, symbol: str, target_perf: float):
+        """Останній кадр стрічки з міткою <= target_perf.
+
+        Саме ОСТАННІЙ не пізніше дедлайну, а не найсвіжіший узагалі: інакше ми
+        судили б філ проти книги, якої на той момент ще не існувало, і замість
+        однієї тавтології отримали б іншу — вже з поглядом у майбутнє.
+        Повертає (frame, status, age_ms_vs_deadline) або (None, статус, None).
+        """
+        tape = self._twin_tape.get(symbol)
+        if not tape:
+            return None, "no_tape", None
+        best = None
+        for fr in tape:                      # 250 елементів, дешевше за bisect
+            if fr[0] <= target_perf:
+                best = fr
+            else:
+                break                        # стрічка монотонна за часом
+        if best is None:
+            # Усі кадри НОВІШІ за дедлайн — стрічка почалась пізніше за подію
+            # (перша спроба по символу, або рестарт). Рядок усе одно пишеться,
+            # інакше знаменник знову став би брехливим.
+            return None, "tape_starts_later", None
+        return best, "ok", int((target_perf - best[0]) * 1000)
+
+    @staticmethod
+    def _ob_from_frame(mexc_symbol: str, frame) -> OrderBook:
+        """Відновити OrderBook із кадру стрічки, зберігши вік книги."""
+        _perf, uid, synced, orig_ts_ms, bids, asks = frame
+        ob = OrderBook(symbol=mexc_symbol, exchange="mexc", max_levels=20)
+        ob.apply_snapshot(list(bids.items()), list(asks.items()), update_id=uid or 1)
+        # apply_snapshot щойно переписав це поточним часом — повертаємо правду,
+        # інакше max_book_age_ms не калібрується в принципі.
+        ob.last_update_ts_ms = orig_ts_ms or ob.last_update_ts_ms
+        if not synced:
+            ob.is_synced = False
+        return ob
+
+    def _schedule_twin(self, signal, cfg, mexc_symbol, slot_id,
                        live_result, notional) -> None:
         """Поставити в чергу порівняння shadow-симулятора з живим філом.
 
@@ -1805,7 +1935,7 @@ class ShadowEngine:
         """
         try:
             task = asyncio.create_task(
-                self._record_twin(signal, cfg, mexc_symbol, slot_id, snap,
+                self._record_twin(signal, cfg, mexc_symbol, slot_id,
                                   live_result, notional),
                 name=f"twin:{mexc_symbol}",
             )
@@ -1814,52 +1944,126 @@ class ShadowEngine:
         except Exception:
             logger.debug("[TWIN] не вдалось запланувати", exc_info=True)
 
-    async def _record_twin(self, signal, cfg, mexc_symbol, slot_id, snap,
+    async def _record_twin(self, signal, cfg, mexc_symbol, slot_id,
                            live_result, notional) -> None:
-        """Що вирішив би симулятор на ТІЙ САМІЙ книзі і з ТИМ САМИМ лімітом.
+        """Що вирішив би симулятор на книзі ТОГО САМОГО ВІКУ і з тим самим лімітом.
 
-        Це і є те, чого досі не існувало: перетин signal_uid між shadow_trades
-        і live_trades був РІВНО НУЛЬ, бо пара або live, або shadow. Будь-яке
-        «чи стало чесніше» порівнювало різні календарні вікна. Тепер обидві
-        відповіді стоять в одному рядку, на одному сигналі.
+        ЧОМУ ЦЕ ПЕРЕПИСАНО (2026-08-21). Попередня версія брала знімок книги в
+        мить t0 і судила філ проти ліміту, який live вивів із ТОГО САМОГО
+        обʼєкта книги мікросекундами пізніше. Тобто умова філу
+        `min(asks) <= best_ask(t0) + offset*tick` була тотожно істинною —
+        симулятор не міг протухнути ЖОДНОГО разу, і дані це підтвердили:
+        `shadow_filled=0` у 0 рядках із 360. «Головне число» shadow/live
+        алгебраїчно дорівнювало `1/(живий fill-rate)` і про симулятор не
+        казало нічого.
 
-        Ліміт беремо той, що РЕАЛЬНО пішов на біржу (`limit_price_scaled`), а не
-        перерахований — інакше порівнювали б із чимось, чого не було.
+        Тепер вердикт рахується на ТРЬОХ затримках від МИТІ ЦІНОУТВОРЕННЯ
+        (`live_result.priced_at_perf` — знімається разом із BBO, з якого
+        виведено ліміт):
+          d0    = 0мс     — стара тавтологія, лишена як КОНТРОЛЬ (має бути ~100%;
+                            якщо ні — щось поїхало у стрічці, а не в симуляторі)
+          draw  = uniform(entry_latency_min_ms, max_ms) — те, що робить
+                            продакшн-shadow: ліміт морозиться в t0, книга
+                            перечитується після сну
+          rtt   = реальний submit RTT цього ж ордера — пряме порівняння з live
+                            на ТОМУ САМОМУ сигналі
+
+        Одне число тут принципово не годиться: без контролю d0 неможливо
+        відрізнити «симулятор став чесним» від «стрічка віддає сміття».
+
+        Паритет із продакшн-shadow (інакше калібрування міряло б нашу власну
+        неузгодженість): ті самі `queue_frac` і `max_book_age_ms`, той самий
+        гейт `is_synced` і той самий поріг дрейфу `_max_acceptable_drift_pct`.
+        Випадкові штрафи (`should_reject_order`, `simulate_server_error`) НЕ
+        реплікуються — разом це ~2.5% і додало б лише дисперсію.
         """
         try:
-            bids, asks = snap
-            if not bids or not asks:
-                return
             limit = getattr(live_result, "limit_price_scaled", 0.0) or 0.0
             if limit <= 0:
                 return                      # нема з чим порівнювати
-            ob = OrderBook(symbol=mexc_symbol, exchange="mexc", max_levels=20)
-            ob.apply_snapshot(list(bids.items()), list(asks.items()), update_id=1)
-            res = self.ioc_executor.simulate_ioc_entry(
-                mexc_ob=ob,
-                direction=signal.direction,
-                notional_usdt=notional,
-                limit_price=limit,
-                contract_size=CONTRACT_SIZES.get(mexc_symbol, 1.0),
-                queue_frac=self._queue_frac,
-            )
+            t_price = getattr(live_result, "priced_at_perf", 0.0) or 0.0
+            sym = signal.symbol
+            contract_size = CONTRACT_SIZES.get(mexc_symbol, 1.0)
+
+            draw_ms = random.uniform(self._latency_min_ms, self._latency_max_ms)
+            rtt_ms = float(getattr(live_result, "submit_latency_ms", 0) or 0)
+
+            def verdict(delay_ms):
+                """(filled_any, filled_strict, pct, price, reason, tape_status, age_ms)"""
+                if t_price <= 0:
+                    return None, None, None, None, "no_pricing_ts", "no_pricing_ts", None
+                frame, status, age = self._tape_frame_at(sym, t_price + delay_ms / 1000.0)
+                if frame is None:
+                    return None, None, None, None, status, status, None
+                ob = self._ob_from_frame(mexc_symbol, frame)
+                # Паритет 1: продакшн-shadow після сну перевіряє синхронність.
+                if not ob.is_synced:
+                    return 0, 0, 0.0, 0.0, "book_desynced", status, age
+                # Паритет 2: той самий гейт дрейфу, поріг з атрибута, не літерал.
+                mid = ob.mid_price()
+                if mid and getattr(signal, "mexc_price", 0) > 0:
+                    drift = (mid - signal.mexc_price) / signal.mexc_price * 100
+                    if ((signal.direction == "long" and drift > self._max_acceptable_drift_pct)
+                            or (signal.direction != "long"
+                                and drift < -self._max_acceptable_drift_pct)):
+                        return 0, 0, 0.0, 0.0, "latency_drift", status, age
+                r = self.ioc_executor.simulate_ioc_entry(
+                    mexc_ob=ob,
+                    direction=signal.direction,
+                    notional_usdt=notional,
+                    limit_price=limit,
+                    contract_size=contract_size,
+                    max_book_age_ms=self._max_book_age_ms,
+                    queue_frac=self._queue_frac,
+                )
+                any_fill = 1 if r.status in ("filled", "partial") else 0
+                # Строгий поріг: `partial` зараз означає БУДЬ-ЯКЕ ненульове
+                # заповнення (у даних є рядок із часткою 0.0341, і він рахувався
+                # філом). Пишемо обидва, вирішувати будемо на даних.
+                strict = 1 if (r.filled_pct or 0.0) >= 0.99 else 0
+                reason = r.status if any_fill else (r.expired_reason or "expired")
+                return (any_fill, strict, (r.filled_pct or 0.0),
+                        (r.avg_fill_price or 0.0), reason, status, age)
+
+            # `await asyncio.sleep(0)` МІЖ проходами — не косметика. Прохід по
+            # драбині синхронний (5-15мс), а їх тепер три; без поступки цикл
+            # подій блокувався б на 15-45мс поспіль, тобто втричі довше, ніж
+            # коштував один прохід. За кривою Gate 0 кожні ~50мс приблизно
+            # ПОДВОЮЮТЬ втрати філів, тож така пауза — не дрібниця.
+            # Кожен _tape_frame_at сам по собі атомарний (усередині немає
+            # await), тож ітерація по deque не може зіткнутись із append.
+            d0_f, _d0s, d0_pct, _d0p, d0_reason, tape_status, tape_age = verdict(0.0)
+            await asyncio.sleep(0)
+            dr_f, dr_s, dr_pct, dr_price, dr_reason, _ts2, _a2 = verdict(draw_ms)
+            await asyncio.sleep(0)
+            rt_f, _rts, _rtp, _rtp2, _rtr, _ts3, _a3 = verdict(rtt_ms)
+
             live_ok = 1 if (live_result.success and live_result.fill_price > 0) else 0
             await self.db.execute(
                 """INSERT INTO shadow_twin
                    (ts, signal_uid, symbol, direction, slot_id, limit_price,
                     live_filled, live_price, live_filled_pct, live_error,
                     shadow_filled, shadow_price, shadow_filled_pct,
-                    shadow_reason, notional_usdt)
-                   VALUES (?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?)""",
+                    shadow_reason, notional_usdt,
+                    shadow_filled_d0, shadow_filled_draw, shadow_filled_rtt,
+                    shadow_strict_draw, shadow_pct_draw, shadow_reason_draw,
+                    delay_draw_ms, delay_rtt_ms, tape_status, tape_age_ms)
+                   VALUES (?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?)""",
                 (int(time.time()), getattr(signal, "created_at_ms", None),
                  signal.symbol, signal.direction, slot_id, limit,
                  live_ok, live_result.fill_price or 0.0,
                  (live_result.notional_usdt / notional) if notional > 0 else 0.0,
                  live_result.error_msg,
-                 1 if res.status in ("filled", "partial") else 0,
-                 res.avg_fill_price or 0.0, res.filled_pct or 0.0,
-                 res.status if res.status in ("filled", "partial") else (res.expired_reason or "expired"),
-                 notional),
+                 # Стара колонка = d0, щоб історичні запити не поламались і було
+                 # видно, що саме вона й міряла тавтологію.
+                 # shadow_price = ціна ВЕРДИКТУ draw (продакшн-shadow), бо саме
+                 # він тепер порівнюваний із живим філом; d0 лишається контролем.
+                 d0_f, dr_price if dr_price is not None else 0.0,
+                 d0_pct if d0_pct is not None else 0.0,
+                 d0_reason, notional,
+                 d0_f, dr_f, rt_f,
+                 dr_s, dr_pct, dr_reason,
+                 int(draw_ms), int(rtt_ms), tape_status, tape_age),
             )
         except Exception:
             logger.debug("[TWIN] запис не вдався", exc_info=True)
@@ -2149,18 +2353,13 @@ class ShadowEngine:
                         _skip_reason, _skip_sid = "slot_busy", sid
                     continue
                 chosen_slot_id = sid
-                # T2.2: знімок книги ДО відправки. Це все, що робиться на
-                # живому шляху — дві копії dict по <=40 записів, мікросекунди.
-                # Уся симуляція виконується ПІСЛЯ, окремою задачею: прохід по
-                # драбині коштував 5-15мс на сигнал, і саме тому його свого
-                # часу прибрали з live fast-path. Сюди він не повертається.
-                _twin_snap = None
-                try:
-                    _ob = _mexc_ob_for_open
-                    if _ob is not None and _ob.is_synced:
-                        _twin_snap = (dict(_ob._bids), dict(_ob._asks))
-                except Exception:
-                    _twin_snap = None
+                # T2.2: знімок книги ТУТ БІЛЬШЕ НЕ БЕРЕТЬСЯ. Він давав книгу
+                # миті t0, з якої live виводив і сам ліміт, — тобто симулятор
+                # судив себе проти власного якоря і не міг протухнути жодного
+                # разу. Тепер книгу потрібного ВІКУ дає `_twin_tape_loop`, а на
+                # живому шляху лишається один додаток у set (мікросекунди) і
+                # жодних копій dict.
+                self._twin_tape_symbols.add(signal.symbol)
                 async with _slot_lock:
                     live_result = await executor.place_ioc_open(
                         symbol=mexc_symbol,
@@ -2183,9 +2382,8 @@ class ShadowEngine:
                 # T2.2: fire-and-forget. Викликається ПІСЛЯ того, як живий
                 # ордер уже відправлено й відповідь отримано, тож на шлях до
                 # submit не впливає нічим.
-                if _twin_snap is not None:
-                    self._schedule_twin(signal, cfg, mexc_symbol, sid,
-                                        _twin_snap, live_result, live_notional)
+                self._schedule_twin(signal, cfg, mexc_symbol, sid,
+                                    live_result, live_notional)
                 # Видимість у панелі: писати РЕАЛЬНУ причину відмови
                 # відкриття (api_error_2006 leverage, throttle 9082/10014,
                 # 510, …) у колонку ПОМИЛКА і чистити при успіху. Рутинні
