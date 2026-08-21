@@ -842,6 +842,19 @@ class ShadowEngine:
         # +0.96 = лише x1.26 при потрібних x2.5. Абсолютна планка це ловить.
         # 0 = вимкнено.
         bps_abs = float(os.environ.get("BURST_BPS_ABS", "1.5"))
+        # ТРИВАЛІСТЬ. Головна знахідка 2026-08-21: bps НЕ відділяє аномалію від
+        # шуму — розподіли перекриваються. Найкраще 3-хв вікно 08-21 дало +$61
+        # при 2.22 bps, а p90 звичайних вікон того ж дня 2.30. Скільки не
+        # піднімай планку, або ріжеш справжні сплески, або ловиш поодинокі
+        # стрибки на затихаючій активності (де bps росте механічно: угод стає
+        # мало, знаменник падає швидше за чисельник).
+        # Розділяє їх те, чи рух ТРИМАЄТЬСЯ. На всіх трьох еталонних днях
+        # аномалія — це серія вікон поспіль: 08-18 13:40-13:48 (9 вікон,
+        # $+864), 08-21 07:59-08:06 (8 вікон, $+159), 08-13 19:15-19:18.
+        # Фейкові алерти — завжди ОДНЕ вікно.
+        # У секундах, а не в кількості сканів: інакше залежить від BURST_SCAN_SEC.
+        persist_sec = int(os.environ.get("BURST_PERSIST_SEC", "180"))
+        bps_sustain = float(os.environ.get("BURST_BPS_SUSTAIN", "2.0"))
         # 20/год блокувало 1950 сканів 2026-08-18 — на рідких парах детектор
         # не встигав навіть дійти до перевірок. 10 достатньо для медіани.
         min_base_trades = int(os.environ.get("BURST_MIN_BASE_TRADES", "10"))
@@ -851,6 +864,10 @@ class ShadowEngine:
                     "win=%ds, scan=%ds, spam=%d", rate_mult, conf_min, win_sec,
                     scan_sec, alert_count)
         active: dict = {}   # (symbol,label) -> last alert ts, поки в сплеску
+        # (symbol,label) -> коли ПОЧАЛАСЬ поточна безперервна серія умов.
+        # Обнуляється щойно умова розірвалась — саме це й відсікає
+        # поодинокі сплески.
+        run_since: dict = {}
         try:
             while not self._stop.is_set():
                 try:
@@ -930,10 +947,23 @@ class ShadowEngine:
                                    and rbps >= bps_min)
                         _by_abs = (bps_abs > 0 and rbps >= bps_abs
                                    and rate >= bps_rate_mult * base_rate)
-                        is_burst = _move_ok and (_by_rate or _by_bps or _by_abs)
+                        _by_sustain = rbps >= bps_sustain
+                        _candidate = _move_ok and (_by_rate or _by_bps or _by_abs
+                                                   or _by_sustain)
+                        # Серія: тримаємо момент її початку, а не лічильник —
+                        # так вимога виражена в секундах і не поїде, якщо
+                        # хтось змінить інтервал сканування.
+                        if _candidate:
+                            run_since.setdefault(key, now)
+                        else:
+                            run_since.pop(key, None)
+                        _held = (now - run_since[key]) if key in run_since else 0
+                        is_burst = _candidate and _held >= persist_sec
                         _trigger = "+".join(
                             n for n, ok in (("частота", _by_rate), ("bps", _by_bps),
-                                            ("абс.bps", _by_abs)) if ok) or "?"
+                                            ("абс.bps", _by_abs),
+                                            ("тривалість", _by_sustain)) if ok) or "?"
+                        _trigger += f" ({_held}с)"
                         if is_burst:
                             first = key not in active
                             if first or (now - active.get(key, 0)) >= repeat_sec:
@@ -979,6 +1009,7 @@ class ShadowEngine:
                                             symbol, ("/" + label) if label else "",
                                             rate, ratio, rbps, base_bps, rpnl, _trigger)
                         else:
+                            run_since.pop(key, None)
                             if key in active:
                                 try:
                                     await self.alerts.send(
@@ -994,6 +1025,12 @@ class ShadowEngine:
                     for k in list(active.keys()):
                         if k not in seen:
                             del active[k]
+                    # Пара зникла з live -> її серія більше не має сенсу.
+                    # Без цього словник ріс би вічно, а повернення пари в live
+                    # через годину виглядало б як безперервна серія.
+                    for k in list(run_since.keys()):
+                        if k not in seen:
+                            del run_since[k]
                 except Exception:
                     logger.exception("[BURST] loop iteration failed")
         except asyncio.CancelledError:

@@ -139,7 +139,7 @@ def test_either_trigger_can_fire_but_movement_gate_is_mandatory():
     """pk1000 is what separates a real move from chop — dropping it took the
     replay from 100% profitable to 88-90% with losing alerts."""
     b = _burst_src()
-    assert "is_burst = _move_ok and (_by_rate or _by_bps or _by_abs)" in b
+    assert "_candidate = _move_ok and (_by_rate or _by_bps or _by_abs" in b
 
 
 def test_bps_trigger_uses_a_lower_frequency_bar():
@@ -190,7 +190,7 @@ def test_absolute_trigger_can_be_switched_off():
 def test_absolute_trigger_still_requires_movement_and_some_activity():
     """Left alone it would fire on a single lucky trade in a dead market."""
     b = _burst_src()
-    assert "is_burst = _move_ok and (_by_rate or _by_bps or _by_abs)" in b
+    assert "_candidate = _move_ok and (_by_rate or _by_bps or _by_abs" in b
     i = b.index("_by_abs = ")
     assert "rate >= bps_rate_mult * base_rate" in b[i:i + 220]
 
@@ -224,3 +224,53 @@ def test_compose_pins_the_recalibrated_thresholds():
     assert val("BURST_MIN_TRADES") >= 10, "fewer trades = the bps is noise"
     assert val("BURST_BPS_ABS") >= 3.0
     assert val("BURST_BPS_MULT") >= 3.0
+
+
+# ---- persistence: what actually separates an anomaly from a spike --------
+
+def test_alert_requires_the_move_to_HOLD():
+    """The finding that ended three rounds of threshold-tuning: bps does NOT
+    separate anomaly from noise — the distributions overlap. The best 3-min
+    window of 2026-08-21 made +$61 at 2.22 bps while that day's ordinary p90
+    was 2.30. What separates them is whether the move HOLDS:
+      08-18 13:40-13:48  9 windows in a row  $+864
+      08-21 07:59-08:06  8 windows in a row  $+159
+    Every false alert we shipped was a SINGLE window."""
+    b = _burst_src()
+    assert "is_burst = _candidate and _held >= persist_sec" in b
+
+
+def test_run_is_tracked_in_seconds_not_scan_counts():
+    """A counter of scans silently changes meaning if BURST_SCAN_SEC moves."""
+    b = _burst_src()
+    assert 'BURST_PERSIST_SEC", "180"' in b
+    assert "run_since.setdefault(key, now)" in b
+    assert "_held = (now - run_since[key])" in b
+
+
+def test_a_broken_run_resets_immediately():
+    """One failing scan must wipe the streak — otherwise a spike plus a later
+    unrelated spike would add up into a fake 'sustained' move."""
+    b = _burst_src()
+    assert "run_since.pop(key, None)" in b
+
+
+def test_run_state_is_cleaned_when_a_pair_leaves_live():
+    """Else the dict grows forever, and a pair returning after an hour looks
+    like it had been running the whole time."""
+    b = _burst_src()
+    assert "for k in list(run_since.keys()):" in b
+
+
+def test_sustain_threshold_is_lower_than_the_spike_thresholds():
+    """Persistence buys the right to a LOWER bar: 2.0 held for 3 minutes beats
+    3.0 for one window. That is what catches 08-18 at 13:28 with 94% of the
+    day's profit still ahead."""
+    b = _burst_src()
+    assert 'BURST_BPS_SUSTAIN", "2.0"' in b
+
+
+def test_held_seconds_are_shown_in_the_alert():
+    """Without it you cannot tell a 3-minute move from a 30-minute one."""
+    b = _burst_src()
+    assert '_trigger += f" ({_held}с)"' in b
