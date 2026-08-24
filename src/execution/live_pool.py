@@ -215,6 +215,95 @@ class LiveExecutorPool:
 
         self._active_slot_ids = active_slot_ids
         self._pair_to_slots = new_pair_to_slots
+        # Кіл живе В ПАМʼЯТІ контролера, тож зовні його не видно НІДЕ: вебпанель
+        # окремий процес (на іншій машині для клона) і в цю памʼять не заглядає.
+        # Тут стан дзеркалиться в live_state, а звідти ж забирається запит на
+        # зняття. Цикл rebuild іде раз на 30с — саме така затримка і в кнопки.
+        await self.sync_kill_state()
+
+    # ---- Кіл назовні: дзеркало стану + запит на зняття з панелі ----
+
+    @staticmethod
+    def _kill_state_key(slot_id: int) -> str:
+        return f"kill_state:slot{slot_id}"
+
+    @staticmethod
+    def _kill_request_key(slot_id: int) -> str:
+        return f"kill_release_req:slot{slot_id}"
+
+    async def sync_kill_state(self) -> None:
+        """Дзеркалити кіл у `live_state` і виконувати запити на зняття з панелі.
+
+        ЧОМУ ЧЕРЕЗ БД. Панель — окремий процес, а для клона ще й інша машина;
+        дістатись до `SafetyController` у памʼяті бота вона не може в принципі.
+        `live_state` уже використовується як канал для маркера ручного зняття
+        (`persist_kill_release`), тож це не нова інфраструктура.
+
+        ПОРЯДОК ВАЖЛИВИЙ: спершу виконати запит на зняття, і лише потім писати
+        стан. У зворотному порядку панель показувала б «кіл активний» ще 30
+        секунд після успішного зняття.
+
+        Ніколи не кидає назовні: це діагностика і зручність, а не торгівля —
+        збій тут не має валити цикл rebuild.
+        """
+        if self.live_db is None:
+            return
+        # Слоти БЕЗ контролера теж треба обійти. Контролер існує лише поки слот
+        # live-активний; якщо оператор вимкнув live, у `_safety_controllers`
+        # порожньо — і тоді (а) запит із панелі не споживався б НІКОЛИ, тобто
+        # кнопка мовчки не працювала б, і (б) протухлий kill_state від минулої
+        # сесії висів би вічно, а панель показувала б ФАНТОМНИЙ халт.
+        # Немає контролера — немає й халту, тож маркер прибираємо.
+        sids = set(self._safety_controllers)
+        try:
+            for _r in await self.live_db.fetchall(
+                    "SELECT key FROM live_state WHERE key LIKE 'kill_state:slot%' "
+                    "   OR key LIKE 'kill_release_req:slot%'"):
+                try:
+                    sids.add(int(str(_r[0]).rsplit("slot", 1)[1]))
+                except (IndexError, ValueError):
+                    continue
+        except Exception:
+            logger.exception("[KILL SYNC] не вдалось перелічити маркери")
+        for sid in sorted(sids):
+            ctl = self._safety_controllers.get(sid)
+            try:
+                # 1. Запит на зняття від панелі.
+                req_key = self._kill_request_key(sid)
+                row = await self.live_db.fetchone(
+                    "SELECT value FROM live_state WHERE key = ?", (req_key,))
+                if row and row[0]:
+                    if ctl is not None and ctl.is_killed():
+                        was, why = await self.release_kill(sid)
+                        logger.warning(
+                            "[KILL RESET] slot %d: знято з ВЕБПАНЕЛІ (%s)",
+                            sid, why or "без причини")
+                    elif ctl is None:
+                        logger.info("[KILL RESET] slot %d: запит із панелі, але "
+                                    "слот не live-активний — халту немає", sid)
+                    else:
+                        logger.info("[KILL RESET] slot %d: запит із панелі, але "
+                                    "активного кіла немає", sid)
+                    # Маркер прибираємо в БУДЬ-ЯКОМУ разі, інакше запит
+                    # відпрацьовував би на кожному циклі знову.
+                    await self.live_db.execute(
+                        "DELETE FROM live_state WHERE key = ?", (req_key,))
+
+                # 2. Дзеркало поточного стану.
+                st_key = self._kill_state_key(sid)
+                if ctl is not None and ctl.is_killed():
+                    reason = getattr(ctl.state, "kill_reason", "") or "peak drawdown"
+                    until = int(getattr(ctl.state, "kill_until_ts", 0) or 0)
+                    await self.live_db.execute(
+                        "INSERT OR REPLACE INTO live_state (key, value, updated_at) "
+                        "VALUES (?, ?, ?)",
+                        (st_key, f"{until}|{reason}", int(time.time())),
+                    )
+                else:
+                    await self.live_db.execute(
+                        "DELETE FROM live_state WHERE key = ?", (st_key,))
+            except Exception:
+                logger.exception("[KILL SYNC] slot %d: не вдалось синхронізувати", sid)
 
     def active_executors(self) -> dict[int, "LiveExecutor"]:
         """Executors that may still act on an exchange account.

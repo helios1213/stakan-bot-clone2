@@ -135,9 +135,49 @@ def accounts() -> list[dict]:
             _lc.close()
     except Exception:
         pass
+    # Кіл-світч. Контролер живе в памʼяті БОТА, тож панель (окремий процес, а
+    # для клона ще й інша машина) не може його побачити напряму. Бот дзеркалить
+    # стан у live_state ключем `kill_state:slotN` (LiveExecutorPool.sync_kill_state,
+    # раз на ~30с). Порожньо = кіла немає.
+    _kill: dict[int, tuple[int, str]] = {}
+    try:
+        _kc = _ro(LIVE_DB)
+        try:
+            for _kr in _kc.execute(
+                    "SELECT key, value FROM live_state WHERE key LIKE 'kill_state:slot%'"):
+                try:
+                    _sid = int(str(_kr["key"]).rsplit("slot", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                _until, _, _why = str(_kr["value"] or "").partition("|")
+                try:
+                    _until_i = int(_until)
+                except ValueError:
+                    _until_i = 0
+                _kill[_sid] = (_until_i, _why or "peak drawdown")
+        finally:
+            _kc.close()
+    except Exception:
+        pass
     out = []
     for r in rows:
+        _k = _kill.get(r["slot_id"])
+        # Поле помилки — це те, куди оператор дивиться першим. Кіл ПЕРЕКРИВАЄ
+        # last_error, а не дописується збоку: халт важливіший за будь-яку
+        # транзиторну помилку health-check, і саме його треба побачити одразу.
+        # Оригінал не губиться — він поруч, у api_last_error.
+        _err = r["last_error"]
+        if _k:
+            _until_txt = ""
+            if _k[0]:
+                _left = max(0, _k[0] - int(time.time()))
+                _until_txt = f" · ще {_left // 60}хв" if _left else " · вичерпано"
+            _err = f"💀 KILL SWITCH: {_k[1]}{_until_txt}"
         out.append({
+            "kill_active": bool(_k),
+            "kill_reason": _k[1] if _k else None,
+            "kill_until_ts": _k[0] if _k else None,
+            "api_last_error": r["last_error"],
             "slot_id": r["slot_id"], "label": r["label"],  # реальна мітка (порожньо=нема); дефолт-хінт у UI (placeholder)
             "enabled": bool(r["enabled"]), "live_enabled": bool(r["live_enabled"]),
             "assigned_pair": r["assigned_pair"],
@@ -145,7 +185,7 @@ def accounts() -> list[dict]:
             "latency_ms": _num(r["last_latency_ms"], int),
             "order_latency_ms": _lat.get(f"slot{r['slot_id']}"),
             "last_health_check": r["last_health_check"],
-            "last_error": r["last_error"], "has_key": bool(r["has_key"]),
+            "last_error": _err, "has_key": bool(r["has_key"]),
             "has_proxy": bool(r["has_proxy"]),
         })
     return out
@@ -304,6 +344,43 @@ def set_account_routed(server: str, slot_id: int, **kwargs) -> dict:
             return {"ok": False, "error": str(e)}
         return {"ok": True}
     return _remote_rpc(server, {"op": "set", "slot_id": slot_id, **kwargs})
+
+
+def request_kill_release(slot_id: int) -> dict:
+    """Попросити бота зняти кіл-світч зі слота.
+
+    ПАНЕЛЬ НЕ ЗНІМАЄ КІЛ САМА, і це навмисно: `SafetyController` живе в памʼяті
+    бота, а панель — окремий процес (для клона ще й на іншій машині). Якби ми
+    просто почистили щось у БД, у памʼяті бота халт лишився б, і кнопка
+    «працювала» б лише візуально — рівно той клас бага, що вже був із ручним
+    зняттям, яке не переживало рестарт.
+    Тому сюди пишеться ЗАПИТ, а виконує його бот у `LiveExecutorPool.sync_kill_state`
+    (цикл rebuild, ~30с) — він же прибирає маркер і зберігає факт зняття так,
+    щоб той пережив рестарт.
+
+    Затримка до ~30с — очікувана, UI має про це сказати.
+    """
+    conn = _rw(LIVE_DB)
+    try:
+        now = int(time.time())
+        conn.execute(
+            "INSERT OR REPLACE INTO live_state (key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            (f"kill_release_req:slot{int(slot_id)}", str(now), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "queued": True}
+
+
+def request_kill_release_routed(server: str, slot_id: int) -> dict:
+    if server == "primary":
+        try:
+            return request_kill_release(slot_id)
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return _remote_rpc(server, {"op": "unkill", "slot_id": slot_id})
 
 
 @_rw_retry
