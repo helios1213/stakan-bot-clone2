@@ -69,25 +69,32 @@ async def test_get_order_deals_no_auth_signing():
 
 # ---- impersonate alignment tests ----
 
-def test_impersonate_default_is_chrome136():
-    """Default impersonate should be chrome136 (aligned with UA headers)."""
-    from src.execution.webkey.client import MexcWebClient
+def test_impersonate_is_aligned_with_the_ua_headers():
+    """Версія більше НЕ прибита до 136: вона береться з _CHROME_VER, і та сама
+    змінна живить UA і sec-ch-ua. Пінимо саме УЗГОДЖЕНІСТЬ, а не число —
+    інакше кожне підняття версії ламало б тест на рівному місці.
+    (Дефолт піднято 136 -> 146 після знімка живого браузера 2026-08-26, де
+    реальний Chrome виявився 147; 146 — найновіша ціль, яку знає curl_cffi.)"""
+    from src.execution.webkey import client as m
 
-    client = MexcWebClient(
-        webkey="test_key",
-        visitor_id="test_visitor",
-    )
-    assert client.impersonate == "chrome136"
+    client = m.MexcWebClient(webkey="test_key", visitor_id="test_visitor")
+    assert client.impersonate == m._CHROME_IMPERSONATE
+    assert client.impersonate == f"chrome{m._CHROME_VER}"
+    assert f"Chrome/{m._CHROME_VER}.0.0.0" in client.user_agent
+    assert f'v="{m._CHROME_VER}"' in client.sec_ch_ua
 
 
 def test_ua_matches_impersonate_version():
-    """User-Agent and sec-ch-ua should reference Chrome 136, matching impersonate."""
-    from src.execution.webkey.client import _DEFAULT_UA, _DEFAULT_SEC_CH_UA
+    """UA і sec-ch-ua мають називати ТУ САМУ версію, що й TLS-ціль.
+    Число не фіксуємо — фіксуємо збіг: розсинхрон «TLS каже одне, заголовок
+    інше» і є тим, що фінгерпринт-системи бачать найлегше."""
+    from src.execution.webkey import client as m
 
-    assert "Chrome/136" in _DEFAULT_UA, f"UA should contain Chrome/136, got: {_DEFAULT_UA}"
-    assert '"136"' in _DEFAULT_SEC_CH_UA, (
-        f"sec-ch-ua should contain '136', got: {_DEFAULT_SEC_CH_UA}"
-    )
+    v = m._CHROME_VER
+    assert f"Chrome/{v}." in m._DEFAULT_UA, m._DEFAULT_UA
+    assert f'"Google Chrome";v="{v}"' in m._DEFAULT_SEC_CH_UA, m._DEFAULT_SEC_CH_UA
+    assert f'"Chromium";v="{v}"' in m._DEFAULT_SEC_CH_UA, m._DEFAULT_SEC_CH_UA
+    assert m._CHROME_IMPERSONATE == f"chrome{v}"
 
 
 def test_ua_and_sec_ch_ua_same_major_version():

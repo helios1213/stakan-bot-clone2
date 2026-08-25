@@ -190,3 +190,103 @@ def test_impersonate_target_is_one_curl_cffi_knows():
             f"{m._CHROME_IMPERSONATE} немає в curl_cffi — сесія впаде на старті")
     finally:
         importlib.reload(client_mod)
+
+
+# ---- звірка з ЖИВИМ знімком браузера (2026-08-26) -------------------------
+# Оператор зняв реальний запит /order/create зі свого браузера. Нижче — те, що
+# розійшлось, і тести, щоб воно не розійшлось знову. Це вже не здогади про
+# «кращий відбиток», а дослівне порівняння.
+
+def test_referer_follows_the_traded_symbol():
+    """Було: referer ЗАВЖДИ вказував на ZEC_USDT, хоч ордер ішов на SOXL.
+    У браузері referer = сторінка ТІЄЇ САМОЇ пари. Найдешевша для виявлення
+    розбіжність з усіх, що ми мали."""
+    import inspect
+    src = inspect.getsource(client_mod.MexcWebClient._common_headers)
+    assert '_ref_sym' in src and '{_ref_sym}' in src
+    assert '{_WARMUP_SYMBOL}?type=linear_swap' not in src, "referer знову прибитий до ZEC"
+
+
+def test_symbol_is_taken_from_the_request_body():
+    import inspect
+    src = inspect.getsource(client_mod.MexcWebClient._request)
+    assert 'body.get("symbol")' in src
+    assert 'symbol=_sym' in src
+
+
+def test_referer_defaults_safely_when_there_is_no_symbol():
+    """GET-и без тіла не мають ламатись через відсутній символ."""
+    import inspect
+    src = inspect.getsource(client_mod.MexcWebClient._common_headers)
+    assert 'symbol or _WARMUP_SYMBOL' in src
+
+
+def test_no_literal_zero_trochilus_uid(monkeypatch):
+    """Слали `trochilus-uid: 0` — найдешевший маркер «це не браузер».
+    Тепер: не задано в env -> заголовка немає взагалі."""
+    import importlib
+    monkeypatch.delenv("MEXC_TROCHILUS_UID", raising=False)
+    m = importlib.reload(client_mod)
+    try:
+        assert m._TROCHILUS_UID == ""
+        src = __import__("inspect").getsource(m.MexcWebClient._common_headers)
+        assert '"trochilus-uid": "0"' not in src
+        assert 'if _TROCHILUS_UID:' in src
+    finally:
+        importlib.reload(client_mod)
+
+
+def test_trochilus_uid_is_sent_when_configured(monkeypatch):
+    """Значення РІЗНЕ на двох ботах (це id акаунта), тому env, а не константа."""
+    import importlib
+    monkeypatch.setenv("MEXC_TROCHILUS_UID", "12345678")
+    m = importlib.reload(client_mod)
+    try:
+        assert m._TROCHILUS_UID == "12345678"
+    finally:
+        monkeypatch.delenv("MEXC_TROCHILUS_UID", raising=False)
+        importlib.reload(client_mod)
+
+
+def test_sec_ch_ua_matches_the_browser_format():
+    """Знімок: `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`.
+    У нас був інший ПОРЯДОК брендів і застаріла GREASE-версія v="99"."""
+    import importlib
+    m = importlib.reload(client_mod)
+    try:
+        v = m._CHROME_VER
+        assert m._DEFAULT_SEC_CH_UA == (
+            f'"Google Chrome";v="{v}", "Not.A/Brand";v="8", "Chromium";v="{v}"')
+        assert 'v="99"' not in m._DEFAULT_SEC_CH_UA
+    finally:
+        importlib.reload(client_mod)
+
+
+def test_chash_is_overridable_without_a_code_change():
+    """Перемикання має бути ОДНІЄЮ змінною: помилка в chash ламає КОЖЕН ордер,
+    тож відкат не має вимагати правки коду й перезбірки.
+
+    БЕЗ importlib.reload(credentials) СВІДОМО. Перезавантаження цього модуля
+    ламає ІДЕНТИЧНІСТЬ класів винятків для тестів, які їх уже імпортували, і
+    `pytest.raises` перестає впізнавати цілком правильний виняток. Пастка
+    описана в CLAUDE.md, і я на неї тут наступив: 7 падінь у
+    test_webkey_credentials.py, причому ЛИШЕ коли той файл іде ПІСЛЯ цього.
+    Перевіряємо ДЖЕРЕЛО, а не перезавантажений модуль."""
+    from pathlib import Path
+    src = Path("src/execution/webkey/credentials.py").read_text()
+    assert 'os.environ.get("MEXC_CHASH", "")' in src
+    assert "_BOOTSTRAP_CHASH_DEFAULT" in src
+
+
+def test_chash_default_is_the_value_from_the_live_browser():
+    """Знімок 2026-08-26: браузер шле d6c64d28…; перемкнуто рішенням оператора."""
+    from src.execution.webkey.credentials import BOOTSTRAP_CHASH
+    assert BOOTSTRAP_CHASH == (
+        "d6c64d28e362f314071b3f9d78ff7494d9cd7177ae0465e772d1840e9f7905d8")
+
+
+def test_previous_chash_is_kept_for_rollback():
+    """Відкат має бути можливим без археології в git."""
+    from pathlib import Path
+    src = Path("src/execution/webkey/credentials.py").read_text()
+    assert "973e5a66902be9ff97f3e916b71d4535c47b8a30c5f4122a7683d6ef701f30dd" in src

@@ -66,15 +66,22 @@ class MexcServerError(MexcClientError):
 # що фінгерпринт-системи бачать найлегше. Тому версія тут одна змінна.
 # MEXC_CHROME_VER дозволяє перевірити іншу версію без зміни коду; ціль має
 # існувати в curl_cffi (є chrome124/131/133a/136/142/145/146).
-_CHROME_VER = os.environ.get("MEXC_CHROME_VER", "136").strip() or "136"
+# 146, бо це найновіша ціль, яку знає curl_cffi (реальний браузер оператора —
+# 147, знімок 2026-08-26). Рівність не потрібна, потрібна УЗГОДЖЕНІСТЬ трьох
+# джерел і близькість до реального; 136 відставав на 11 версій.
+_CHROME_VER = os.environ.get("MEXC_CHROME_VER", "146").strip() or "146"
 _CHROME_IMPERSONATE = f"chrome{_CHROME_VER}"
 _DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_CHROME_VER}.0.0.0 Safari/537.36"
 )
+# Формат ДОСЛІВНО з живого знімка браузера (2026-08-26):
+#   "Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"
+# У нас було `Google Chrome, Chromium, Not.A/Brand` з v="99" — і інший порядок,
+# і застаріла GREASE-версія. Обидва відхилення видно простим порівнянням рядка.
 _DEFAULT_SEC_CH_UA = (
-    f'"Google Chrome";v="{_CHROME_VER}", "Chromium";v="{_CHROME_VER}", '
-    '"Not.A/Brand";v="99"'
+    f'"Google Chrome";v="{_CHROME_VER}", "Not.A/Brand";v="8", '
+    f'"Chromium";v="{_CHROME_VER}"'
 )
 _DEFAULT_SEC_CH_UA_PLATFORM = '"macOS"'
 
@@ -124,9 +131,14 @@ _API_URL = os.environ.get("MEXC_API_HOST", "https://contract.mexc.com").rstrip("
 _DOLOS_ON_ORDER = os.environ.get("MEXC_DOLOS_ON_ORDER", "1").strip().lower() not in (
     "0", "false", "no", "off", "")
 
-# Placeholder for trochilus-uid header — MEXC doesn't validate the value
-# (server does not validate the value).
-_TROCHILUS_UID_PLACEHOLDER = "0"
+# trochilus-uid — у браузері це РЕАЛЬНИЙ uid акаунта (знімок 2026-08-26 показав
+# 8-значне число). Ми роками слали буквальний "0": сервер значення не валідує,
+# але константа "0" — це найдешевший можливий маркер «це не браузер».
+# Тепер: якщо MEXC_TROCHILUS_UID не заданий, заголовок НЕ надсилається зовсім.
+# Відсутній заголовок — слабший сигнал, ніж явно синтетичне значення.
+# Значення НЕ секрет (це публічний id акаунта), але воно РІЗНЕ на двох ботах,
+# тому живе в env кожного, а не в коді.
+_TROCHILUS_UID = os.environ.get("MEXC_TROCHILUS_UID", "").strip()
 
 
 @dataclass
@@ -264,7 +276,14 @@ class MexcWebClient:
         await self._ensure_session()
 
     # ---- headers ----
-    def _common_headers(self, with_layer2_sign: dict[str, str] | None = None) -> dict[str, str]:
+    def _common_headers(self, with_layer2_sign: dict[str, str] | None = None,
+                        symbol: str | None = None) -> dict[str, str]:
+        # referer МУСИТЬ вказувати на сторінку тієї пари, яку ми торгуємо.
+        # Досі тут завжди стояв _WARMUP_SYMBOL (ZEC_USDT) — тобто ордер на SOXL
+        # ішов із заголовком «я на сторінці ZEC». Знімок браузера 2026-08-26
+        # підтвердив: там referer = сторінка ТІЄЇ САМОЇ пари. Це була найдешевша
+        # для виявлення розбіжність з усіх, які ми мали.
+        _ref_sym = symbol or _WARMUP_SYMBOL
         h = {
             "accept": "*/*",
             "accept-language": "en-US,en;q=0.9",
@@ -276,17 +295,18 @@ class MexcWebClient:
             "platform": "H5-web",
             "pragma": "akamai-x-cache-on",
             "priority": "u=1, i",
-            "referer": f"{self.BASE_URL}/futures/{_WARMUP_SYMBOL}?type=linear_swap",
+            "referer": f"{self.BASE_URL}/futures/{_ref_sym}?type=linear_swap",
             "sec-ch-ua": self.sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": self.sec_ch_ua_platform,
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
-            "trochilus-uid": _TROCHILUS_UID_PLACEHOLDER,
             "user-agent": self.user_agent,
             "x-language": "en-US",
         }
+        if _TROCHILUS_UID:
+            h["trochilus-uid"] = _TROCHILUS_UID
         if with_layer2_sign:
             h.update(with_layer2_sign)
         return h
@@ -351,7 +371,15 @@ class MexcWebClient:
         if needs_web_sign and full_body is not None:
             web_headers = sign_web(full_body, self.webkey)
 
-        headers = self._common_headers(web_headers)
+        # Символ беремо з тіла запиту — так referer сам іде за парою, яку
+        # торгуємо, і не треба прокидати його через кожен виклик.
+        _sym = None
+        try:
+            if isinstance(body, dict):
+                _sym = body.get("symbol") or None
+        except Exception:
+            _sym = None
+        headers = self._common_headers(web_headers, symbol=_sym)
 
         kwargs: dict[str, Any] = {
             "headers": headers,
@@ -471,7 +499,9 @@ class MexcWebClient:
         try:
             await self.warmup()
             session = await self._ensure_session()
-            headers = self._common_headers(sign_web(body, self.webkey))
+            headers = self._common_headers(
+                sign_web(body, self.webkey),
+                symbol=(body or {}).get("symbol") if isinstance(body, dict) else None)
             headers["content-type"] = "application/json"
             headers["authorization"] = self.webkey
             headers["origin"] = "https://www.mexc.com"

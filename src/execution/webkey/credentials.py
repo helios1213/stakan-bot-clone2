@@ -23,6 +23,7 @@ DB (seeded on first init) so UI iteration is straightforward.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import secrets
 import string
@@ -46,7 +47,27 @@ MAX_SLOTS = 2
 # Bootstrap chash returned by /dolos/config for all users (
 # via fp_decrypt_test.py). MEXC's order/create accepts this value with any
 # valid webkey — no per-account chash is required.
-BOOTSTRAP_CHASH = "973e5a66902be9ff97f3e916b71d4535c47b8a30c5f4122a7683d6ef701f30dd"
+#
+# ЗНІМОК ЖИВОГО БРАУЗЕРА 2026-08-26 показав ІНШЕ значення:
+#   d6c64d28e362f314071b3f9d78ff7494d9cd7177ae0465e772d1840e9f7905d8
+# (реліз веб-застосунку v5.40.164). Тобто наш chash СТАРИЙ — схоже, він
+# привʼязаний до версії бандла, а не до акаунта.
+#
+# ПЕРЕМКНУТО НА ЗНАЧЕННЯ З БРАУЗЕРА 2026-08-26 (рішення оператора).
+# Старе `973e5a66...f30dd` працювало — на ньому пройшло 16 932 прийнятих
+# ордери, — але воно СТАРЕ; браузер шле інше.
+#
+# НЕ ПЕРЕВІРЕНО живим ордером на момент перемикання: значення знято з іншого
+# хоста і шляху (www.mexc.com/api/platform/futures/... проти нашого
+# contract.mexc.com), тож приймання з НАШОГО шляху доведе лише перший ордер.
+# Ознака успіху: звичайний `[IOC OPEN] ... orderId=`.
+# Ознака проблеми: нова помилка в `[LIVE OPEN FAIL]` на КОЖНОМУ ордері.
+#
+# ВІДКАТ — одна змінна, без зміни коду:
+#   MEXC_CHASH=973e5a66902be9ff97f3e916b71d4535c47b8a30c5f4122a7683d6ef701f30dd
+_BOOTSTRAP_CHASH_PREV = "973e5a66902be9ff97f3e916b71d4535c47b8a30c5f4122a7683d6ef701f30dd"
+_BOOTSTRAP_CHASH_DEFAULT = "d6c64d28e362f314071b3f9d78ff7494d9cd7177ae0465e772d1840e9f7905d8"
+BOOTSTRAP_CHASH = os.environ.get("MEXC_CHASH", "").strip() or _BOOTSTRAP_CHASH_DEFAULT
 
 
 # ---------------------------------------------------------------------------

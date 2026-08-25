@@ -9,7 +9,6 @@ from src.execution.webkey.client import (
     MexcClientError,
     MexcWebClient,
     _DolosRuntime,
-    _TROCHILUS_UID_PLACEHOLDER,
 )
 from src.execution.webkey.credentials import (
     BOOTSTRAP_CHASH,
@@ -98,11 +97,20 @@ class TestFromSlot:
 
 
 class TestHeaders:
-    def test_trochilus_uid_is_placeholder(self):
+    def test_trochilus_uid_is_not_a_literal_zero(self):
+        """Було: слали `trochilus-uid: 0`. Знімок живого браузера 2026-08-26
+        показав там РЕАЛЬНИЙ 8-значний uid акаунта, тож константа "0" була
+        найдешевшим можливим маркером «це не браузер».
+        Тепер без MEXC_TROCHILUS_UID заголовок не надсилається зовсім:
+        відсутній заголовок — слабший сигнал, ніж явно синтетичне значення."""
         client = MexcWebClient(SAMPLE_WEBKEY, SAMPLE_VISITOR)
         h = client._common_headers()
-        assert h["trochilus-uid"] == _TROCHILUS_UID_PLACEHOLDER
-        assert _TROCHILUS_UID_PLACEHOLDER == "0"
+        assert h.get("trochilus-uid") != "0"
+
+    def test_referer_points_at_the_traded_pair(self):
+        """Було: referer завжди ZEC_USDT, хоч ордер ішов на іншу пару."""
+        client = MexcWebClient(SAMPLE_WEBKEY, SAMPLE_VISITOR)
+        assert "SOXL_USDT" in client._common_headers(symbol="SOXL_USDT")["referer"]
 
     def test_authorization_is_webkey(self):
         client = MexcWebClient(SAMPLE_WEBKEY, SAMPLE_VISITOR)
