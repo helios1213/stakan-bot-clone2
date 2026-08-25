@@ -44,6 +44,7 @@ Project instructions for Claude Code. Read this fully at the start of every sess
 - All tools read the webkey from the DB by slot. **Never paste the webkey/cookies into a command or a file.**
 
 ## Signing & the web path (established facts — don't re-derive)
+> **ОНОВЛЕНО 2026-08-25: dolos ПОВЕРНУТО на `/order/create`** (рішення оператора). Абзац нижче про «dolos НЕ enforced» лишається ФАКТИЧНО ВІРНИМ — біржа приймає і без нього — але за замовчуванням ми його ШЛЕМО. `MEXC_DOLOS_ON_ORDER=0` вимикає без зміни коду. Ціна виміряна: `sign_dolos` p50=**1.708мс** проти HTTP RTT p50=152мс (~1% шляху).
 - `sign_web(body, webkey)` is **body-generic**: `md5(nonce + json_body + md5(webkey+nonce)[7:])`. Signs any JSON body — futures and spot alike. Reuse as-is.
 - **Dolos is NOT enforced** on futures `/order/create` or on spot `/order/place`. Plain body + web-sign is accepted (spot success code `200`; futures success `0`). `close_all_positions` KEEPS dolos.
 - **Web-sign IS required** — without `x-mxc-sign` the futures path returns `code=602`.
@@ -148,6 +149,40 @@ At the end of any meaningful piece of work — a commit, a bug fixed, a decision
 
 ## Worklog
 Format: `### YYYY-MM-DD — topic`, newest first. Each entry: **Done** (facts + shas) / **In flight** / **Next** / **Open**. Written so a fresh session can resume from THIS alone, without reading the transcript. No secrets — status and paths only.
+
+### 2026-08-25 — 0% ПРОМО ЗАКІНЧИЛОСЬ НА ОБОХ АКАУНТАХ; dolos повернуто
+primary `61e6d29`, клон — порт. Сюїта **1127 / 1105**, 0 failed. `client.py` байт-у-байт на обох.
+
+**ГОЛОВНЕ ЧИСЛО, з приватного `/account/tiered_fee_rate` (`python -m src._fee_audit --slot N`):**
+```
+primary слот 1   maker=0.0001  taker=0.0004   на ВСІХ 24 парах
+клон    слот 1   maker=0.0001  taker=0.0004   ІНШИЙ акаунт, та сама картина
+soft-start whitelist (account maker == 0):  ПОРОЖНЬО
+```
+Напрямок розбіжності **перевернувся** проти 20.08: тоді приватний ендпоінт бачив `maker=0`, якого не було в публічному тарифі; тепер публічний каже `maker=0`, а акаунт платить `0.0001`. Акаунт тепер ГІРШИЙ за публічний.
+
+**Спрацювання fee-guard (обидва на слоті 1):** `08-17 XMR_USDT $0.021859`, `08-25 PEPE_USDT $0.407004`. $0.407 при ноціоналі ~1250 = ~0.033% = **тейкерська ставка**. Наші IOC свідомо перетинають спред (`ioc_offset_ticks` 1-5), тож філи тейкерські. Поки промо давало нуль і на тейкері — це було безкоштовно; тепер ні.
+
+**АРИФМЕТИКА, ЯКУ ТРЕБА ТРИМАТИ В ГОЛОВІ:** taker 0.0004 = **4 bps** на вхід, edge стратегії 0.5-2 bps. При поточному тарифі конфігурація в мінусі ЗА АРИФМЕТИКОЮ, незалежно від будь-яких оптимізацій латентності.
+
+**ГІПОТЕЗА «нас спалили через dolos-drop» — НЕ ПІДТВЕРДЖЕНА. Чотири виміри проти:**
+- клон має dolos-drop із **13.08** і **24 303 угоди без жодної ненульової комісії**;
+- перше спрацювання fee-guard на primary — **17.08**, тобто ДО приїзду dolos-drop туди (`45620d6`, 20.08);
+- тариф читається як властивість **АКАУНТА**, не запиту; детект дає блокування (`9082`/`6002`), а не зміну тарифної сітки;
+- **два РІЗНІ акаунти на двох машинах втратили промо СИНХРОННО й однаково** — так виглядає кінець промо-кампанії, а не покарання за автоматизацію.
+
+**dolos ПОВЕРНУТО попри це — рішення оператора при мізерній ціні.** Не «фікс», а перевірка гіпотези коштом ~1.7мс.
+- `MEXC_DOLOS_ON_ORDER` (дефолт **1**). Відкат без зміни коду.
+- **ЦІНА ВИМІРЯНА:** `sign_dolos` p50=**1.708мс** p90=2.945 p99=4.624 (300 прогонів у контейнері) проти HTTP RTT p50=152мс — ~1% шляху. Ті «пару мілісекунд» із 12.08 — це 1.7мс.
+- **ЗАПОБІЖНИК:** збій збірання dolos НЕ вбиває ордер — іде ПЛОСКЕ тіло + `logger.error`. До 25.08 ця гілка на `/order/create` не виконувалась узагалі (`needs_dolos=False`), тож виняток у ній ніхто не ловив; тепер це гарячий шлях із грошима.
+- Ризик низький: це ПОВЕРНЕННЯ старої поведінки (до 20.08 так і було), а `close_all_positions` слав dolos безперервно весь час.
+- **НЕ ПЕРЕВІРЕНО ЖИВИМ ОРДЕРОМ** — лайв був вимкнений. Ознака успіху: `[IOC OPEN] ... orderId=`. Ознака проблеми: новий код у `[LIVE OPEN FAIL]` або `[DOLOS] ... підпис не зібрано`.
+
+**TLS-ВІДБИТОК: РОЗСИНХРОНУ НЕ БУЛО.** `curl_cffi impersonate=chrome136`, UA `Chrome/136`, `sec-ch-ua v="136"` — усі три збігались. Тепер беруться з ОДНІЄЇ змінної `_CHROME_VER`, щоб випадкова правка не створила розсинхрон «TLS 136 / заголовок 151» — саме це фінгерпринт-системи бачать найлегше. `MEXC_CHROME_VER` дозволяє спробувати іншу версію без коду (curl_cffi знає до `chrome146`); лишено 136.
+
+**СЛОТ 2 ПОРОЖНІЙ** — `Slot 2 not ready (webkey or visitor_id missing)`. Ключ прибрано, торгує слот 1. Якщо це робив не оператор — розібратись окремо.
+
+**Стан на кінець:** лайв ВИМКНЕНО (`live_enabled=0`, живих пар немає). Тест перейменовано `test_order_no_dolos` -> `test_order_dolos` (пінить протилежне).
 
 ### 2026-08-24 — kill-switch у вебпанелі + SOXL кулдаун 30/30
 primary `2c2b6fd`+`bb97873`, клон — порт. Сюїта **1115** (primary), 0 failed. Обидва боти `healthy`.

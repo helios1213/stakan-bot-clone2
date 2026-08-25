@@ -60,12 +60,21 @@ class MexcServerError(MexcClientError):
 # Constants & defaults
 # ---------------------------------------------------------------------------
 
+# ТРИ МІСЦЯ, ЯКІ МУСЯТЬ РУХАТИСЬ РАЗОМ: TLS-ціль curl_cffi (_CHROME_IMPERSONATE),
+# User-Agent і sec-ch-ua. Зсунути одне — означає СТВОРИТИ розсинхрон, якого
+# зараз немає: саме неузгодженість «TLS каже 136, заголовок каже 151» і є тим,
+# що фінгерпринт-системи бачать найлегше. Тому версія тут одна змінна.
+# MEXC_CHROME_VER дозволяє перевірити іншу версію без зміни коду; ціль має
+# існувати в curl_cffi (є chrome124/131/133a/136/142/145/146).
+_CHROME_VER = os.environ.get("MEXC_CHROME_VER", "136").strip() or "136"
+_CHROME_IMPERSONATE = f"chrome{_CHROME_VER}"
 _DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_CHROME_VER}.0.0.0 Safari/537.36"
 )
 _DEFAULT_SEC_CH_UA = (
-    '"Google Chrome";v="136", "Chromium";v="136", "Not.A/Brand";v="99"'
+    f'"Google Chrome";v="{_CHROME_VER}", "Chromium";v="{_CHROME_VER}", '
+    '"Not.A/Brand";v="99"'
 )
 _DEFAULT_SEC_CH_UA_PLATFORM = '"macOS"'
 
@@ -91,6 +100,29 @@ _BASE_URL = "https://futures.mexc.com"
 # contract.mexc.com is already the host the private WS uses (wss://.../edge).
 # Override with MEXC_API_HOST to revert without a code change.
 _API_URL = os.environ.get("MEXC_API_HOST", "https://contract.mexc.com").rstrip("/")
+
+# Чи підписувати /order/create блоком dolos. ДЕФОЛТ — УВІМКНЕНО (2026-08-25).
+#
+# Історія. Абляція 2026-08-12 показала, що MEXC ПРИЙМАЄ ордер і без dolos, і
+# його прибрали заради швидкості. 2026-08-25 оператор вирішив повернути: акаунт
+# втратив 0% промо, і його підозра — що «голий» шлях відрізняється від
+# браузерного і це помітно збоку.
+#
+# ВАРТІСТЬ ВИМІРЯНА, а не оцінена: sign_dolos p50=1.708мс, p90=2.945, p99=4.624
+# (300 прогонів у контейнері). Проти реального HTTP RTT до MEXC p50=152мс це
+# ~1% шляху. Тобто «пару мілісекунд», заради яких його колись прибрали, — це
+# 1.7мс, і компромісу тут фактично немає.
+#
+# ЧЕСНО ПРО ПРИЧИННІСТЬ: доказів, що dolos-drop спричинив втрату промо, НЕМАЄ,
+# і є три виміри проти (клон мав dolos-drop із 13.08 і 24 303 угоди без жодної
+# комісії; перше спрацювання fee-guard на primary — 17.08, тобто ДО того, як
+# dolos-drop туди приїхав; а тариф читається з /account/tiered_fee_rate як
+# властивість АКАУНТА, не запиту). Повертаємо як рішення оператора при
+# вимірювано мізерній ціні, а не як доведений фікс.
+#
+# MEXC_DOLOS_ON_ORDER=0 вимикає назад без зміни коду.
+_DOLOS_ON_ORDER = os.environ.get("MEXC_DOLOS_ON_ORDER", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
 
 # Placeholder for trochilus-uid header — MEXC doesn't validate the value
 # (server does not validate the value).
@@ -141,7 +173,7 @@ class MexcWebClient:
         webkey: str,
         visitor_id: str,
         slot_id: int | None = None,
-        impersonate: str = "chrome136",
+        impersonate: str = _CHROME_IMPERSONATE,
         timeout: int = 10,
         cookie_max_age_sec: int = _DEFAULT_COOKIE_MAX_AGE_SEC,
         user_agent: str = _DEFAULT_UA,
@@ -288,16 +320,31 @@ class MexcWebClient:
 
         full_body = body
         if needs_dolos and body is not None:
-            input_payload = {
-                **body,
-                "mtoken": self.dolos.visitor_id,
-                "mhash": self.dolos.mhash,
-            }
-            dolos_sig = sign_dolos(input_payload, self.dolos.as_signing_dict)
-            full_body = {**body, **dolos_sig}
+            # Запобіжник: dolos — це ПІДПИС, а не торгове рішення. Якщо його не
+            # вдалось зібрати (порожній visitor_id, зіпсований конфіг), ордер
+            # має піти БЕЗ нього, а не впасти: MEXC приймає і плоске тіло
+            # (абляція 2026-08-12), тож деградація безпечна. Раніше цей шлях на
+            # /order/create не виконувався взагалі (needs_dolos=False), тож
+            # виняток тут ніхто не ловив — а тепер це гарячий шлях із грошима.
+            # Мовчати НЕ можна: logger.error, інакше деградація стане невидимою.
+            try:
+                if not getattr(self.dolos, "visitor_id", None):
+                    raise ValueError("visitor_id порожній")
+                input_payload = {
+                    **body,
+                    "mtoken": self.dolos.visitor_id,
+                    "mhash": self.dolos.mhash,
+                }
+                dolos_sig = sign_dolos(input_payload, self.dolos.as_signing_dict)
+                full_body = {**body, **dolos_sig}
 
-            sep = "&" if "?" in url else "?"
-            url += f"{sep}mhash={dolos_sig['mhash']}"
+                sep = "&" if "?" in url else "?"
+                url += f"{sep}mhash={dolos_sig['mhash']}"
+            except Exception:
+                logger.error(
+                    "[DOLOS] %s: підпис не зібрано — ордер іде БЕЗ dolos", endpoint,
+                    exc_info=True)
+                full_body = body
         t2 = time.perf_counter_ns()
 
         web_headers: dict[str, str] = {}
@@ -478,7 +525,13 @@ class MexcWebClient:
         return await self._request(
             "POST", "/order/create",
             body=body,
-            needs_dolos=False,
+            # dolos на /order/create: НЕ ВИМАГАЄТЬСЯ біржею (абляція 2026-08-12
+            # — ордер приймається і з плоским тілом), але з 2026-08-25 ми його
+            # ШЛЕМО за замовчуванням. Причини, вартість і чесне застереження про
+            # причинність — біля _DOLOS_ON_ORDER угорі файлу.
+            # web-sign обовʼязковий у будь-якому разі: без нього code=602.
+            # close_all_positions завжди слав dolos і не змінювався.
+            needs_dolos=_DOLOS_ON_ORDER,
             needs_web_sign=True,
         )
 
