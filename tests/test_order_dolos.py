@@ -97,8 +97,12 @@ def test_flag_defaults_to_on(monkeypatch):
 
 
 @pytest.mark.parametrize("val,expect", [
-    ("0", False), ("false", False), ("no", False), ("off", False), ("", False),
+    ("0", False), ("false", False), ("no", False), ("off", False),
     ("1", True), ("true", True), ("yes", True),
+    # ПОРОЖНЄ значення = «не задано» -> вирішує MEXC_PATH_MODE (дефолт full).
+    # Раніше порожнє означало «вимкнено», і це було пасткою: людина, що
+    # виставила змінну без значення, мовчки лишалась без dolos.
+    ("", True),
 ])
 def test_flag_env_override(monkeypatch, val, expect):
     """Відкат має бути однією змінною в compose, як з MEXC_API_HOST."""
@@ -121,7 +125,7 @@ def test_dolos_failure_degrades_instead_of_killing_the_order():
     import inspect
     src = inspect.getsource(client_mod.MexcWebClient._request)
     i = src.index("if needs_dolos and body is not None:")
-    seg = src[i:i + 1400]
+    seg = src[i:i + 2200]   # блок підріс разом із _device_payload()
     assert "try:" in seg and "except Exception:" in seg
     assert "full_body = body" in seg, "деградація має повертати ПЛОСКЕ тіло"
     assert "logger.error" in seg, "мовчазна деградація зробила б проблему невидимою"
@@ -290,3 +294,153 @@ def test_previous_chash_is_kept_for_rollback():
     from pathlib import Path
     src = Path("src/execution/webkey/credentials.py").read_text()
     assert "973e5a66902be9ff97f3e916b71d4535c47b8a30c5f4122a7683d6ef701f30dd" in src
+
+
+# ---- повна емуляція: p0 містить поля СЦЕНИ, а не поля ордера -------------
+
+def test_p0_carries_every_field_the_server_scene_asks_for():
+    """Раніше ми клали в p0 параметри ордера, яких не просить ЖОДНА сцена."""
+    from src.execution.webkey import dolos_config as dc
+    c = client_mod.MexcWebClient("WEB" + "0" * 64, "Y0B3VbBfdYpoEEF4eZ8t")
+    payload = {"symbol": "SOXL_USDT", "side": 1,
+               "mtoken": c.dolos.visitor_id, "mhash": c.dolos.mhash,
+               **c._device_payload()}
+    missing = [p for p in dc.FALLBACK_PARAMETERS if p not in payload]
+    assert not missing, f"сцена просить, а ми не кладемо: {missing}"
+
+
+def test_device_fields_do_not_contradict_our_own_headers():
+    """p0, що каже Windows, поруч із UA, що каже macOS, — гірше за відсутність
+    p0 взагалі. Пінимо УЗГОДЖЕНІСТЬ, а не конкретну ОС: із появою профілів на
+    слот вона різна в різних слотів, і жорстке "Mac OS" тут зламалось би на
+    рівному місці."""
+    for slot in (None, 1, 2, 3):
+        c = client_mod.MexcWebClient("WEB" + "0" * 64, "v" * 20, slot_id=slot)
+        d = c._device_payload()
+        if d["sys"] == "Mac OS":
+            assert "Macintosh" in c.user_agent and d["sys_ver"] == "10.15.7"
+            assert "10_15_7" in c.user_agent
+        else:
+            assert d["sys"] == "Windows" and "Windows NT" in c.user_agent
+            assert d["sys_ver"] == "10.0"
+
+
+def test_request_id_matches_the_browser_format():
+    """Знімок кукі: `x_fingerprint_requestId=1787685214220.at2lp1`."""
+    import re
+    c = client_mod.MexcWebClient("WEB" + "0" * 64, "v" * 20)
+    rid = c._device_payload()["request_id"]
+    assert re.fullmatch(r"\d{13}\.[a-z0-9]{6}", rid), rid
+
+
+def test_request_id_is_fresh_each_time():
+    c = client_mod.MexcWebClient("WEB" + "0" * 64, "v" * 20)
+    assert c._device_payload()["request_id"] != c._device_payload()["request_id"]
+
+
+def test_tencent_token_is_empty_not_invented():
+    """Його видає SDK Tencent, якого в нас немає. Порожнє поле пояснюється,
+    вигаданий токен — ні."""
+    c = client_mod.MexcWebClient("WEB" + "0" * 64, "v" * 20)
+    assert c._device_payload()["tencent_device_token"] == ""
+
+
+def test_hostname_matches_the_origin_we_send():
+    c = client_mod.MexcWebClient("WEB" + "0" * 64, "v" * 20)
+    assert c._device_payload()["hostname"] in c.BASE_URL
+
+
+def test_signing_dict_uses_the_live_cache():
+    from src.execution.webkey import dolos_config as dc
+    c = client_mod.MexcWebClient("WEB" + "0" * 64, "v" * 20)
+    sd = c.dolos.as_signing_dict
+    assert sd["chash"] == dc.CACHE.get()["chash"]
+    assert sd["parameters"] == dc.CACHE.get()["parameters"]
+
+
+def test_legacy_mode_restores_the_old_scheme(monkeypatch):
+    """Відкат до доведено робочої пари «старий chash + поля ордера»."""
+    import importlib
+    monkeypatch.setenv("MEXC_DOLOS_LEGACY", "1")
+    m = importlib.reload(client_mod)
+    try:
+        c = m.MexcWebClient("WEB" + "0" * 64, "v" * 20)
+        sd = c.dolos.as_signing_dict
+        assert sd["chash"].startswith("973e5a66")
+        assert "symbol" in sd["parameters"]
+    finally:
+        monkeypatch.delenv("MEXC_DOLOS_LEGACY", raising=False)
+        importlib.reload(client_mod)
+
+
+# ---- два режими шляху одним перемикачем ----------------------------------
+# Замість пʼяти окремих змінних: full = «браузерний» (dolos + повна емуляція),
+# bare = найкоротший доведений шлях (без dolos на /order/create, -3.9мс).
+# TLS-профіль, заголовки, referer і новий chash лишаються В ОБОХ: вони нічого
+# не коштують за часом, а close_all_positions шле dolos у будь-якому разі.
+
+def _reload(monkeypatch, **env):
+    import importlib
+    for k in ("MEXC_PATH_MODE", "MEXC_DOLOS_ON_ORDER"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    return importlib.reload(client_mod)
+
+
+def test_default_mode_is_full(monkeypatch):
+    m = _reload(monkeypatch)
+    try:
+        assert m._PATH_MODE == "full" and m._DOLOS_ON_ORDER is True
+    finally:
+        _reload(monkeypatch)
+
+
+def test_bare_mode_drops_dolos_from_the_order(monkeypatch):
+    m = _reload(monkeypatch, MEXC_PATH_MODE="bare")
+    try:
+        assert m._DOLOS_ON_ORDER is False
+    finally:
+        _reload(monkeypatch)
+
+
+def test_bare_mode_keeps_everything_that_is_free(monkeypatch):
+    """Голий режим — про ШВИДКІСТЬ, не про відкат емуляції. Профіль пристрою,
+    referer за парою і новий chash коштують 0мс, тож лишаються."""
+    from src.execution.webkey.credentials import BOOTSTRAP_CHASH
+    m = _reload(monkeypatch, MEXC_PATH_MODE="bare")
+    try:
+        c = m.MexcWebClient("WEB" + "0" * 64, "v" * 20, slot_id=1)
+        assert c.impersonate.startswith("chrome")
+        assert "SOXL_USDT" in c._common_headers(symbol="SOXL_USDT")["referer"]
+        assert BOOTSTRAP_CHASH.startswith("d6c64d28")
+    finally:
+        _reload(monkeypatch)
+
+
+def test_explicit_flag_overrides_the_mode(monkeypatch):
+    """Щоб можна було зібрати проміжну комбінацію, не чіпаючи код."""
+    m = _reload(monkeypatch, MEXC_PATH_MODE="bare", MEXC_DOLOS_ON_ORDER="1")
+    try:
+        assert m._DOLOS_ON_ORDER is True
+    finally:
+        _reload(monkeypatch)
+
+
+def test_unknown_mode_falls_back_to_full(monkeypatch):
+    """Друкарська помилка в env не має мовчки вимикати емуляцію."""
+    m = _reload(monkeypatch, MEXC_PATH_MODE="ляля")
+    try:
+        assert m._PATH_MODE == "full"
+    finally:
+        _reload(monkeypatch)
+
+
+def test_close_all_sends_dolos_in_both_modes(monkeypatch):
+    """Саме там новий chash і працює, незалежно від режиму."""
+    import inspect
+    for mode in ("full", "bare"):
+        m = _reload(monkeypatch, MEXC_PATH_MODE=mode)
+        src = inspect.getsource(m.MexcWebClient.close_all_positions)
+        assert "needs_dolos=True" in src, mode
+    _reload(monkeypatch)

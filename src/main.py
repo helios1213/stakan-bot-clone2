@@ -237,6 +237,37 @@ async def db_prune_loop(db_path: str, live_db_path: str, research_path: str, int
         await asyncio.sleep(interval_sec)
 
 
+async def dolos_config_refresh_loop(webkey_store, interval_sec: int = 21600) -> None:
+    """Тягнути живий конфіг dolos (chash + parameters) раз на 6 годин.
+
+    Сервер віддає `overdue: 86400`, тож 6 годин — із запасом уп'ятеро; частіше
+    не треба, рідше — ризик проґавити реліз їхнього фронтенду.
+
+    НІКОЛИ не чіпає шлях ордера: HTTP тут, у фоні; `CACHE.get()` на гарячому
+    шляху синхронний і без мережі. Збій = лишається попередній (або знімковий)
+    конфіг, тобто поведінка рівно та сама, що була до появи автозабору.
+    """
+    from src.execution.webkey import dolos_config as _dcfg
+    while True:
+        try:
+            visitor = None
+            for s in await webkey_store.list_all():
+                v = getattr(s, "visitor_id", None)
+                if v:
+                    visitor = v
+                    break
+            if visitor:
+                cfg = await asyncio.to_thread(_dcfg.fetch_sync, visitor)
+                if not _dcfg.CACHE.apply(cfg):
+                    logger.warning("[DOLOS CFG] оновити не вдалось — працюємо "
+                                   "на попередньому конфізі")
+            else:
+                logger.debug("[DOLOS CFG] жодного слота з visitor_id — пропуск")
+        except Exception:
+            logger.exception("[DOLOS CFG] цикл оновлення впав")
+        await asyncio.sleep(interval_sec)
+
+
 async def slot_balance_refresh_loop(webkey_store, webkey_client_pool, interval_sec: int = 60) -> None:
     """Periodically refresh `last_balance_usdt` (and latency/error) for every
     configured slot, so the web panel always shows fresh balances for ALL
@@ -825,6 +856,27 @@ async def main() -> None:
     # Eagerly warm up clients in background so first user request is fast.
     webkey_client_pool = WebkeyClientPool(webkey_store)
     asyncio.create_task(_warmup_webkey_pool(webkey_client_pool))
+
+    # Конфіг dolos (chash + перелік полів для p0) тягнемо з MEXC замість того,
+    # щоб тримати прибитим у коді: він застаріває при кожному релізі їхнього
+    # фронтенду, і саме так наш chash уже одного разу протух непомітно.
+    # Шлях ордера цю задачу НЕ чекає: він читає готовий кеш синхронно, а поки
+    # оновлення не сталось — працює на знімку, тобто рівно як раніше.
+    # Режим шляху друкується ТУТ, а не при імпорті client.py: там логування
+    # ще не налаштоване, і рядок нікуди не потрапляв. Оператор має бачити з
+    # логів, у якому режимі бот піднявся, без заглядання в compose.
+    try:
+        from src.execution.webkey import client as _wc
+        from src.execution.webkey import device_profile as _dpf
+        logger.info("[PATH MODE] %s — dolos на /order/create: %s | зсув профілів: %d%s",
+                    _wc._PATH_MODE, "ТАК" if _wc._DOLOS_ON_ORDER else "ні",
+                    _dpf.machine_offset(),
+                    "" if _dpf.seed_is_explicit() or os.environ.get("MEXC_DEVICE_OFFSET")
+                    else "  ⚠️ MEXC_DEVICE_OFFSET не задано — профілі можуть збігтись з іншим ботом")
+    except Exception:
+        logger.exception("[PATH MODE] не вдалось надрукувати режим")
+
+    asyncio.create_task(dolos_config_refresh_loop(webkey_store), name="dolos_config")
 
     # Periodically refresh `last_balance_usdt` for ALL configured slots so the
     # web panel (which reads from this cache) always shows fresh balances —

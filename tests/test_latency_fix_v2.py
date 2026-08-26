@@ -75,13 +75,18 @@ def test_impersonate_is_aligned_with_the_ua_headers():
     інакше кожне підняття версії ламало б тест на рівному місці.
     (Дефолт піднято 136 -> 146 після знімка живого браузера 2026-08-26, де
     реальний Chrome виявився 147; 146 — найновіша ціль, яку знає curl_cffi.)"""
+    import re
     from src.execution.webkey import client as m
 
-    client = m.MexcWebClient(webkey="test_key", visitor_id="test_visitor")
-    assert client.impersonate == m._CHROME_IMPERSONATE
-    assert client.impersonate == f"chrome{m._CHROME_VER}"
-    assert f"Chrome/{m._CHROME_VER}.0.0.0" in client.user_agent
-    assert f'v="{m._CHROME_VER}"' in client.sec_ch_ua
+    # Кожен слот має власний профіль, тож звіряємо клієнта САМ ІЗ СОБОЮ:
+    # TLS-ціль, UA і sec-ch-ua мусять називати одну версію.
+    for slot in (None, 1, 2):
+        c = m.MexcWebClient(webkey="test_key", visitor_id="test_visitor",
+                            slot_id=slot)
+        v = re.fullmatch(r"chrome(\d+)[a-z]?", c.impersonate).group(1)
+        assert f"Chrome/{v}.0.0.0" in c.user_agent
+        assert f'"Google Chrome";v="{v}"' in c.sec_ch_ua
+        assert f'"Chromium";v="{v}"' in c.sec_ch_ua
 
 
 def test_ua_matches_impersonate_version():
@@ -117,18 +122,19 @@ def test_ua_and_sec_ch_ua_same_major_version():
     )
 
 
-def test_impersonate_close_to_ua_version():
-    """impersonate version should be within 2 of UA Chrome version."""
+def test_impersonate_matches_the_clients_own_ua():
+    """TLS-ціль і UA мають називати ТУ САМУ версію.
+
+    Звіряємо з UA САМОГО КЛІЄНТА, а не з модульним _DEFAULT_UA: з 2026-08-26
+    кожен слот має власний профіль пристрою, тож модульний дефолт більше не
+    описує конкретного клієнта. Раніше тут допускався розбіг до 2 версій —
+    тепер вимагаємо точний збіг, бо профіль будує обидва поля з одного числа.
+    """
     import re
-    from src.execution.webkey.client import MexcWebClient, _DEFAULT_UA
+    from src.execution.webkey.client import MexcWebClient
 
-    client = MexcWebClient(webkey="k", visitor_id="v")
-    imp_match = re.search(r"(\d+)", client.impersonate)
-    ua_match = re.search(r"Chrome/(\d+)", _DEFAULT_UA)
-
-    assert imp_match and ua_match
-    imp_ver = int(imp_match.group(1))
-    ua_ver = int(ua_match.group(1))
-    assert abs(imp_ver - ua_ver) <= 2, (
-        f"impersonate={client.impersonate} (v{imp_ver}) too far from UA Chrome/{ua_ver}"
-    )
+    for slot in (None, 1, 2, 3):
+        c = MexcWebClient(webkey="k", visitor_id="v" * 20, slot_id=slot)
+        imp = int(re.search(r"(\d+)", c.impersonate).group(1))
+        ua = int(re.search(r"Chrome/(\d+)", c.user_agent).group(1))
+        assert imp == ua, f"slot={slot}: TLS={c.impersonate} проти UA Chrome/{ua}"

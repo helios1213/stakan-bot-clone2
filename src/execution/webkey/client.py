@@ -28,6 +28,7 @@ from typing import Any
 
 from curl_cffi import requests as curl_requests
 
+from . import device_profile, dolos_config
 from .credentials import BOOTSTRAP_CHASH, WebkeySlot
 from .signing import sign_dolos, sign_web
 
@@ -127,9 +128,36 @@ _API_URL = os.environ.get("MEXC_API_HOST", "https://contract.mexc.com").rstrip("
 # властивість АКАУНТА, не запиту). Повертаємо як рішення оператора при
 # вимірювано мізерній ціні, а не як доведений фікс.
 #
-# MEXC_DOLOS_ON_ORDER=0 вимикає назад без зміни коду.
-_DOLOS_ON_ORDER = os.environ.get("MEXC_DOLOS_ON_ORDER", "1").strip().lower() not in (
-    "0", "false", "no", "off", "")
+# ── РЕЖИМ ШЛЯХУ: один перемикач замість пʼяти окремих змінних ────────────
+#
+#   MEXC_PATH_MODE=full   (дефолт) — «браузерний»: dolos на /order/create,
+#       живий конфіг (chash + поля пристрою), профіль пристрою на слот,
+#       заголовки під живий знімок браузера. Ціна: ~3.9мс на ордер
+#       (1.7мс наш підпис + 2.2мс на боці біржі).
+#
+#   MEXC_PATH_MODE=bare — «голий»: НАЙКОРОТШИЙ доведений шлях. Без dolos на
+#       /order/create (абляція 12.08: біржа приймає плоске тіло + web-sign),
+#       тобто -3.9мс. Усе інше — TLS-профіль, заголовки, referer за парою,
+#       новий chash — ЛИШАЄТЬСЯ: воно нічого не коштує за часом, а
+#       `close_all_positions` у будь-якому разі шле dolos, і саме там новий
+#       chash і застосовується.
+#
+# Окремі змінні (MEXC_DOLOS_ON_ORDER тощо) перебивають режим — щоб можна було
+# зібрати проміжну комбінацію, не чіпаючи код.
+_PATH_MODE = os.environ.get("MEXC_PATH_MODE", "full").strip().lower() or "full"
+if _PATH_MODE not in ("full", "bare"):
+    logger.warning("[PATH MODE] невідомий режим %r — беру 'full'", _PATH_MODE)
+    _PATH_MODE = "full"
+
+# MEXC_DOLOS_ON_ORDER перебиває режим; без нього рішення ухвалює режим.
+_DOLOS_ON_ORDER = (
+    os.environ.get("MEXC_DOLOS_ON_ORDER", "").strip().lower() not in (
+        "0", "false", "no", "off")
+    if os.environ.get("MEXC_DOLOS_ON_ORDER", "").strip()
+    else _PATH_MODE == "full")
+
+logger.info("[PATH MODE] %s — dolos на /order/create: %s",
+            _PATH_MODE, "ТАК" if _DOLOS_ON_ORDER else "ні")
 
 # trochilus-uid — у браузері це РЕАЛЬНИЙ uid акаунта (знімок 2026-08-26 показав
 # 8-значне число). Ми роками слали буквальний "0": сервер значення не валідує,
@@ -139,6 +167,36 @@ _DOLOS_ON_ORDER = os.environ.get("MEXC_DOLOS_ON_ORDER", "1").strip().lower() not
 # Значення НЕ секрет (це публічний id акаунта), але воно РІЗНЕ на двох ботах,
 # тому живе в env кожного, а не в коді.
 _TROCHILUS_UID = os.environ.get("MEXC_TROCHILUS_UID", "").strip()
+
+
+# Повна емуляція dolos: класти в p0 САМЕ ті поля, яких вимагає серверна сцена
+# під нашим chash, а не поля ордера.
+#
+# ЩО З'ЯСУВАЛОСЬ ІЗ ЖИВОГО КОНФІГУ (2026-08-26, `dolos_config.py`):
+#   * наш прибитий chash 973e5a66… у поточному конфізі ВІДСУТНІЙ — старий реліз;
+#   * ЖОДНА сцена не приймає поля ордера. Усі 5 сцен беруть характеристики
+#     ПРИСТРОЮ. Наш список (symbol/side/vol/…) не відповідав жодній сцені ніколи.
+#   * і попри це пройшло 16 932 ордери -> MEXC не перевіряє ВМІСТ p0 на
+#     /order/create (узгоджується з абляцією 12.08: ордер приймають і без dolos).
+#
+# ЧЕСНО ПРО МЕЖУ ТОЧНОСТІ. Які поля потрібні — ми знаємо ТОЧНО (з конфігу).
+# Які там мають бути ЗНАЧЕННЯ — ні: щоб побачити browser p0, потрібен приватний
+# RSA-ключ MEXC. Тому `sys`/`sys_ver` виведені з нашого ж User-Agent (щоб не
+# суперечити заголовкам), а `tencent_device_token` порожній — його видає SDK
+# Tencent, якого в нас немає. Вигадувати правдоподібне сміття тут гірше, ніж
+# лишити порожнім: порожнє поле пояснюється, а неправильний токен — ні.
+# MEXC_DOLOS_LEGACY=1 повертає стару схему (chash 973e5a66… + поля ордера).
+_DOLOS_LEGACY = os.environ.get("MEXC_DOLOS_LEGACY", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def _new_request_id() -> str:
+    """Формат узято з кукі браузера `x_fingerprint_requestId=1787685214220.at2lp1`:
+    мілісекунди + крапка + 6 символів [a-z0-9]."""
+    import random
+    import string
+    tail = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"{int(time.time() * 1000)}.{tail}"
 
 
 @dataclass
@@ -156,11 +214,24 @@ class _DolosRuntime:
 
     @property
     def as_signing_dict(self) -> dict[str, Any]:
+        if not _DOLOS_LEGACY:
+            # Живий конфіг. `get()` синхронний і без мережі — оновлює його
+            # фонова задача, шлях ордера ніколи не чекає на HTTP.
+            cfg = dolos_config.CACHE.get()
+            return {
+                "chash": cfg["chash"],
+                "mtoken": self.visitor_id,
+                "mhash": self.mhash,
+                "parameters": cfg["parameters"],
+                "data_upload": cfg["data_upload"],
+            }
+        # Legacy: доведено робоча пара «старий chash + поля ордера».
+        # Саме її пройшли 16 932 ордери, тож це і є відкат.
         return {
-            "chash": self.chash,
+            "chash": dolos_config.LEGACY_CHASH,
             "mtoken": self.visitor_id,
             "mhash": self.mhash,
-            "parameters": self.parameters,
+            "parameters": list(dolos_config.LEGACY_PARAMETERS),
             "data_upload": 1,
         }
 
@@ -195,6 +266,35 @@ class MexcWebClient:
         self.webkey = webkey
         self.dolos = _DolosRuntime.from_visitor(visitor_id)
         self.slot_id = slot_id  # for logging only
+        # Свій СТАБІЛЬНИЙ профіль пристрою на слот. До 2026-08-26 усі слоти
+        # обох ботів (до чотирьох акаунтів) ходили одним і тим самим UA/ОС/TLS —
+        # чотири акаунти виглядали одним пристроєм. Профіль детермінований від
+        # visitor_id: НЕ рандомний і НЕ змінюється при рестарті, бо у реального
+        # браузера відбиток стабільний, і саме стрибки були б аномалією.
+        # MEXC_DEVICE_PROFILE=0 повертає єдиний спільний профіль (відкат).
+        self._profile = None
+        if os.environ.get("MEXC_DEVICE_PROFILE", "1").strip().lower() not in (
+                "0", "false", "no", "off"):
+            try:
+                # За НОМЕРОМ СЛОТА, не за visitor_id: ротація вебкея не має
+                # міняти пристрій (людина перезаходить на тому ж компʼютері),
+                # а зсув за слотом гарантує різні профілі різним слотам.
+                self._profile = (device_profile.for_slot(slot_id)
+                                 if slot_id is not None
+                                 else device_profile.for_visitor(visitor_id))
+            except Exception:
+                logger.warning("[DEVICE] профіль не побудовано", exc_info=True)
+        if self._profile is not None:
+            # Явно передані аргументи мають пріоритет: тести й ручні проби
+            # задають їх свідомо.
+            if impersonate == _CHROME_IMPERSONATE:
+                impersonate = self._profile.impersonate
+            if user_agent == _DEFAULT_UA:
+                user_agent = self._profile.user_agent
+            if sec_ch_ua == _DEFAULT_SEC_CH_UA:
+                sec_ch_ua = self._profile.sec_ch_ua
+            if sec_ch_ua_platform == _DEFAULT_SEC_CH_UA_PLATFORM:
+                sec_ch_ua_platform = self._profile.sec_ch_ua_platform
         self.impersonate = impersonate
         self.timeout = timeout
         self.cookie_max_age_sec = cookie_max_age_sec
@@ -276,6 +376,56 @@ class MexcWebClient:
         await self._ensure_session()
 
     # ---- headers ----
+    def _device_payload(self) -> dict[str, Any]:
+        """Поля ПРИСТРОЮ, яких вимагає серверна сцена dolos.
+
+        Точний перелік беремо з живого конфігу; тут — лише значення. Кожне
+        виведене так, щоб НЕ суперечити нашим власним заголовкам: інакше ми
+        створили б рівно ту неузгодженість, заради усунення якої все це й
+        робиться (UA каже macOS, а p0 каже Windows — це гірше, ніж нічого).
+
+        `tencent_device_token` свідомо ПОРОЖНІЙ: його видає SDK Tencent, якого
+        в нас немає. Вигадати правдоподібний токен неможливо, а неправильний
+        гірший за відсутній.
+        `member_id` — публічний uid акаунта, різний на двох ботах, тому з env
+        (та сама змінна, що й для заголовка trochilus-uid).
+        """
+        host = self.BASE_URL.split("//", 1)[-1]
+        return {
+            "hostname": host,
+            "member_id": _TROCHILUS_UID,
+            "platform_type": 3,
+            "product_type": 0,
+            "request_id": _new_request_id(),
+            "sys": self._sys_name(),
+            "sys_ver": self._sys_version(),
+            "tencent_device_token": "",
+        }
+
+    def _sys_name(self) -> str:
+        """ОС із НАШОГО ж User-Agent — щоб p0 не суперечив заголовку."""
+        if self._profile is not None:
+            return self._profile.sys
+        ua = self.user_agent
+        if "Macintosh" in ua or "Mac OS" in ua:
+            return "Mac OS"
+        if "Windows" in ua:
+            return "Windows"
+        if "Linux" in ua:
+            return "Linux"
+        return ""
+
+    def _sys_version(self) -> str:
+        """Версія ОС звідти ж: `Intel Mac OS X 10_15_7` -> `10.15.7`."""
+        if self._profile is not None:
+            return self._profile.sys_ver
+        import re as _re
+        m = _re.search(r"Mac OS X (\d+[_.]\d+(?:[_.]\d+)?)", self.user_agent)
+        if m:
+            return m.group(1).replace("_", ".")
+        m = _re.search(r"Windows NT ([\d.]+)", self.user_agent)
+        return m.group(1) if m else ""
+
     def _common_headers(self, with_layer2_sign: dict[str, str] | None = None,
                         symbol: str | None = None) -> dict[str, str]:
         # referer МУСИТЬ вказувати на сторінку тієї пари, яку ми торгуємо.
@@ -286,7 +436,9 @@ class MexcWebClient:
         _ref_sym = symbol or _WARMUP_SYMBOL
         h = {
             "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
+            "accept-language": (self._profile.accept_language
+                                if self._profile is not None
+                                else "en-US,en;q=0.9"),
             "authorization": self.webkey,
             "content-type": "application/json",
             "language": "English",
@@ -350,10 +502,14 @@ class MexcWebClient:
             try:
                 if not getattr(self.dolos, "visitor_id", None):
                     raise ValueError("visitor_id порожній")
+                # Кандидати на вміст p0. `sign_dolos` сам відбере з них ті, що
+                # перелічені в `parameters` серверної сцени, — тож зайве тут
+                # нешкідливе, а поля ордера лишаються для legacy-режиму.
                 input_payload = {
                     **body,
                     "mtoken": self.dolos.visitor_id,
                     "mhash": self.dolos.mhash,
+                    **self._device_payload(),
                 }
                 dolos_sig = sign_dolos(input_payload, self.dolos.as_signing_dict)
                 full_body = {**body, **dolos_sig}
