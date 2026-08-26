@@ -491,3 +491,86 @@ async def test_an_idle_futures_half_still_drains_a_leftover_position():
 
 async def _noop(*a, **kw):
     return None
+
+
+# ---- проводка звіту: раннер має віддавати ФАКТИЧНІ числа (2026-08-26) ------
+
+@pytest.mark.asyncio
+async def test_runner_reports_the_real_order_size_not_the_config_ceiling():
+    """НАСКРІЗЬ, бо саме тут була діра.
+
+    Тести репортера перевіряють рендер і мутанта в раннері НЕ ловлять: раннер
+    міг передавати `cfg.order_usdt_max` і літерал «~», і кожен рядок звіту
+    показував би 3.00 USDT незалежно від реального розміру (1.5-2.2). Звіт, що
+    показує константу замість виміру, гірший за відсутній — за ним неможливо
+    помітити, що розмір не змінюється.
+    """
+    # RealSlotWarmer, не SlotWarmer: autouse-фікстура підміняє ssr.SlotWarmer
+    # фейком, і `from ... import SlotWarmer` віддав би саме його.
+    w = RealSlotWarmer.__new__(RealSlotWarmer)
+    w.slot_id = 1
+    seen = []
+
+    class _Rep:
+        async def spot_buy(self, symbol, usdt, qty, **st):
+            seen.append(("buy", symbol, usdt, qty))
+
+        async def spot_sell(self, symbol, qty, usdt=0.0, **st):
+            seen.append(("sell", symbol, usdt, qty))
+
+        async def futures_open(self, *a, **kw):
+            seen.append(("open", a, kw))
+
+        async def futures_close(self, *a, **kw):
+            seen.append(("close", a, kw))
+
+    w.reporter = _Rep()
+    w.spot = type("S", (), {
+        "cfg": type("C", (), {"order_usdt_max": 3.0})(),
+        "last_action": {"kind": "buy", "symbol": "MXUSDT",
+                        "usdt": 1.78, "qty": "0.6692"},
+    })()
+    w.futures = type("F", (), {"state": type("St", (), {"position": None})(),
+                               "last_closed": None})()
+    w.campaign = type("C", (), {"state": type("S2", (), {
+        "day_index": lambda self: 0, "days": 3})()})()
+    w.budget = type("B", (), {"spent": 0.1,
+                              "state": type("S3", (), {"max_usdt": 5.0})()})()
+
+    await RealSlotWarmer._report_diff(w, (0, 0, 0, None), (1, 0, 0, None))
+
+    assert seen, "звіт не відправлено взагалі"
+    kind, sym, usdt, qty = seen[0]
+    assert kind == "buy"
+    assert sym == "MXUSDT", f"символ не з реальної дії: {sym}"
+    assert abs(usdt - 1.78) < 1e-9, f"сума зі стелі конфігу, а не з ордера: {usdt}"
+    assert qty == "0.6692", f"кількість не передана: {qty!r}"
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_futures_open_with_its_size():
+    w = RealSlotWarmer.__new__(RealSlotWarmer)
+    w.slot_id = 1
+    seen = {}
+
+    class _Rep:
+        async def futures_open(self, symbol, side, leverage, hold_min, **kw):
+            seen.update(symbol=symbol, side=side, lev=leverage,
+                        hold=hold_min, **kw)
+
+    w.reporter = _Rep()
+    w.spot = type("S", (), {"cfg": type("C", (), {"order_usdt_max": 3.0})(),
+                            "last_action": None})()
+    pos = {"symbol": "1000PEPEUSDT", "side": 1, "leverage": 9, "vol": 1,
+           "notional": 37.44, "opened_at": 0, "close_after": 53 * 60}
+    w.futures = type("F", (), {"state": type("St", (), {"position": pos})(),
+                               "last_closed": None})()
+    w.campaign = type("C", (), {"state": type("S2", (), {
+        "day_index": lambda self: 0, "days": 3})()})()
+    w.budget = type("B", (), {"spent": 0.1,
+                              "state": type("S3", (), {"max_usdt": 5.0})()})()
+
+    await RealSlotWarmer._report_diff(w, (0, 0, 0, None), (0, 0, 1, "1000PEPEUSDT"))
+    assert seen.get("symbol") == "1000PEPEUSDT"
+    assert seen.get("lev") == 9 and seen.get("hold") == 53
+    assert seen.get("vol") == 1, "розмір позиції не передано у звіт"

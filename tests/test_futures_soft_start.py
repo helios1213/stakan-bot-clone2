@@ -597,39 +597,31 @@ async def test_fee_survives_a_restart_before_adoption(tmp_path, live):
 
 
 @pytest.mark.asyncio
-async def test_the_budget_gate_prices_the_fee_too(tmp_path, live):
-    """Стеля перевіряється ДО відправки — і мусить бачити комісію.
+async def test_spend_is_still_accounted_even_without_a_ceiling(tmp_path, live):
+    """Стелю витрат прибрано (рішення оператора 2026-08-26) — але ОБЛІК ні.
 
-    Мутант, що прибрав `fee_frac` саме з `can_afford` (а не з списання),
-    проходив зеленим: ордер, який пробиває стелю, усе одно йшов, а стеля
-    дізнавалась про це заднім числом. Тест ставить бюджет РІВНО між
-    безкоштовною і платною вартістю.
+    Раніше тут пінився гейт `can_afford`: бюджет ставився рівно між
+    безкоштовною і платною вартістю, і платний ордер мусив НЕ піти. Тепер
+    прогрів не зупиняється ні на чому, крім кінця кампанії, тож перевіряємо
+    протилежне: ордер іде, а витрати з комісією все одно лягають у звіт.
     """
     from src.execution.soft_start_budget import (SoftStartBudget,
                                                  futures_round_trip_cost)
-    # Ноціонал беремо з самого сайзера, а не з відкритої позиції: у dry-run
-    # позиція не персиститься, тож `state.position` там None.
     probe, _, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=True)
     _v, _m, notional = probe._size_position("BTCUSDT", 10, 0.0002)
     assert notional and notional > 0
 
     free = futures_round_trip_cost(notional, fee_frac=0.0)
     paid = futures_round_trip_cost(notional, fee_frac=0.0002)
-    assert paid > free, "фікстура безглузда — комісія нічого не змінює"
+    assert paid > free
 
-    # Стеля вміщає безкоштовний round-trip, але НЕ платний.
-    ceiling = (free + paid) / 2
-    bud = SoftStartBudget(str(tmp_path / "tight.json"), max_usdt=ceiling)
+    # Стеля, що НЕ вмістила б платний round-trip, більше нічого не блокує.
+    bud = SoftStartBudget(str(tmp_path / "tight.json"),
+                          max_usdt=(free + paid) / 2)
     ss, cl, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=False, budget=bud)
-    assert await ss.open_position() is False, \
-        "гейт не побачив комісію — ордер пробив стелю витрат"
-    assert cl.opened == []
-
-    # Контроль: та сама стеля з БЕЗКОШТОВНОЮ парою пропускає.
-    bud2 = SoftStartBudget(str(tmp_path / "tight2.json"), max_usdt=ceiling)
-    ss2, cl2, _ = mk(tmp_path, {"HYPEUSDT": (0, 0)}, dry_run=False, budget=bud2)
-    assert await ss2.open_position() is True
-    assert cl2.opened
+    assert await ss.open_position() is True, "стеля знову блокує прогрів"
+    assert cl.opened
+    assert bud.spent > 0, "витрати перестали обліковуватись"
 
 
 # ---- рандомізація РОЗМІРУ (2026-08-26) ------------------------------------

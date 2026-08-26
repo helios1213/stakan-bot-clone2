@@ -180,7 +180,7 @@ def test_min_viable_balance_is_the_documented_floor():
 # ---- integration with the spot warmer -----------------------------------
 
 @pytest.mark.asyncio
-async def test_spot_warmer_stops_buying_when_budget_is_exhausted(tmp_path, monkeypatch):
+async def test_spot_warmer_keeps_buying_regardless_of_spend(tmp_path, monkeypatch):
     from src.execution.spot_soft_start import DayPlan, SoftStartConfig, SpotSoftStart
     from src.execution.webkey.spot_client import OrderResult
 
@@ -203,5 +203,10 @@ async def test_spot_warmer_stops_buying_when_budget_is_exhausted(tmp_path, monke
     e = SpotSoftStart(c, cfg, rng=random.Random(1), budget=b)
     e.plan = DayPlan(date=e.plan.date, tokens=["PENGU"], buys_target=5, sells_target=5)
 
-    assert await e.maybe_buy() is False
-    assert c.orders == [], "an exhausted budget must place nothing"
+    # ПОВЕДІНКУ ЗМІНЕНО 2026-08-26 (рішення оператора): стелі витрат більше
+    # немає — прогрів має гріти, а не впиратись у ліміт. Раніше тут пінилось
+    # протилежне: «вичерпаний бюджет не має нічого відправляти».
+    # Облік ЛИШИВСЯ: витрати далі рахуються і показуються у звіті.
+    assert await e.maybe_buy() is True
+    assert c.orders, "стеля витрат більше не має блокувати прогрів"
+    assert b.spent > 0.001, "витрати перестали обліковуватись"

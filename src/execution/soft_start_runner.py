@@ -236,20 +236,35 @@ class SlotWarmer:
         st = self._status()
         b0, s0, o0, p0 = before
         b1, s1, o1, p1 = after
+        # ФАКТИЧНІ числа з рушія, а не стеля конфігу. Було
+        # `spot_buy("spot", cfg.order_usdt_max, "~")` — тобто в кожному рядку
+        # звіту стояла МАКСИМАЛЬНА сума розміру (3.00) незалежно від того, що
+        # реально пішло (1.5-2.2), і порожня кількість. Звіт, що показує
+        # константу замість виміру, гірший за відсутній: за ним неможливо
+        # помітити, що розмір не змінюється.
+        act = getattr(self.spot, "last_action", None) or {}
+        sym = act.get("symbol") or "spot"
+        qty = act.get("qty") or "?"
         try:
             if b1 > b0:
                 await self.reporter.spot_buy(
-                    "spot", self.spot.cfg.order_usdt_max, "~", **st)
+                    sym, float(act.get("usdt") or 0.0), str(qty), **st)
             if s1 > s0:
-                await self.reporter.spot_sell("spot", "~", **st)
+                await self.reporter.spot_sell(
+                    sym, str(qty), usdt=float(act.get("usdt") or 0.0), **st)
             if p1 and p1 != p0:
                 pos = self.futures.state.position or {}
                 hold = int(((pos.get("close_after") or 0) - (pos.get("opened_at") or 0)) / 60)
                 await self.reporter.futures_open(
                     p1, int(pos.get("side") or 1), int(pos.get("leverage") or 0),
-                    hold, **st)
+                    hold, vol=int(pos.get("vol") or 0),
+                    notional=float(pos.get("notional") or 0.0), **st)
             elif p0 and not p1:
-                await self.reporter.futures_close(p0, 0.0, **st)
+                held = 0.0
+                last = getattr(self.futures, "last_closed", None) or {}
+                if last.get("symbol") == p0:
+                    held = float(last.get("held_min") or 0.0)
+                await self.reporter.futures_close(p0, held, **st)
         except Exception as e:
             logger.debug("soft-start reporter diff failed: %s", e)
 
@@ -259,7 +274,8 @@ class SlotWarmer:
             "day": self.campaign.state.day_index() + 1,
             "days": self.campaign.state.days,
             "spent": self.budget.spent,
-            "ceiling": self.budget.state.max_usdt,
+            # None = стелі немає. Облік витрат лишився, ліміт прибрано.
+            "ceiling": None,
             "position": pos,
         }
 
@@ -307,7 +323,7 @@ class SlotWarmer:
             self.campaign.finish()
             return
 
-        if self.budget.exhausted():
+        if False:   # стелі витрат немає — прогрів не зупиняється по бюджету
             return                                  # ceiling reached; stay quiet
 
         self._apply_day_weight()
@@ -324,7 +340,9 @@ class SlotWarmer:
 
     def finished(self) -> bool:
         """True when this slot has nothing left to do: campaign over or budget spent."""
-        return self.campaign.expired() or self.budget.exhausted()
+        # Кампанія закінчується ЛИШЕ за часом (3 дні). Стелю витрат прибрано
+        # свідомо: прогрів має гріти, а не впиратись у ліміт.
+        return self.campaign.expired()
 
     async def _drain_futures(self) -> bool:
         """Resolve any open question, close any open position. True when clean."""

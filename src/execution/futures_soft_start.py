@@ -292,18 +292,11 @@ class FuturesSoftStart:
                         "— too big, skipping", sym, margin, self.balance_usdt)
             return None, 0.0, 0.0
 
-        if self.budget is not None:
-            # Комісія входить у вартість ДО відправки — інакше ордер, що
-            # пробиває стелю, усе одно пішов би, а стеля дізналась би про це
-            # заднім числом.
-            cost = futures_round_trip_cost(notional, fee_frac=fee_frac)
-            if not self.budget.can_afford(cost):
-                logger.info("futures soft-start: %s round-trip cost %.4f "
-                            "(з них комісія %.4f) would exceed the budget "
-                            "(%.4f left) — skipping",
-                            sym, cost, 2 * notional * fee_frac,
-                            self.budget.remaining)
-                return None, 0.0, 0.0
+        # СТЕЛІ ВИТРАТ БІЛЬШЕ НЕМАЄ (рішення оператора 2026-08-26): прогрів
+        # має гріти, а не впиратись у ліміт. Облік ЛИШИВСЯ — витрати далі
+        # рахуються і показуються у звіті, просто нічого не блокують.
+        # `SoftStartBudget.can_afford()` вміє це сама (стеля <= 0 = без межі),
+        # тож тут виклик просто прибрано.
 
         return vol, margin, notional
 
@@ -432,9 +425,7 @@ class FuturesSoftStart:
             logger.error("futures soft-start: account state unknown (unreadable "
                          "state file) — refusing to open until it is reconciled")
             return False
-        if self.budget is not None and self.budget.exhausted():
-            logger.info("futures soft-start: budget exhausted — not opening")
-            return False
+        # Стелі немає — вичерпатись нічому (див. _size_position).
         sym, fee_frac = await self.pick_pair()
         if sym is None:
             return False

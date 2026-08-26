@@ -88,7 +88,9 @@ async def test_status_line_carries_day_budget_and_position():
     await r.spot_buy("MX", 2.5, "1.52", day=2, days=3, spent=0.31,
                      ceiling=5.0, position="HYPE_USDT")
     t = b.sent[-1]
-    assert "day 2/3" in t and "0.310/5.00 USDT" in t and "HYPE_USDT" in t
+    # Формат змінено 2026-08-26 разом зі зняттям стелі витрат: знаменник
+    # лишається лише коли стеля справді задана.
+    assert "day 2/3" in t and "витрачено 0.310 USDT" in t and "HYPE_USDT" in t
 
 
 @pytest.mark.asyncio
@@ -193,3 +195,50 @@ async def test_final_report_stays():
 async def test_final_report_survives_telegram_failure():
     r = rep(FakeBot(fail_send=True))
     await r.final_report("done", spent=0.1, ceiling=5.0)   # must not raise
+
+
+# ---- звіт: фʼючерси не мають тонути у споті (2026-08-26) -------------------
+
+@pytest.mark.asyncio
+async def test_futures_events_survive_a_flood_of_spot_actions():
+    """ДЕФЕКТ, ЯКИЙ ЦЕ ЛІКУЄ. Спот робить десятки дій на день, фʼючерси —
+    одну-три. У спільному списку з 8 рядків фʼючерсне відкриття витіснялось
+    спотом за півгодини, і в звіті лишався ТІЛЬКИ спот: оператор не бачив ані
+    відкриття, ані закриття позиції, тобто найдорожчих подій прогріву.
+    """
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=True)
+
+    await r.futures_open("1000PEPEUSDT", 1, 9, 53, vol=1, notional=37.44)
+    for i in range(30):
+        await r.spot_buy("MXUSDT", 2.0 + i * 0.01, "0.75")
+
+    out = r.render(day=1, days=3, spent=0.1, position="1000PEPEUSDT")
+    assert "FUTURES OPEN 1000PEPEUSDT" in out, (
+        "фʼючерсну подію витіснив спот — саме те, що лікували")
+    assert "vol=1" in out and "37.44" in out, "розмір позиції не показано"
+
+
+@pytest.mark.asyncio
+async def test_spot_lines_show_the_real_amount_and_quantity():
+    """Було `~3.00 USDT (qty ~)` у КОЖНОМУ рядку: раннер передавав
+    `order_usdt_max` (стелю розміру) і літерал «~». Звіт, що показує
+    константу замість виміру, гірший за відсутній — за ним неможливо
+    помітити, що розмір не змінюється."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=True)
+    await r.spot_buy("MXUSDT", 1.78, "0.6692")
+    await r.spot_sell("MXUSDT", "0.5", usdt=1.33)
+    out = r.render(day=1, days=3, spent=0.0, position=None)
+    assert "1.78" in out and "0.6692" in out
+    assert "1.33" in out and "qty 0.5" in out
+    assert "qty ~" not in out
+
+
+def test_report_does_not_advertise_a_ceiling_that_no_longer_exists():
+    """Стелю витрат прибрано; «0.117/5.00» читалось би як діючий ліміт."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=True)
+    out = r.render(day=1, days=3, spent=0.117, ceiling=None, position=None)
+    assert "витрачено 0.117 USDT" in out
+    assert "/5.00" not in out and "стеля" not in out

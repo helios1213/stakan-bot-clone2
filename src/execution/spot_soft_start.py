@@ -173,6 +173,9 @@ class SpotSoftStart:
         # Optional hard spend ceiling shared with the futures warmer. None means
         # "no ceiling" — kept optional so existing callers and tests are unchanged.
         self.budget = budget
+        # Слід останньої УСПІШНОЇ дії — читає раннер, щоб звіт показував
+        # справжні суму й кількість, а не стелю конфігу.
+        self.last_action: dict | None = None
         self.plan = load_plan(self.cfg)
         if self.plan is None or not self.plan.is_today():
             self.plan = new_day_plan(self.cfg, self.rng)
@@ -227,16 +230,20 @@ class SpotSoftStart:
         # known before sending — so an order that would breach the ceiling is
         # never placed rather than being noticed afterwards.
         cost = _order_cost(usdt, cfg.marketable_buffer, cfg.spot_fee_frac)
-        if self.budget is not None and not self.budget.can_afford(cost):
-            logger.info("[buy] skip %s — cost %.4f would exceed the soft-start "
-                        "budget (%.4f left)", symbol, cost, self.budget.remaining)
-            return False
-
         res = await self.client.buy(token, usdt=usdt,
                                     price=px * (1 + cfg.marketable_buffer))
         if res.ok:
             p.buys_done += 1
             p.spent_usdt += usdt
+            # ФАКТИЧНІ числа для звіту оператору. Раніше репортер отримував
+            # `order_usdt_max` і літерал "~" — тобто показував СТЕЛЮ розміру
+            # замість реальної суми (звідси «~3.00 USDT» у кожному рядку, хоч
+            # насправді йшло 1.5-2.2) і порожню кількість. Рушій і далі нічого
+            # не знає про Telegram: він просто лишає слід.
+            self.last_action = {
+                "kind": "buy", "symbol": symbol, "usdt": usdt,
+                "qty": res.quantity, "price": res.price,
+            }
             save_plan(cfg, p)
             if self.budget is not None and not res.dry_run:
                 self.budget.charge(cost, f"spot buy {symbol}"
@@ -285,15 +292,14 @@ class SpotSoftStart:
             return False
 
         cost = _order_cost(qty * px, cfg.marketable_buffer, cfg.spot_fee_frac)
-        if self.budget is not None and not self.budget.can_afford(cost):
-            logger.info("[sell] skip %s — cost %.4f would exceed the soft-start "
-                        "budget (%.4f left)", symbol, cost, self.budget.remaining)
-            return False
-
         res = await self.client.sell(token, quantity=qty,
                                      price=px * (1 - cfg.marketable_buffer))
         if res.ok:
             p.sells_done += 1
+            self.last_action = {
+                "kind": "sell", "symbol": symbol, "usdt": qty * px,
+                "qty": res.quantity, "price": res.price,
+            }
             save_plan(cfg, p)
             if self.budget is not None and not res.dry_run:
                 self.budget.charge(cost, f"spot sell {symbol}"

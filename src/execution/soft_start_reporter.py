@@ -31,6 +31,13 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY = 8
+# Окремий, коротший журнал ФʼЮЧЕРСНИХ подій. Їх одиниці на день проти
+# десятків спотових, тож у спільному списку вони гарантовано витісняються.
+MAX_FUTURES_LOG = 6
+
+
+def _hhmm() -> str:
+    return time.strftime("%H:%M:%S", time.localtime())
 
 
 @dataclass
@@ -52,6 +59,9 @@ class SoftStartReporter:
         self.slot_id = slot_id
         self.dry_run = dry_run
         self.history: deque[Action] = deque(maxlen=max_history)
+        # Фʼючерсні події живуть ОКРЕМО і не витісняються спотом.
+        self.futures_log: list[str] = []
+        self.max_futures = MAX_FUTURES_LOG
         self._message_id: int | None = None
         self.started_at = time.time()
         # Counters for the closing report. The rolling history only keeps the
@@ -78,20 +88,36 @@ class SoftStartReporter:
         self.stats["spot_buys"] += 1
         await self.action("🟢", f"SPOT BUY {symbol} ~{usdt:.2f} USDT (qty {qty})", **st)
 
-    async def spot_sell(self, symbol: str, qty: str, **st) -> None:
+    async def spot_sell(self, symbol: str, qty: str, usdt: float = 0.0,
+                        **st) -> None:
         self.stats["spot_sells"] += 1
-        await self.action("🔴", f"SPOT SELL {symbol} qty {qty}", **st)
+        amt = f" ~{usdt:.2f} USDT" if usdt else ""
+        await self.action("🔴", f"SPOT SELL {symbol}{amt} (qty {qty})", **st)
 
     async def futures_open(self, symbol: str, side: int, leverage: int,
-                           hold_min: int, **st) -> None:
+                           hold_min: int, vol: int = 0, notional: float = 0.0,
+                           **st) -> None:
         self.stats["futures_opens"] += 1
         s = "LONG" if side == 1 else "SHORT"
-        await self.action("📈", f"FUTURES OPEN {symbol} {s} {leverage}x "
-                                f"— closing in {hold_min}min", **st)
+        size = f" vol={vol}" if vol else ""
+        size += f" ~{notional:.2f} USDT" if notional else ""
+        line = (f"FUTURES OPEN {symbol} {s} {leverage}x{size} "
+                f"— closing in {hold_min}min")
+        # Фʼючерсні події ДУБЛЮЮТЬСЯ в окремий короткий журнал. Спот робить
+        # десятки дій на день, фʼючерси — одну-три, тож у спільному списку з 8
+        # рядків найважливіше витіснялось спотовим шумом за півгодини: у звіті
+        # лишався тільки спот, і оператор не бачив ані відкриття, ані закриття.
+        self.futures_log.append(f"{_hhmm()} 📈 {line}")
+        del self.futures_log[:-self.max_futures]
+        await self.action("📈", line, **st)
 
     async def futures_close(self, symbol: str, held_min: float, **st) -> None:
         self.stats["futures_closes"] += 1
-        await self.action("📉", f"FUTURES CLOSE {symbol} after {held_min:.0f}min", **st)
+        held = f" after {held_min:.0f}min" if held_min else ""
+        line = f"FUTURES CLOSE {symbol}{held}"
+        self.futures_log.append(f"{_hhmm()} 📉 {line}")
+        del self.futures_log[:-self.max_futures]
+        await self.action("📉", line, **st)
 
     async def campaign_started(self, days: int, **st) -> None:
         await self.action("🌱", f"Soft-start campaign began — {days} days", **st)
@@ -188,11 +214,25 @@ class SoftStartReporter:
         meta = []
         if day is not None and days:
             meta.append(f"day {day}/{days}")
-        if spent is not None and ceiling:
-            meta.append(f"spent {spent:.3f}/{ceiling:.2f} USDT")
+        if spent is not None:
+            # Без знаменника: стелю витрат прибрано (рішення оператора
+            # 2026-08-26), і «0.117/5.00» читалось би як діючий ліміт, якого
+            # немає. Облік лишився — саме число досі корисне.
+            meta.append(f"витрачено {spent:.3f} USDT"
+                        + (f" (стеля {ceiling:.2f})" if ceiling else ""))
         meta.append(f"position: {position}" if position else "position: none")
         lines.append(" · ".join(meta))
         lines.append("")
+
+        # ФʼЮЧЕРСИ ПЕРШИМИ й окремим блоком. У спільному списку з 8 рядків
+        # їх за півгодини витісняв спот (десятки дій на день проти одиниць), і
+        # у звіті лишався тільки спот — оператор не бачив ані відкриття, ані
+        # закриття позиції, тобто найдорожчих подій прогріву.
+        if self.futures_log:
+            lines.append("<b>Futures</b>")
+            for ln in reversed(self.futures_log):
+                lines.append(f"<code>{ln}</code>")
+            lines.append("")
 
         if self.history:
             lines.append("<b>Recent actions</b>")
