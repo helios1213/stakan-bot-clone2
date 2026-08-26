@@ -191,6 +191,36 @@ class SpotSoftStart:
                     self.plan.date, self.plan.tokens,
                     self.plan.buys_target, self.plan.sells_target)
 
+    def _tick_probability(self, now: datetime | None = None) -> float:
+        """Імовірність зробити дію на ЦЬОМУ тіку — щоб день не вигорав одразу.
+
+        БУЛО ПРИБИТЕ 0.5, і це давало рівно те, на що скаржиться оператор:
+        план дня (8 покупок + 2 продажі) виконувався за 22 ХВИЛИНИ, після чого
+        бот мовчав до наступної доби. Для прогріву це найгірший можливий
+        профіль: сплеск і 23 години тиші помітніші за рівну активність, заради
+        якої все й робиться. Активне вікно 6:00-23:00 не використовувалось.
+
+        Тепер темп виводиться з того, скільки дій лишилось і скільки тіків
+        лишилось у вікні: `лишилось / тіків_до_кінця`. Це самокоригується —
+        пропущений тік трохи піднімає ймовірність наступного, а до кінця вікна
+        решта дій дотискається.
+
+        Стеля 0.5 лишена свідомо: вона обмежує сплеск, якщо часу лишилось мало,
+        але не дає темпу підскочити вище за старий максимум. Підлога 0.001 —
+        щоб при довгому вікні дії все ж траплялись, а не відкладались на кінець.
+        """
+        p = self.plan
+        left = max(0, p.buys_target - p.buys_done) + \
+            max(0, p.sells_target - p.sells_done)
+        if left <= 0:
+            return 0.0
+        n = now or datetime.now()
+        # Тік раз на хвилину, тож хвилини до кінця вікна = кількість спроб.
+        mins_left = (self.cfg.active_hour_end - n.hour) * 60 - n.minute
+        if mins_left <= 1:
+            return 0.5
+        return max(0.001, min(0.5, left / float(mins_left)))
+
     def active_now(self, now: datetime | None = None) -> bool:
         h = (now or datetime.now()).hour
         return self.cfg.active_hour_start <= h < self.cfg.active_hour_end
@@ -331,11 +361,12 @@ class SpotSoftStart:
             # tick can also do nothing at all.
             from .soft_start_campaign import shuffled_actions
             p = self.plan
+            pace = self._tick_probability()
             for action in shuffled_actions(
                     self.rng,
                     buy=p.buys_done < p.buys_target,
                     sell=p.sells_done < p.sells_target):
-                if self.rng.random() >= 0.5:
+                if self.rng.random() >= pace:
                     continue
                 if action == "buy":
                     await self.maybe_buy()

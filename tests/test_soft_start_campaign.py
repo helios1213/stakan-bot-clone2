@@ -442,3 +442,108 @@ async def test_a_genuinely_cheaper_pair_still_wins():
         ss.rng = random.Random(seed)
         sym, fee = await ss.pick_pair()
         assert sym == "BUSDT" and fee == 0.0001
+
+
+# ---- темп спота: день не має вигорати за 20 хвилин (2026-08-26) ------------
+
+def _pace_engine(buys_done=0, sells_done=0):
+    import random
+    from src.execution.spot_soft_start import (DayPlan, SoftStartConfig,
+                                               SpotSoftStart)
+    e = SpotSoftStart.__new__(SpotSoftStart)
+    e.cfg = SoftStartConfig()
+    e.rng = random.Random(1)
+    e.plan = DayPlan(date="x", tokens=["MX"], buys_target=8, sells_target=2)
+    e.plan.buys_done = buys_done
+    e.plan.sells_done = sells_done
+    return e
+
+
+def test_pace_is_low_early_in_the_day_and_rises_near_the_end():
+    """Прибите 0.5 давало рівно те, на що скаржився оператор: план дня
+    (8 покупок + 2 продажі) виконувався за 22 ХВИЛИНИ, далі 23 години тиші.
+    Для прогріву це найгірший профіль — сплеск помітніший за рівну активність.
+    """
+    import datetime
+    e = _pace_engine()
+    early = e._tick_probability(datetime.datetime(2026, 8, 26, 7, 0))
+    late = e._tick_probability(datetime.datetime(2026, 8, 26, 22, 30))
+    assert early < 0.05, f"на початку дня темп завеликий: {early}"
+    assert late > early * 3, f"під кінець темп не піднявся: {early} -> {late}"
+
+
+def test_pace_is_zero_once_the_plan_is_done():
+    import datetime
+    e = _pace_engine(buys_done=8, sells_done=2)
+    assert e._tick_probability(datetime.datetime(2026, 8, 26, 12, 0)) == 0.0
+
+
+def test_pace_never_exceeds_the_old_maximum():
+    """Стеля 0.5 обмежує сплеск, якщо часу лишилось мало."""
+    import datetime
+    e = _pace_engine()
+    for hh, mm in ((22, 59), (23, 0), (6, 0)):
+        p = e._tick_probability(datetime.datetime(2026, 8, 26, hh, mm))
+        assert 0.0 <= p <= 0.5, (hh, mm, p)
+
+
+def test_a_whole_simulated_day_is_spread_not_bursty():
+    """НАЙВАЖЛИВІШИЙ ТУТ: міряємо РОЗМАХ дня, а не окрему ймовірність.
+
+    Виміряно на симуляції повного вікна: старий темп давав усі 10 дій за 16
+    хвилин, новий — з 07:32 до 22:17.
+    """
+    import datetime
+    e = _pace_engine()
+    t = datetime.datetime(2026, 8, 26, 6, 0)
+    times = []
+    for _ in range(17 * 60):
+        p = e._tick_probability(t)
+        for kind in ("buy", "sell"):
+            done = e.plan.buys_done if kind == "buy" else e.plan.sells_done
+            targ = e.plan.buys_target if kind == "buy" else e.plan.sells_target
+            if done >= targ:
+                continue
+            if e.rng.random() < p:
+                if kind == "buy":
+                    e.plan.buys_done += 1
+                else:
+                    e.plan.sells_done += 1
+                times.append(t)
+        t += datetime.timedelta(minutes=1)
+
+    assert len(times) >= 8, f"план майже не виконався: {len(times)}"
+    span_min = (times[-1] - times[0]).total_seconds() / 60
+    assert span_min > 240, (
+        f"день вигорів за {span_min:.0f} хв — сплеск повернувся")
+
+
+@pytest.mark.asyncio
+async def test_tick_actually_uses_the_pacing_not_a_constant(monkeypatch):
+    """ПРОВОДКА, а не лише формула.
+
+    Тести вище перевіряють `_tick_probability` напряму і мутанта в `tick()`
+    НЕ ловлять: там могло лишитись прибите `pace = 0.5`, формула була б
+    правильна й невживана, а день і далі вигорав би за 20 хвилин. Це вже
+    третій випадок цієї діри за сесію (гейт бюджету, розмір у звіті).
+    """
+    import datetime
+    e = _pace_engine()
+    calls = []
+
+    def _spy(now=None):
+        calls.append(now)
+        return 0.0                     # 0 -> жодної дії, тік має бути тихим
+
+    monkeypatch.setattr(e, "_tick_probability", _spy)
+    monkeypatch.setattr(e, "active_now", lambda now=None: True)
+    monkeypatch.setattr(e, "_roll_day", lambda: None)
+
+    async def _fail(*a, **k):
+        raise AssertionError("дія пішла попри нульовий темп")
+
+    monkeypatch.setattr(e, "maybe_buy", _fail)
+    monkeypatch.setattr(e, "maybe_sell", _fail)
+
+    await e.tick()
+    assert calls, "tick() не питає _tick_probability — темп прибитий у коді"
