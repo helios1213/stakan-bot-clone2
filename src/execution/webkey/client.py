@@ -29,6 +29,7 @@ from typing import Any
 from curl_cffi import requests as curl_requests
 
 from . import device_profile, dolos_config
+from . import credentials as _credentials
 from .credentials import BOOTSTRAP_CHASH, WebkeySlot
 from .signing import sign_dolos, sign_web
 
@@ -219,7 +220,13 @@ class _DolosRuntime:
             # фонова задача, шлях ордера ніколи не чекає на HTTP.
             cfg = dolos_config.CACHE.get()
             return {
-                "chash": cfg["chash"],
+                # Явно заданий MEXC_CHASH перебиває будь-яке джерело — і
+                # знімок, і привезене з сервера. Читаємо ЧЕРЕЗ МОДУЛЬ, а не
+                # через імпортовану константу: інакше значення застигло б на
+                # момент імпорту, і перевірити важіль було б неможливо інакше
+                # ніж reload-ом, який ламає ідентичність класів (ця пастка вже
+                # клала 7 тестів 2026-08-26).
+                "chash": _credentials.CHASH_ENV_OVERRIDE or cfg["chash"],
                 "mtoken": self.visitor_id,
                 "mhash": self.mhash,
                 "parameters": cfg["parameters"],
@@ -228,7 +235,7 @@ class _DolosRuntime:
         # Legacy: доведено робоча пара «старий chash + поля ордера».
         # Саме її пройшли 16 932 ордери, тож це і є відкат.
         return {
-            "chash": dolos_config.LEGACY_CHASH,
+            "chash": _credentials.CHASH_ENV_OVERRIDE or dolos_config.LEGACY_CHASH,
             "mtoken": self.visitor_id,
             "mhash": self.mhash,
             "parameters": list(dolos_config.LEGACY_PARAMETERS),

@@ -2032,7 +2032,7 @@ class ShadowEngine:
             # ПОДВОЮЮТЬ втрати філів, тож така пауза — не дрібниця.
             # Кожен _tape_frame_at сам по собі атомарний (усередині немає
             # await), тож ітерація по deque не може зіткнутись із append.
-            d0_f, _d0s, d0_pct, _d0p, d0_reason, tape_status, tape_age = verdict(0.0)
+            d0_f, _d0s, d0_pct, d0_price, d0_reason, tape_status, tape_age = verdict(0.0)
             await asyncio.sleep(0)
             dr_f, dr_s, dr_pct, dr_price, dr_reason, _ts2, _a2 = verdict(draw_ms)
             await asyncio.sleep(0)
@@ -2054,11 +2054,13 @@ class ShadowEngine:
                  live_ok, live_result.fill_price or 0.0,
                  (live_result.notional_usdt / notional) if notional > 0 else 0.0,
                  live_result.error_msg,
-                 # Стара колонка = d0, щоб історичні запити не поламались і було
-                 # видно, що саме вона й міряла тавтологію.
-                 # shadow_price = ціна ВЕРДИКТУ draw (продакшн-shadow), бо саме
-                 # він тепер порівнюваний із живим філом; d0 лишається контролем.
-                 d0_f, dr_price if dr_price is not None else 0.0,
+                 # УСІ чотири старі колонки = d0. Це важливо: раніше
+                 # `shadow_filled` брався з d0, а `shadow_price` — з draw, тож
+                 # у 60 рядках із 1083 стояло «налився» з ціною 0.0. Наївний
+                 # запит `WHERE shadow_filled=1` давав через це -554 bps проти
+                 # +0.01 у коректного. Вердикт draw живе у ВЛАСНИХ колонках
+                 # (`shadow_*_draw`), змішувати їх в одному рядку не можна.
+                 d0_f, d0_price if d0_price is not None else 0.0,
                  d0_pct if d0_pct is not None else 0.0,
                  d0_reason, notional,
                  d0_f, dr_f, rt_f,
@@ -2066,7 +2068,12 @@ class ShadowEngine:
                  int(draw_ms), int(rtt_ms), tape_status, tape_age),
             )
         except Exception:
-            logger.debug("[TWIN] запис не вдався", exc_info=True)
+            # ERROR, не DEBUG. `LOG_LEVEL=INFO` глушить DEBUG в ОБОХ сінках
+            # (stderr і файл), тож падіння запису twin було невидимим
+            # наскрізь: таблиця просто не росла, і це виглядало як «сигналів
+            # не було». Найімовірніша причина — розбіжність схеми після
+            # деплою, тобто рівно той момент, коли мовчання найдорожче.
+            logger.error("[TWIN] запис не вдався", exc_info=True)
 
     async def _record_shadow_miss(self, symbol: str, reason: str) -> None:
         """Record a shadow entry that never became a trade.

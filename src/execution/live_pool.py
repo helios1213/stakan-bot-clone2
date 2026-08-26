@@ -22,6 +22,13 @@ from src.execution.live_safety import LiveSafetyController
 
 logger = logging.getLogger(__name__)
 
+# Скільки живе запит на зняття кіла з вебпанелі. Цикл синку йде раз на ~30с,
+# тож 10 хвилин — це з великим запасом на «бот саме перезапускався», але
+# набагато менше за проміжок до НАСТУПНОГО кіла просадки. Без цієї межі
+# маркер лежав у `live_state` вічно (prune його не чистить) і знімав кіл,
+# якого оператор ніколи не бачив.
+KILL_RELEASE_REQ_TTL_SEC = 600.0
+
 
 class LiveExecutorPool:
     """
@@ -231,6 +238,22 @@ class LiveExecutorPool:
     def _kill_request_key(slot_id: int) -> str:
         return f"kill_release_req:slot{slot_id}"
 
+    @staticmethod
+    def _release_req_is_stale(value, *, now: float | None = None) -> bool:
+        """Чи протермінований запит на зняття кіла.
+
+        Нечитабельне значення вважаємо ПРОТЕРМІНОВАНИМ: невідомий вік не має
+        знімати запобіжник, що стереже реальні гроші.
+        """
+        try:
+            ts = int(value)
+        except (TypeError, ValueError):
+            return True
+        if ts <= 0:
+            return True
+        _now = time.time() if now is None else now
+        return (_now - ts) > KILL_RELEASE_REQ_TTL_SEC
+
     async def sync_kill_state(self) -> None:
         """Дзеркалити кіл у `live_state` і виконувати запити на зняття з панелі.
 
@@ -272,7 +295,21 @@ class LiveExecutorPool:
                 req_key = self._kill_request_key(sid)
                 row = await self.live_db.fetchone(
                     "SELECT value FROM live_state WHERE key = ?", (req_key,))
-                if row and row[0]:
+                if row and row[0] and self._release_req_is_stale(row[0]):
+                    # ПРОТЕРМІНОВАНИЙ ЗАПИТ НЕ ЗНІМАЄ КІЛ. Таймстемп писався з
+                    # самого початку, але не читався: маркер віком у ТИЖНІ знімав
+                    # щойно ввімкнений кіл просадки — тобто слот повертався до
+                    # живих грошей без жодної дії оператора. `live_state` не
+                    # входить у RET_LIVE, prune його не чистить, тож самé воно
+                    # не зникало. Та сама рамка вже стоїть на `kill_released_at`
+                    # (див. ~:129) — сюди її просто не застосували.
+                    logger.warning(
+                        "[KILL RESET] slot %d: запит із панелі ПРОТЕРМІНОВАНИЙ "
+                        "(старший за %dс) — ігнорую і прибираю", sid,
+                        int(KILL_RELEASE_REQ_TTL_SEC))
+                    await self.live_db.execute(
+                        "DELETE FROM live_state WHERE key = ?", (req_key,))
+                elif row and row[0]:
                     if ctl is not None and ctl.is_killed():
                         was, why = await self.release_kill(sid)
                         logger.warning(

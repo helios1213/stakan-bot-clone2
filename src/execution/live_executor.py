@@ -1676,6 +1676,13 @@ class LiveExecutor:
             # симулятор філиться там, де біржа не змогла.
             limit_price_scaled=limit_scaled,
             priced_at_perf=priced_at_perf,
+            # Те саме стосується RTT. `shadow_twin` виносить три вердикти —
+            # d0 (контроль), draw (продакшн-shadow) і rtt (реальний round-trip
+            # ЦЬОГО ордера), — але на шляху відмови поле лишалось нулем, а
+            # `verdict(0.0)` — це БУКВАЛЬНО той самий виклик, що й контроль d0.
+            # Тобто третя точка кривої була структурно мертвою рівно там, де
+            # вона цікава: на протухлих ордерах.
+            submit_latency_ms=last_latency_ms,
             raw_response=last_response,
         )
 
