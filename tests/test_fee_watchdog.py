@@ -237,6 +237,64 @@ def test_loop_can_be_disabled():
     assert "FEE_WATCHDOG" in Path("src/execution/fee_watchdog.py").read_text()
 
 
+# ---- адаптивний інтервал ------------------------------------------------
+# Ризик несиметричний: озброєний слот може відправити ордер будь-якої миті,
+# у простої ми не шлемо нічого. Тому два інтервали, а не один.
+
+def test_active_interval_is_faster_than_idle():
+    assert fw.ACTIVE_SEC < fw.POLL_SEC
+
+
+def test_active_interval_is_not_absurdly_fast():
+    """1с (як у браузерному скрипті) — 86 400 запитів на добу і зайвий привід
+    для рейт-ліміту. Ставка між тіками не міняється."""
+    assert fw.ACTIVE_SEC >= 5
+
+
+def test_loop_switches_interval_on_armed_slots():
+    from pathlib import Path
+    src = Path("src/main.py").read_text()
+    i = src.index("async def fee_watchdog_loop")
+    seg = src[i:i + 3000]
+    assert "_fw.ACTIVE_SEC if armed else _fw.POLL_SEC" in seg
+    assert "armed += 1" in seg
+
+
+def test_a_slot_without_a_pair_does_not_count_as_armed():
+    """live_enabled без призначеної пари ордерів не шле — прискорюватись нема
+    заради чого."""
+    from pathlib import Path
+    src = Path("src/main.py").read_text()
+    i = src.index("async def fee_watchdog_loop")
+    seg = src[i:i + 3000]
+    j = seg.index("if not pair:")
+    assert "continue" in seg[j:j + 60]
+    assert seg.index("armed += 1") > j, "лічильник має рахуватись ПІСЛЯ перевірки пари"
+
+
+def test_an_error_does_not_slow_the_watchdog_down():
+    """Якщо слот озброєний, а опитати не вдалось — це привід перевірити ЩЕ РАЗ
+    ШВИДШЕ, а не рідше. Без `continue` виняток лишав би `armed=0` і переводив
+    сторож у повільний режим саме тоді, коли він найпотрібніший."""
+    from pathlib import Path
+    src = Path("src/main.py").read_text()
+    i = src.index("async def fee_watchdog_loop")
+    seg = src[i:i + 3000]
+    k = seg.index('logger.exception("[FEE WATCH] цикл упав")')
+    assert "continue" in seg[k:k + 400]
+
+
+def test_mode_change_is_logged_once_not_every_tick():
+    """Щотіку на 10с — це спам; мовчки — це вже двічі за сесію призводило до
+    того, що жива задача була не відрізнити від мертвої."""
+    from pathlib import Path
+    src = Path("src/main.py").read_text()
+    i = src.index("async def fee_watchdog_loop")
+    seg = src[i:i + 3000]
+    assert "_armed_prev" in seg
+    assert "if armed != _armed_prev:" in seg
+
+
 def test_poll_interval_is_not_one_second():
     """Браузерний скрипт опитував раз на секунду — це 86 400 запитів на добу
     і зайвий привід для рейт-ліміту. Ставка між тіками не міняється."""

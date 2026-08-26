@@ -253,16 +253,23 @@ async def fee_watchdog_loop(webkey_store, webkey_client_pool, live_pool) -> None
     if not _fw.ENABLED:
         logger.info("[FEE WATCH] вимкнено (FEE_WATCHDOG=0)")
         return
-    logger.info("[FEE WATCH] старт: кожні %.0fс, підтверджень %d",
-                _fw.POLL_SEC, _fw.CONFIRMATIONS)
+    logger.info("[FEE WATCH] старт: %.0fс коли слот озброєний, %.0fс у простої, "
+                "підтверджень %d", _fw.ACTIVE_SEC, _fw.POLL_SEC, _fw.CONFIRMATIONS)
+    # Інтервал АДАПТИВНИЙ. Озброєний слот (live + призначена пара) може
+    # відправити ордер будь-якої миті, тож там дорога кожна секунда; у простої
+    # ми нічого не шлемо, і частий опит — лише зайві запити до біржі.
+    interval = _fw.POLL_SEC
+    _armed_prev = None
     while True:
-        await asyncio.sleep(_fw.POLL_SEC)
+        await asyncio.sleep(interval)
+        armed = 0
         try:
             for slot in await webkey_store.list_live_active():
                 sid = slot.slot_id
                 pair = getattr(slot, "assigned_pair", None)
                 if not pair:
                     continue
+                armed += 1
                 try:
                     client = await webkey_client_pool.get(sid)
                 except Exception:
@@ -271,6 +278,18 @@ async def fee_watchdog_loop(webkey_store, webkey_client_pool, live_pool) -> None
                 await _fw.WATCHDOG.check_slot(sid, client, to_mexc(pair), ex)
         except Exception:
             logger.exception("[FEE WATCH] цикл упав")
+            # Помилка НЕ має переводити нас у повільний режим: якщо слот
+            # озброєний, а ми не змогли його опитати — це привід перевірити
+            # ЩЕ РАЗ швидше, а не рідше.
+            continue
+        interval = _fw.ACTIVE_SEC if armed else _fw.POLL_SEC
+        if armed != _armed_prev:
+            # Гучно на ЗМІНІ режиму, а не щотіку: інакше або спам раз на 10с,
+            # або (як уже було двічі сьогодні) мовчання, з якого не зрозуміти,
+            # чи задача взагалі жива.
+            logger.info("[FEE WATCH] озброєних слотів: %d -> інтервал %.0fс",
+                        armed, interval)
+            _armed_prev = armed
 
 
 async def dolos_config_refresh_loop(webkey_store, interval_sec: int = 21600) -> None:
