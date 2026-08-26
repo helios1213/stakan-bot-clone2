@@ -217,6 +217,9 @@ class FuturesSoftStart:
         # Деталі останнього закриття — читає раннер для звіту (тримання, PnL).
         # Раніше звіт друкував «after 0min», бо тривалості не було звідки взяти.
         self.last_closed: dict | None = None
+        # Наша ОЦІНКА комісії за round-trip останнього відкриття — щоб на
+        # закритті звірити її з тим, що біржа взяла насправді.
+        self._last_fee_estimate: float = 0.0
         self.universe = list(universe)
         self.rng = rng or random.Random()
         self.dry_run = bool(dry_run)
@@ -504,6 +507,7 @@ class FuturesSoftStart:
         if self.budget is not None:
             from .soft_start_budget import futures_round_trip_cost
             _fee_cost = 2 * notional * fee_frac
+            self._last_fee_estimate = _fee_cost
             self.budget.charge(
                 futures_round_trip_cost(notional, fee_frac=fee_frac),
                 f"futures round-trip {sym}"
@@ -597,7 +601,36 @@ class FuturesSoftStart:
                 break
             if best is None:
                 return None
-            return float(best.get("realised") or 0.0)
+
+            # ТІЛЬКИ РУХ РИНКУ, БЕЗ КОМІСІЇ — інакше вона рахується ДВІЧІ.
+            #
+            # ВИМІРЯНО на нашій першій живій позиції (PEPE_USDT, 26.08):
+            #     realised = -0.4007
+            #     closeProfitLoss = -0.3710   (рух ринку)
+            #     fee = -0.0297               (комісія біржі)
+            # тобто realised = closeProfitLoss + fee. Комісія вже лежить у
+            # `spent` (ми заряджаємо її ДО відправки), тож брати `realised`
+            # означало б показати її і у витратах, і в PnL.
+            close_pl = best.get("closeProfitLoss")
+            fee = float(best.get("fee") or 0.0)
+            if close_pl is not None:
+                pnl = float(close_pl)
+            else:
+                # Запасний шлях: віднімаємо комісію самі. `fee` віддається
+                # відʼємним, тому мінус.
+                pnl = float(best.get("realised") or 0.0) - fee
+
+            # ФАКТИЧНА комісія проти нашої оцінки. Оцінка йде з
+            # `tiered_fee_rate`, і якщо біржа раптом почала брати інакше, ми
+            # дізнаємось про це ТУТ, а не через тиждень по балансу.
+            est = self._last_fee_estimate
+            if est and abs(abs(fee) - est) > max(0.01 * est, 0.005):
+                logger.warning(
+                    "[futures] %s: комісія біржі %.4f проти оцінки %.4f — "
+                    "розбіжність %.0f%%. Перевір тариф акаунта.",
+                    pos.symbol, abs(fee), est,
+                    100 * (abs(fee) - est) / est if est else 0.0)
+            return pnl
         except Exception:
             logger.debug("futures soft-start: історію позицій не прочитано",
                          exc_info=True)

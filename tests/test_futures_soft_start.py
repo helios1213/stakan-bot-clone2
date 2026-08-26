@@ -711,3 +711,73 @@ def test_round_quantities_do_appear_when_the_band_allows():
     round_ones = sum(1 for q in qtys if abs(q - round(q)) < 1e-6)
     assert round_ones >= 10, f"рівних кількостей майже немає: {round_ones}/200"
     assert round_ones <= 150, "рівні кількості СУЦІЛЬНО — це такий самий підпис"
+
+
+# ---- PnL не має рахувати комісію двічі (2026-08-26) ------------------------
+
+@pytest.mark.asyncio
+async def test_realised_pnl_excludes_the_fee_it_already_charged(tmp_path):
+    """ПОМИЛКА, ЯКУ ЦЕ ЛІКУЄ (моя, того ж дня).
+
+    ВИМІРЯНО на першій живій позиції (PEPE_USDT, 26.08):
+        realised = -0.4007 · closeProfitLoss = -0.3710 · fee = -0.0297
+    тобто `realised` = рух ринку + комісія. Комісія вже лежить у `spent` — ми
+    заряджаємо її ДО відправки, — тож записавши `realised` як PnL, ми б
+    показали її і у витратах, і в PnL. Беремо `closeProfitLoss`.
+    """
+    ss, _, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)})
+
+    class _Cl:
+        async def get_history_positions(self, symbol=None, page_size=10):
+            return {"code": 0, "data": [{
+                "symbol": "BTC_USDT", "createTime": 2_000_000_000_000,
+                "realised": -0.4007, "closeProfitLoss": -0.3710,
+                "fee": -0.0297,
+            }]}
+
+    ss.client = _Cl()
+    pos = type("P", (), {"symbol": "BTCUSDT", "opened_at": 2_000_000_000.0})()
+    got = await ss._realised_pnl(pos)
+    assert abs(got - (-0.3710)) < 1e-9, f"комісія порахована двічі: {got}"
+
+
+@pytest.mark.asyncio
+async def test_pnl_falls_back_to_realised_minus_fee(tmp_path):
+    """Якщо біржа не віддала closeProfitLoss — вивести його самим, а не
+    мовчки взяти realised разом із комісією."""
+    ss, _, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)})
+
+    class _Cl:
+        async def get_history_positions(self, symbol=None, page_size=10):
+            return {"code": 0, "data": [{
+                "symbol": "BTC_USDT", "createTime": 2_000_000_000_000,
+                "realised": -0.4007, "fee": -0.0297,
+            }]}
+
+    ss.client = _Cl()
+    pos = type("P", (), {"symbol": "BTCUSDT", "opened_at": 2_000_000_000.0})()
+    got = await ss._realised_pnl(pos)
+    assert abs(got - (-0.3710)) < 1e-6, got
+
+
+@pytest.mark.asyncio
+async def test_a_fee_that_disagrees_with_our_estimate_is_flagged(tmp_path, caplog):
+    """Оцінка йде з tiered_fee_rate. Якщо біржа почала брати інакше, ми маємо
+    дізнатись НА ЗАКРИТТІ, а не через тиждень по балансу."""
+    import logging
+    ss, _, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)})
+    ss._last_fee_estimate = 0.03
+
+    class _Cl:
+        async def get_history_positions(self, symbol=None, page_size=10):
+            return {"code": 0, "data": [{
+                "symbol": "BTC_USDT", "createTime": 2_000_000_000_000,
+                "realised": -0.5, "closeProfitLoss": -0.35, "fee": -0.15,
+            }]}
+
+    ss.client = _Cl()
+    pos = type("P", (), {"symbol": "BTCUSDT", "opened_at": 2_000_000_000.0})()
+    with caplog.at_level(logging.WARNING):
+        await ss._realised_pnl(pos)
+    assert any("комісія біржі" in r.getMessage() for r in caplog.records), \
+        "розбіжність комісії пройшла мовчки"
