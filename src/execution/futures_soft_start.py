@@ -61,6 +61,11 @@ SIDE_SHORT = 3
 
 ORDER_TYPE_MARKET = "5"
 
+# Крок очікування між спробами прочитати історію закритої позиції. Константа,
+# а не літерал, щоб сюїта могла її стиснути: інакше кожен тест на цьому шляху
+# чесно спить секундами (файл виріс з 1.6с до 15.5с на першому ж прогоні).
+HISTORY_RETRY_DELAY_SEC = 1.5
+
 
 @dataclass
 class FuturesSoftStartConfig:
@@ -598,19 +603,32 @@ class FuturesSoftStart:
         try:
             from src.exchanges.mexc_rest import to_mexc
             cs = to_mexc(pos.symbol)
-            r = await self.client.get_history_positions(symbol=cs, page_size=10)
-            rows = (r or {}).get("data") or []
             opened_ms = int(pos.opened_at * 1000)
             best = None
-            for row in rows:
-                if row.get("symbol") != cs:
-                    continue
-                # Допуск 60с: MEXC округлює час, а позиція одна за раз.
-                if int(row.get("createTime", 0) or 0) < opened_ms - 60_000:
-                    continue
-                best = row
-                break
+            # РЕТРАЙ, БО ЦЕ ГОНКА, А НЕ ВІДСУТНІСТЬ ДАНИХ. Виміряно на живому
+            # закритті 26.08 (slot 2, LINKUSDT): у мить закриття історія
+            # порожня і лог писав «realised=невідомо», а через кілька хвилин
+            # той самий запит віддавав рядок (realised -0.0898, closePL
+            # -0.0594, fee -0.0304). Тобто біржа пише історію з затримкою.
+            # Тут не гарячий шлях — кілька секунд очікування нічого не коштують.
+            for attempt in range(4):
+                if attempt:
+                    await asyncio.sleep(HISTORY_RETRY_DELAY_SEC * attempt)
+                r = await self.client.get_history_positions(symbol=cs,
+                                                            page_size=10)
+                for row in (r or {}).get("data") or []:
+                    if row.get("symbol") != cs:
+                        continue
+                    # Допуск 60с: MEXC округлює час, а позиція одна за раз.
+                    if int(row.get("createTime", 0) or 0) < opened_ms - 60_000:
+                        continue
+                    best = row
+                    break
+                if best is not None:
+                    break
             if best is None:
+                logger.info("[futures] %s: історія позиції ще не зʼявилась за "
+                            "4 спроби — PnL лишається невідомим", pos.symbol)
                 return None
 
             # ТІЛЬКИ РУХ РИНКУ, БЕЗ КОМІСІЇ — інакше вона рахується ДВІЧІ.

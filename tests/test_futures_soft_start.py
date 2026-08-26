@@ -840,3 +840,47 @@ def test_broken_window_is_rejected_at_config_time():
     from src.execution.futures_soft_start import FuturesSoftStartConfig
     with pytest.raises(ValueError, match="active hours"):
         FuturesSoftStartConfig(active_hour_start=23, active_hour_end=6).validate()
+
+
+@pytest.mark.asyncio
+async def test_realised_pnl_retries_because_history_lags(tmp_path):
+    """ВИМІРЯНО НА ЖИВОМУ ЗАКРИТТІ (slot 2, LINKUSDT, 26.08): у мить закриття
+    історія позицій ПОРОЖНЯ і лог писав «realised=невідомо», а за кілька
+    хвилин той самий запит віддавав рядок (realised -0.0898). Тобто біржа
+    пише історію із затримкою — це гонка, а не відсутність даних.
+
+    Тут не гарячий шлях, тож кілька секунд очікування нічого не коштують.
+    """
+    ss, _, _ = mk(tmp_path, {"LINKUSDT": (0, 0.0004)})
+    calls = {"n": 0}
+
+    class _Cl:
+        async def get_history_positions(self, symbol=None, page_size=10):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return {"code": 0, "data": []}       # ще не записалось
+            return {"code": 0, "data": [{
+                "symbol": "LINK_USDT", "createTime": 2_000_000_000_000,
+                "realised": -0.0898, "closeProfitLoss": -0.0594,
+                "fee": -0.0304,
+            }]}
+
+    ss.client = _Cl()
+    pos = type("P", (), {"symbol": "LINKUSDT", "opened_at": 2_000_000_000.0})()
+    got = await ss._realised_pnl(pos)
+    assert calls["n"] >= 3, "ретраю не було — гонка лишилась"
+    assert abs(got - (-0.0594)) < 1e-9, got
+
+
+@pytest.mark.asyncio
+async def test_realised_pnl_gives_up_and_says_unknown(tmp_path):
+    """Ретрай не безкінечний, і «не знайшли» лишається None, а не нулем."""
+    ss, _, _ = mk(tmp_path, {"LINKUSDT": (0, 0.0004)})
+
+    class _Cl:
+        async def get_history_positions(self, symbol=None, page_size=10):
+            return {"code": 0, "data": []}
+
+    ss.client = _Cl()
+    pos = type("P", (), {"symbol": "LINKUSDT", "opened_at": 2_000_000_000.0})()
+    assert await ss._realised_pnl(pos) is None

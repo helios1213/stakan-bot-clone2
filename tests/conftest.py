@@ -87,6 +87,15 @@ def _fast_waits(request, monkeypatch):
     monkeypatch.setattr(_le, "PHANTOM_FILL_CHECK_DELAYS_SEC",
                         list(_FAST_PHANTOM_DELAYS))
 
+    # 2а) Ретрай читання історії позиції у soft-start: біржа пише історію із
+    #     затримкою, тож у проді там 1.5с×N. У тестах це чисте очікування —
+    #     на першому прогоні файл виріс з 1.6с до 15.5с.
+    try:
+        from src.execution import futures_soft_start as _fss
+        monkeypatch.setattr(_fss, "HISTORY_RETRY_DELAY_SEC", 0.001)
+    except Exception:
+        pass
+
     # 2) Полли філу: обмежуємо ДЕДЛАЙН, не чіпаючи логіку. Обидва — функції
     #    рівня модуля, тож підміна атрибута модуля ловить і внутрішні виклики.
     monkeypatch.setattr(_le, "_poll_close_fill",
