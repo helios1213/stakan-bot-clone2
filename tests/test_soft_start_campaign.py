@@ -202,9 +202,15 @@ async def test_finished_campaign_switches_the_slot_off(monkeypatch):
             self._stop_attempts = 0
             self._final_sent = False
             self.campaign = type("C", (), {"expired": lambda self: True})()
+            # pnl і entries — фінальний звіт тепер показує рух ринку і те,
+            # що лишилось у монетах. Фейк мусить це вміти, інакше звіт падає
+            # у своєму ж try/except і тест бачить лише «звіту не було».
             self.budget = type("B", (), {"exhausted": lambda self: False,
-                                         "spent": 0.0,
-                                         "state": type("S", (), {"max_usdt": 5.0})()})()
+                                         "spent": 0.0, "pnl": 0.0,
+                                         "state": type("S", (), {
+                                             "max_usdt": 5.0,
+                                             "entries": []})()})()
+            self._held_spot_value = lambda: 0.0
             self.futures = type("F", (), {
                 "state": type("St", (), {"position": None, "pending": None,
                                          "needs_exchange_check": False})(),

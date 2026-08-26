@@ -446,9 +446,13 @@ async def _final_report(w, slot_id: int, reason: str, *, position_left: bool) ->
     if w.reporter is None:
         return
     try:
-        await w.reporter.final_report(reason, spent=w.budget.spent,
-                                      ceiling=w.budget.state.max_usdt,
-                                      position_left=position_left)
+        await w.reporter.final_report(
+            reason, spent=w.budget.spent,
+            # Стелі немає — передаємо 0, щоб рядок про неї не зʼявлявся.
+            ceiling=0.0,
+            pnl=w.budget.pnl,
+            held_value=w._held_spot_value(),
+            position_left=position_left)
     except Exception:
         logger.exception("soft-start slot %d: final report failed", slot_id)
 

@@ -107,6 +107,11 @@ class FakeWarmer:
         self._final_sent = False
         FakeWarmer.made.append(self)
 
+    def _held_spot_value(self) -> float:
+        """Дзеркалить SlotWarmer: фінальний звіт читає це, щоб показати,
+        скільки лишилось у монетах за ціною купівлі."""
+        return 0.0
+
     async def start(self):
         self.started = True
 
@@ -403,7 +408,6 @@ def test_fake_warmer_still_matches_the_real_one():
     for name in sorted(reads):
         assert name in real, f"the loop reads w.{name}, which SlotWarmer lacks"
         assert hasattr(fake, name), f"FakeWarmer is missing {name} — it is lying"
-
 
 class _FakeFutures:
     """Stands in for FuturesSoftStart in the stop()/drain tests."""

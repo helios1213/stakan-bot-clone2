@@ -143,7 +143,9 @@ async def test_final_report_counts_everything():
     assert "1 buys, 1 sells" in t
     assert "1 opened, 1 closed" in t
     assert "skipped : 1" in t
-    assert "0.3100 / 5.00 USDT" in t
+    # Формат змінено 2026-08-26: гроші показуються завжди і трьома рядками
+    # (комісії / рух ринку / разом), а «стеля» — лише коли її передали.
+    assert "0.3100" in t and "стеля" in t
 
 
 @pytest.mark.asyncio
@@ -310,3 +312,49 @@ def test_a_profit_really_reduces_the_cost():
     b.charge(0.10, "cost")
     b.record_pnl(0.50, "good close")
     assert b.net_cost < 0, "прибуток не зменшив вартість"
+
+
+# ---- фінальний звіт: гроші показуються ЗАВЖДИ (2026-08-26) -----------------
+
+def _final(**kw):
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=kw.pop("dry", False))
+    r.stats.update(kw.pop("stats", {}))
+    return r.render_final(kw.pop("reason", "campaign finished"), **kw)
+
+
+def test_final_report_shows_money_even_without_a_ceiling():
+    """Було `if ceiling:` — а стелю прибрано, тож підсумковий звіт лишився б
+    БЕЗ ЖОДНОЇ цифри про гроші, тобто без головного, заради чого його читають.
+    """
+    out = _final(spent=0.9134, pnl=-4.21, held_value=3.60, ceiling=0.0)
+    assert "0.9134" in out and "-4.2100" in out
+    assert "3.6000" in out
+    assert "РАЗОМ" in out and "+1.5234" in out
+
+
+def test_final_verdict_is_not_a_coin_flip_near_zero():
+    """Вердикт із двох станів біля нуля змушує обирати навмання: і «в плюс», і
+    «в мінус» там однаково неправдиві."""
+    assert "приблизно в нуль" in _final(spent=0.10, pnl=0.09, held_value=0.0)
+    assert "коштував грошей" in _final(spent=1.00, pnl=0.00, held_value=0.0)
+    assert "у плюс" in _final(spent=0.10, pnl=1.00, held_value=0.0)
+
+
+def test_final_report_says_the_held_value_is_at_cost():
+    """Число — це вкладена сума, а не ринкова переоцінка. Без підпису його
+    прочитають як поточну вартість монет, і підсумок здаватиметься точнішим,
+    ніж він є."""
+    out = _final(spent=0.5, pnl=-3.0, held_value=2.5)
+    assert "за купівлею" in out
+    assert "ринковий рух у підсумок не входить" in out
+
+
+def test_final_report_still_flags_a_stuck_position():
+    """Дві речі, через які оператор іде дивитись на біржу: помилки і
+    незакрита позиція. Гроші їх не заступають."""
+    out = _final(spent=0.5, pnl=-1.0, held_value=0.0, position_left=True,
+                 stats={"errors": 2})
+    assert "All clear" not in out
+    assert "could NOT be closed" in out
+    assert "2 error" in out

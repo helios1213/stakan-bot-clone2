@@ -134,7 +134,8 @@ class SoftStartReporter:
     # ---- closing report -------------------------------------------------
 
     def render_final(self, reason: str, *, spent: float = 0.0,
-                     ceiling: float = 0.0, position_left: bool = False) -> str:
+                     ceiling: float = 0.0, position_left: bool = False,
+                     pnl: float = 0.0, held_value: float = 0.0) -> str:
         s = self.stats
         elapsed_h = (time.time() - self.started_at) / 3600
         spot_total = s["spot_buys"] + s["spot_sells"]
@@ -160,9 +161,39 @@ class SoftStartReporter:
             f"{s['futures_closes']} closed</code>",
             f"<code>skipped : {s['skips']}</code>",
         ]
+        # ГРОШІ ПОКАЗУЮТЬСЯ ЗАВЖДИ. Було `if ceiling:` — а стелю прибрано, тож
+        # підсумковий звіт про кампанію лишився б БЕЗ ЖОДНОЇ цифри про гроші,
+        # тобто без головного, заради чого його читають.
+        net = spent - pnl - held_value
+        lines += [
+            "",
+            "<b>Скільки коштувало</b>",
+            f"<code>комісії+спред : {spent:+.4f} USDT</code>",
+            f"<code>рух ринку     : {pnl:+.4f} USDT</code>",
+        ]
+        if held_value:
+            # ЗА ЦІНОЮ КУПІВЛІ, не за ринком — і так і підписано. Ми знаємо,
+            # скільки USDT пішло в монети, але не переоцінюємо їх: без цього
+            # рядка «разом» читалось би як збиток, яким воно не є (спотова
+            # купівля йде в PnL мінусом, поки монета не продана), а з ринковою
+            # переоцінкою число мінялось би щохвилини від курсу.
+            lines.append(f"<code>у монетах (за купівлею): {held_value:.4f} "
+                         f"USDT</code>")
+        lines.append(f"<code>РАЗОМ         : {net:+.4f} USDT</code>")
+        # Поріг, а не знак: біля нуля казати «в плюс» чи «в мінус» однаково
+        # неправдиво, а вердикт із двох станів змушує обирати навмання.
+        if net > 0.05:
+            lines.append("<i>прогрів коштував грошей</i>")
+        elif net < -0.05:
+            lines.append("<i>прогрів вийшов у плюс попри витрати</i>")
+        else:
+            lines.append("<i>прогрів вийшов приблизно в нуль</i>")
+        if held_value:
+            lines.append("<i>Непроданi монети враховано за ціною купівлі — "
+                         "їхній ринковий рух у підсумок не входить.</i>")
         if ceiling:
             pct = (spent / ceiling * 100) if ceiling else 0
-            lines.append(f"<code>cost    : {spent:.4f} / {ceiling:.2f} USDT "
+            lines.append(f"<code>стеля         : {spent:.4f} / {ceiling:.2f} "
                          f"({pct:.0f}%)</code>")
         lines.append("")
 
