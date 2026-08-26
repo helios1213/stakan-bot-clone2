@@ -131,24 +131,40 @@ class SoftStartBudget:
 
 # ---- cost estimation ----------------------------------------------------
 
-def spot_order_cost(notional_usdt: float, marketable_buffer: float) -> float:
-    """What crossing the book costs on one spot order.
+def spot_order_cost(notional_usdt: float, marketable_buffer: float,
+                    fee_frac: float = 0.0) -> float:
+    """What ONE spot order costs us.
 
-    We deliberately price the order slightly through the touch so it fills;
-    that offset IS the cost, and it is known before sending.
+    Два доданки, обидва відомі ДО відправки:
+      * `marketable_buffer` — ми свідомо ставимо ціну трохи крізь дотик, щоб
+        ордер налився; цей офсет і є вартістю перетину;
+      * `fee_frac` — комісія біржі за цей ордер. Була відсутня в моделі, бо
+        прогрів починався з припущення «у нас 0%». Коли нуля немає, прогрів
+        усе одно йде — просто комісія ЗАПИСУЄТЬСЯ у витрати, а не ігнорується.
+
+    Ордери прогріву — marketable limit, тобто ТЕЙКЕР. Передавати сюди
+    мейкерську ставку означало б занизити витрати.
     """
-    return abs(notional_usdt) * abs(marketable_buffer)
+    return abs(notional_usdt) * (abs(marketable_buffer) + abs(fee_frac))
 
 
 def futures_round_trip_cost(notional_usdt: float, spread_frac: float = 0.0005,
-                            funding_frac: float = 0.0001) -> float:
+                            funding_frac: float = 0.0001,
+                            fee_frac: float = 0.0) -> float:
     """Estimated cost of open+close on a futures position.
 
     Two spread crossings plus, conservatively, one funding settlement — a hold
     of up to 300 minutes can span one. Market PnL is NOT included here; a losing
     close is charged separately, when it is known.
+
+    `fee_frac` — комісія за ОДНУ ногу; множиться на 2, бо позицію прогріву і
+    відкривають, і закривають. Обидві ноги йдуть `ORDER_TYPE_MARKET` (type 5),
+    тобто ТЕЙКЕРСЬКІ — сюди має приходити takerFee, не makerFee.
+    Нуль означає «комісії немає», а не «невідомо»: невідому ставку прогрів
+    трактує окремо (див. `FuturesSoftStart.pick_pair`).
     """
-    return abs(notional_usdt) * (2 * abs(spread_frac) + abs(funding_frac))
+    return abs(notional_usdt) * (2 * abs(spread_frac) + abs(funding_frac)
+                                 + 2 * abs(fee_frac))
 
 
 # ---- balance-driven sizing ----------------------------------------------

@@ -60,6 +60,20 @@ class SoftStartConfig:
     sell_fraction_min: float = 0.2
     sell_fraction_max: float = 0.6
     marketable_buffer: float = 0.002     # cross the book slightly so orders fill
+    # Комісія спота за ОДИН ордер, часткою від ноціоналу.
+    #
+    # ЦЕ ПРИПУЩЕННЯ, А НЕ ВИМІР — і його треба знати. `FeeGate` читає
+    # `/account/tiered_fee_rate`, тобто ФʼЮЧЕРСНУ сітку; спотова інша, і
+    # перевіреного приватного ендпоінта для неї в нас немає. Тому число тут
+    # береться з конфігу, а не «вимірюється».
+    #
+    # Дефолт 0.0005 (5 bps) — стандартний тейкер MEXC на споті. Він СВІДОМО
+    # завищений для акаунта з промо: бюджет — це стеля витрат, і завищення
+    # витрачає її швидше, тобто помиляється в БЕЗПЕЧНИЙ бік. Якщо оператор
+    # знає свою реальну ставку — виставити тут; 0.0 = «комісії немає».
+    #
+    # Ордери прогріву — marketable limit, тобто ТЕЙКЕР.
+    spot_fee_frac: float = 0.0005
     active_hour_start: int = 6
     active_hour_end: int = 23
     tick_min_sec: int = 180
@@ -82,11 +96,16 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _order_cost(notional_usdt: float, marketable_buffer: float) -> float:
-    """Cost of crossing the book on one order — imported lazily to keep this
-    module usable without the budget machinery."""
+def _order_cost(notional_usdt: float, marketable_buffer: float,
+                fee_frac: float = 0.0) -> float:
+    """Cost of ONE order: перетин книги + комісія біржі.
+
+    Комісії тут раніше не було взагалі — модель мовчки припускала 0%. На
+    акаунті без промо це занижувало витрати рівно на розмір комісії, тобто
+    стеля бюджету не спрацьовувала б там, де мала.
+    """
     from .soft_start_budget import spot_order_cost
-    return spot_order_cost(notional_usdt, marketable_buffer)
+    return spot_order_cost(notional_usdt, marketable_buffer, fee_frac)
 
 
 def public_last_price(symbol: str) -> float | None:
@@ -193,7 +212,7 @@ class SpotSoftStart:
         # The buffer we cross to get filled IS the cost of this order, and it is
         # known before sending — so an order that would breach the ceiling is
         # never placed rather than being noticed afterwards.
-        cost = _order_cost(usdt, cfg.marketable_buffer)
+        cost = _order_cost(usdt, cfg.marketable_buffer, cfg.spot_fee_frac)
         if self.budget is not None and not self.budget.can_afford(cost):
             logger.info("[buy] skip %s — cost %.4f would exceed the soft-start "
                         "budget (%.4f left)", symbol, cost, self.budget.remaining)
@@ -206,7 +225,9 @@ class SpotSoftStart:
             p.spent_usdt += usdt
             save_plan(cfg, p)
             if self.budget is not None and not res.dry_run:
-                self.budget.charge(cost, f"spot buy {symbol}")
+                self.budget.charge(cost, f"spot buy {symbol}"
+                                   + (f" (комісія @ {cfg.spot_fee_frac*10000:.1f}bps)"
+                                      if cfg.spot_fee_frac else ""))
             return True
         logger.warning("[buy] %s rejected: %s", symbol, res.error)
         return False
@@ -249,7 +270,7 @@ class SpotSoftStart:
             logger.info("[sell] skip %s — clamped below min notional", symbol)
             return False
 
-        cost = _order_cost(qty * px, cfg.marketable_buffer)
+        cost = _order_cost(qty * px, cfg.marketable_buffer, cfg.spot_fee_frac)
         if self.budget is not None and not self.budget.can_afford(cost):
             logger.info("[sell] skip %s — cost %.4f would exceed the soft-start "
                         "budget (%.4f left)", symbol, cost, self.budget.remaining)
@@ -261,7 +282,9 @@ class SpotSoftStart:
             p.sells_done += 1
             save_plan(cfg, p)
             if self.budget is not None and not res.dry_run:
-                self.budget.charge(cost, f"spot sell {symbol}")
+                self.budget.charge(cost, f"spot sell {symbol}"
+                                   + (f" (комісія @ {cfg.spot_fee_frac*10000:.1f}bps)"
+                                      if cfg.spot_fee_frac else ""))
             return True
         logger.warning("[sell] %s rejected: %s", symbol, res.error)
         return False

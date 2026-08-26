@@ -13,9 +13,16 @@ deliberately heavier than the spot one:
     Either one missing means nothing is sent.
   * **Fee is re-checked immediately before EVERY open**, not once at planning
     time. A tier can change between the plan and the order.
-  * **zero_both by default**, not just zero maker: a warm-up position is opened
-    AND closed, and a close can land as taker. `BTC_USDT` (maker=0, taker=0.0002)
-    is correctly excluded under this rule.
+  * **0% — це ПЕРЕВАГА, а не умова** (змінено 2026-08-26). Пара з `0/0`
+    береться першою. Якщо таких немає — прогрів НЕ зупиняється: береться
+    найдешевша платна, а її комісія списується у бюджет як витрата. Раніше
+    правило `zero_both` вимикало прогрів цілком на акаунті без промо — тобто
+    саме там, де він найпотрібніший. `allow_paid_fees=False` повертає старе.
+    Обидві ноги — market (type 5), тобто ТЕЙКЕР; у вартість іде `takerFee`,
+    помножений на 2. `max_fee_frac` (10 bps/нога) відсікає безглузді пари.
+  * **Невідома ставка ≠ безкоштовна і ≠ дешева.** Пара, чию ставку не вдалось
+    прочитати, не береться взагалі: без числа не порахувати ані бюджет, ані
+    рішення. Це НЕ те саме, що «ставка відома і ненульова».
   * **The open position is persisted the instant it is opened**, with its close
     deadline. If the bot restarts mid-hold, `recover()` finds the position and
     closes it on time instead of leaving it to sit.
@@ -68,7 +75,15 @@ class FuturesSoftStartConfig:
     leverage_min: int = 5
     leverage_max: int = 20
     long_ratio: float = 0.5              # share of opens that go long
-    require_zero_taker: bool = True      # a close can be taker — demand both
+    # Було: прогрів ВІДМОВЛЯВСЯ від пари, якщо тейкер не нуль. Тобто на акаунті
+    # без промо прогрів не йшов узагалі — а це саме той акаунт, якому прогрів
+    # потрібен найбільше. Тепер нуль — це ПЕРЕВАГА, а не умова: платні пари
+    # беруться теж, а комісія списується у бюджет як витрата.
+    # `require_zero_taker=True` лишається як ПРІОРИТЕТ (спершу шукаємо 0/0),
+    # а `allow_paid_fees=False` повертає стару жорстку поведінку.
+    require_zero_taker: bool = True      # спершу пробувати пари з 0/0
+    allow_paid_fees: bool = True         # якщо 0% немає — гріти платно і рахувати
+    max_fee_frac: float = 0.001          # стеля: 10 bps за ногу, вище — не гріти
     state_path: str = "/app/data/futures_soft_start_state.json"
 
     def validate(self) -> None:
@@ -243,7 +258,7 @@ class FuturesSoftStart:
 
     # ---- pair choice ----------------------------------------------------
 
-    def _size_position(self, sym: str, leverage: int):
+    def _size_position(self, sym: str, leverage: int, fee_frac: float = 0.0):
         """(contracts, margin_usdt, notional_usdt) or (None, ..) to skip.
 
         Skips when: the contract metadata is unreadable, a single contract would
@@ -277,35 +292,77 @@ class FuturesSoftStart:
             return None, 0.0, 0.0
 
         if self.budget is not None:
-            cost = futures_round_trip_cost(notional)
+            # Комісія входить у вартість ДО відправки — інакше ордер, що
+            # пробиває стелю, усе одно пішов би, а стеля дізналась би про це
+            # заднім числом.
+            cost = futures_round_trip_cost(notional, fee_frac=fee_frac)
             if not self.budget.can_afford(cost):
-                logger.info("futures soft-start: %s round-trip cost %.4f would "
-                            "exceed the budget (%.4f left) — skipping",
-                            sym, cost, self.budget.remaining)
+                logger.info("futures soft-start: %s round-trip cost %.4f "
+                            "(з них комісія %.4f) would exceed the budget "
+                            "(%.4f left) — skipping",
+                            sym, cost, 2 * notional * fee_frac,
+                            self.budget.remaining)
                 return None, 0.0, 0.0
 
         return vol, margin, notional
 
-    async def pick_pair(self) -> str | None:
-        """A random pair that is 0% for THIS account, verified right now."""
+    async def pick_pair(self) -> tuple[str | None, float]:
+        """Пара для прогріву + ставка ТЕЙКЕРА за одну ногу.
+
+        ПОРЯДОК ВІДБОРУ:
+          1. пара з `0/0` — безкоштовна, беремо одразу (як і раніше);
+          2. якщо таких немає і `allow_paid_fees` — НАЙДЕШЕВША платна, а її
+             комісія йде у вартість і списується з бюджету.
+
+        ЩО ЛИШАЄТЬСЯ FAIL-CLOSED і чому. Ставка, яку **не вдалось прочитати**
+        (`fee is None` — таймаут, рейт-ліміт), НЕ вважається нулем і НЕ
+        вважається дешевою: ми просто не знаємо, скільки заплатимо, тож не
+        можемо ані порахувати бюджет, ані вирішити. Це не те саме, що «ставка
+        відома і вона ненульова» — саме цю різницю плутати не можна.
+
+        `max_fee_frac` — стеля здорового глузду: платити 50 bps за ногу заради
+        прогріву безглуздо, бюджет вигорить за кілька ордерів.
+
+        Повертає `(symbol, taker_fee_frac)`; `(None, 0.0)`, якщо гріти нічим.
+        """
         pool = list(self.universe)
         self.rng.shuffle(pool)
+        paid: list[tuple[float, str]] = []
+        unknown = 0
         for sym in pool:
             try:
                 fee = await self.fee_gate.fee(sym)
             except Exception as e:
                 logger.warning("futures soft-start: fee lookup %s failed (%s)", sym, e)
+                unknown += 1
                 continue
             if fee is None:
-                continue                       # fail-closed
-            if not fee.zero_maker:
+                unknown += 1
+                continue                       # fail-closed: невідоме ≠ дешеве
+            if fee.zero_both:
+                return sym, 0.0                # безкоштовно — найкращий випадок
+            if not self.cfg.allow_paid_fees:
                 continue
-            if self.cfg.require_zero_taker and not fee.zero_both:
-                logger.debug("skip %s — taker fee %s", sym, fee.taker)
+            # Обидві ноги прогріву — market (type 5), тобто тейкер. Мейкерська
+            # ставка тут не використовується взагалі.
+            if fee.taker > self.cfg.max_fee_frac:
+                logger.debug("skip %s — тейкер %.4f вище стелі %.4f",
+                             sym, fee.taker, self.cfg.max_fee_frac)
                 continue
-            return sym
-        logger.warning("futures soft-start: no 0%%-fee pair available — skipping")
-        return None
+            paid.append((float(fee.taker), sym))
+
+        if paid:
+            paid.sort()
+            fee_frac, sym = paid[0]
+            logger.info("futures soft-start: пар із 0%% немає — гріємо %s за "
+                        "тейкер %.4f (%.1f bps/нога), комісія піде у витрати",
+                        sym, fee_frac, fee_frac * 10000)
+            return sym, fee_frac
+
+        logger.warning("futures soft-start: немає придатної пари "
+                       "(ставку не прочитано у %d із %d) — пропускаю",
+                       unknown, len(pool))
+        return None, 0.0
 
     # ---- contract metadata ----------------------------------------------
 
@@ -363,7 +420,7 @@ class FuturesSoftStart:
         if self.budget is not None and self.budget.exhausted():
             logger.info("futures soft-start: budget exhausted — not opening")
             return False
-        sym = await self.pick_pair()
+        sym, fee_frac = await self.pick_pair()
         if sym is None:
             return False
 
@@ -374,7 +431,7 @@ class FuturesSoftStart:
         # Size from the WALLET, not from a hardcoded 1 contract. Previously
         # `margin_usdt_*` was computed and then ignored while vol was pinned to
         # 1 — the config looked like it controlled size but did not.
-        vol, margin, notional = self._size_position(sym, leverage)
+        vol, margin, notional = self._size_position(sym, leverage, fee_frac)
         if vol is None:
             return False
 
@@ -390,9 +447,14 @@ class FuturesSoftStart:
         # response (timeout, non-JSON body, process killed) is a real position
         # nothing would otherwise know about. Persisting the intent before the
         # send means there is always a symbol to ask the exchange about.
+        # `fee_frac` теж персиститься: якщо відповідь загубилась і позицію
+        # доведеться АДОПТУВАТИ вже після рестарту, ставку заново прочитати
+        # нізвідки, і комісія списалась би як нуль — тобто стеля витрат тихо
+        # брехала б саме на платному акаунті.
         self.state.pending = {"symbol": sym, "side": side, "vol": vol,
                               "leverage": leverage, "hold_min": hold_min,
-                              "notional": notional, "sent_at": time.time()}
+                              "notional": notional, "fee_frac": fee_frac,
+                              "sent_at": time.time()}
         save_state(c.state_path, self.state)
 
         try:
@@ -429,8 +491,12 @@ class FuturesSoftStart:
         # cannot be blown by a position we have already committed to.
         if self.budget is not None:
             from .soft_start_budget import futures_round_trip_cost
-            self.budget.charge(futures_round_trip_cost(notional),
-                               f"futures round-trip {sym}")
+            _fee_cost = 2 * notional * fee_frac
+            self.budget.charge(
+                futures_round_trip_cost(notional, fee_frac=fee_frac),
+                f"futures round-trip {sym}"
+                + (f" (комісія {_fee_cost:.4f} @ {fee_frac*10000:.1f}bps/нога)"
+                   if fee_frac else " (0% комісія)"))
         logger.info("[futures] OPENED %s side=%d lev=%dx vol=%d "
                     "(margin~%.2f, notional~%.2f) — closing in %dmin",
                     sym, side, leverage, vol, margin, notional, hold_min)
@@ -550,8 +616,11 @@ class FuturesSoftStart:
         # it keeps the ceiling honest whichever way the open was learned about.
         if self.budget is not None and pend.get("notional"):
             from .soft_start_budget import futures_round_trip_cost
-            self.budget.charge(futures_round_trip_cost(float(pend["notional"])),
-                               f"futures round-trip {sym} (adopted)")
+            _ff = float(pend.get("fee_frac") or 0.0)
+            self.budget.charge(
+                futures_round_trip_cost(float(pend["notional"]), fee_frac=_ff),
+                f"futures round-trip {sym} (adopted)"
+                + (f" (комісія @ {_ff*10000:.1f}bps/нога)" if _ff else ""))
         logger.error("futures soft-start: %s DID open despite the error — "
                      "adopted and scheduled to close", sym)
         self._schedule_pause()

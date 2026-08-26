@@ -165,17 +165,64 @@ async def test_unknown_fee_pair_is_never_opened(tmp_path, live):
 
 
 @pytest.mark.asyncio
-async def test_zero_maker_but_paid_taker_excluded_by_default(tmp_path, live):
-    """BTC_USDT: maker=0, taker=0.0002. A warm-up gets CLOSED too, so a paid
-    taker is a real cost — excluded unless the operator opts out."""
-    ss, cl, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=False)
+async def test_paid_taker_now_warms_and_is_charged(tmp_path, live):
+    """ПРАВИЛО ЗМІНЕНО 2026-08-26. Раніше `BTC_USDT` (maker=0, taker=0.0002)
+    ВІДКИДАВСЯ, і на акаунті без промо прогрів не йшов узагалі — тобто саме
+    там, де він найпотрібніший.
+
+    Тепер платна пара гріється, а комісія ЛЯГАЄ У ВИТРАТИ. Перевіряємо обидва
+    боки: ордер пішов І бюджет побачив комісію."""
+    from src.execution.soft_start_budget import SoftStartBudget
+    bud = SoftStartBudget(str(tmp_path / "b.json"), max_usdt=50.0)
+    ss, cl, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=False, budget=bud)
+    assert await ss.open_position() is True
+    assert cl.opened, "платна пара мусить грітись, а не блокуватись"
+
+    assert bud.spent > 0, "витрати не списались узагалі"
+    entries = " ".join(str(e) for e in bud.state.entries)
+    assert "bps/нога" in entries, f"комісії не видно у витратах: {entries}"
+
+    # І кількісно: комісія має бути САМЕ 2 ноги × ставку × ноціонал.
+    notional = float(ss.state.position["vol"]) * 0.1 * 40.0   # cs × px із mk()
+    from src.execution.soft_start_budget import futures_round_trip_cost
+    assert abs(bud.spent
+               - futures_round_trip_cost(notional, fee_frac=0.0002)) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_paid_pair_can_still_be_refused_by_config(tmp_path, live):
+    """Стара жорстка поведінка лишається доступною однією змінною."""
+    ss, cl, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=False,
+                   allow_paid_fees=False)
     assert await ss.open_position() is False
     assert cl.opened == []
 
-    ss2, cl2, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=False,
-                     require_zero_taker=False)
-    assert await ss2.open_position() is True
-    assert cl2.opened
+
+@pytest.mark.asyncio
+async def test_zero_fee_pair_is_preferred_over_a_paid_one(tmp_path, live):
+    """0% має вигравати завжди, коли він доступний — платне це запасний шлях."""
+    ss, cl, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002), "HYPEUSDT": (0, 0)},
+                   dry_run=False)
+    sym, fee = await ss.pick_pair()
+    assert sym == "HYPEUSDT" and fee == 0.0
+
+
+@pytest.mark.asyncio
+async def test_the_cheapest_paid_pair_wins(tmp_path, live):
+    ss, _, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0004), "HYPEUSDT": (0, 0.0001)},
+                  dry_run=False)
+    sym, fee = await ss.pick_pair()
+    assert sym == "HYPEUSDT" and fee == 0.0001
+
+
+@pytest.mark.asyncio
+async def test_an_absurdly_expensive_pair_is_still_refused(tmp_path, live):
+    """`max_fee_frac` — стеля здорового глузду: 50 bps/нога вигорить бюджет
+    за кілька ордерів, і прогрів перестане бути прогрівом."""
+    ss, cl, _ = mk(tmp_path, {"BTCUSDT": (0, 0.005)}, dry_run=False)
+    sym, _ = await ss.pick_pair()
+    assert sym is None
+    assert await ss.open_position() is False
 
 
 @pytest.mark.asyncio
@@ -479,3 +526,107 @@ def test_state_is_written_atomically(tmp_path):
     save_state(path, FuturesState(date="2026-08-21", orders_target=3))
     assert load_state(path).orders_target == 3
     assert not list(tmp_path.glob("*.tmp")), "no temp file left behind"
+
+
+# ---- комісія у моделі витрат (зміна 2026-08-26) ---------------------------
+
+def test_round_trip_cost_charges_both_legs_of_the_fee():
+    """Позицію прогріву і відкривають, і закривають — обидві ноги market,
+    тобто тейкерські. Одна нога в моделі занизила б витрати вдвічі."""
+    from src.execution.soft_start_budget import futures_round_trip_cost
+    free = futures_round_trip_cost(1000.0, fee_frac=0.0)
+    paid = futures_round_trip_cost(1000.0, fee_frac=0.0002)
+    assert abs((paid - free) - 2 * 1000.0 * 0.0002) < 1e-9
+
+
+def test_zero_fee_costs_exactly_what_it_did_before():
+    """Акаунт із промо не має подорожчати від цієї зміни ані на цент."""
+    from src.execution.soft_start_budget import futures_round_trip_cost
+    assert (futures_round_trip_cost(1000.0)
+            == futures_round_trip_cost(1000.0, fee_frac=0.0))
+
+
+def test_spot_order_cost_adds_the_fee_to_the_crossing():
+    from src.execution.soft_start_budget import spot_order_cost
+    assert abs(spot_order_cost(100.0, 0.002, 0.0005) - (0.2 + 0.05)) < 1e-9
+    # Нуль комісії = стара поведінка.
+    assert spot_order_cost(100.0, 0.002) == spot_order_cost(100.0, 0.002, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_fee_is_never_treated_as_cheap(tmp_path, live):
+    """НЕВІДОМА ставка ≠ безкоштовна і ≠ дешева.
+
+    Це не те саме, що «ставка відома і ненульова»: без числа не порахувати
+    бюджет. Гілка лишається fail-closed навіть після того, як платні пари
+    дозволили."""
+    ss, cl, _ = mk(tmp_path, {"BTCUSDT": None}, dry_run=False)
+    sym, fee = await ss.pick_pair()
+    assert sym is None and fee == 0.0
+    assert await ss.open_position() is False
+    assert cl.opened == []
+
+
+@pytest.mark.asyncio
+async def test_fee_survives_a_restart_before_adoption(tmp_path, live):
+    """Якщо відповідь загубилась і позицію адоптують уже після рестарту,
+    ставку заново прочитати нізвідки — тому вона персиститься в `pending`.
+    Без цього комісія списалась би як НУЛЬ саме на платному акаунті."""
+    import src.execution.futures_soft_start as fss
+
+    seen = []
+    orig = fss.save_state
+
+    def _spy(path, state):
+        if getattr(state, "pending", None):
+            seen.append(dict(state.pending))
+        return orig(path, state)
+
+    ss, cl, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=False)
+    monkey = fss.save_state
+    fss.save_state = _spy
+    try:
+        assert await ss.open_position() is True
+    finally:
+        fss.save_state = monkey
+
+    assert seen, "pending не персистився ПЕРЕД відправкою"
+    assert seen[0].get("fee_frac") == 0.0002, (
+        f"ставка не збережена в pending: {seen[0]} — після рестарту адопція "
+        f"спише комісію як НУЛЬ саме на платному акаунті")
+
+
+@pytest.mark.asyncio
+async def test_the_budget_gate_prices_the_fee_too(tmp_path, live):
+    """Стеля перевіряється ДО відправки — і мусить бачити комісію.
+
+    Мутант, що прибрав `fee_frac` саме з `can_afford` (а не з списання),
+    проходив зеленим: ордер, який пробиває стелю, усе одно йшов, а стеля
+    дізнавалась про це заднім числом. Тест ставить бюджет РІВНО між
+    безкоштовною і платною вартістю.
+    """
+    from src.execution.soft_start_budget import (SoftStartBudget,
+                                                 futures_round_trip_cost)
+    # Ноціонал беремо з самого сайзера, а не з відкритої позиції: у dry-run
+    # позиція не персиститься, тож `state.position` там None.
+    probe, _, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=True)
+    _v, _m, notional = probe._size_position("BTCUSDT", 10, 0.0002)
+    assert notional and notional > 0
+
+    free = futures_round_trip_cost(notional, fee_frac=0.0)
+    paid = futures_round_trip_cost(notional, fee_frac=0.0002)
+    assert paid > free, "фікстура безглузда — комісія нічого не змінює"
+
+    # Стеля вміщає безкоштовний round-trip, але НЕ платний.
+    ceiling = (free + paid) / 2
+    bud = SoftStartBudget(str(tmp_path / "tight.json"), max_usdt=ceiling)
+    ss, cl, _ = mk(tmp_path, {"BTCUSDT": (0, 0.0002)}, dry_run=False, budget=bud)
+    assert await ss.open_position() is False, \
+        "гейт не побачив комісію — ордер пробив стелю витрат"
+    assert cl.opened == []
+
+    # Контроль: та сама стеля з БЕЗКОШТОВНОЮ парою пропускає.
+    bud2 = SoftStartBudget(str(tmp_path / "tight2.json"), max_usdt=ceiling)
+    ss2, cl2, _ = mk(tmp_path, {"HYPEUSDT": (0, 0)}, dry_run=False, budget=bud2)
+    assert await ss2.open_position() is True
+    assert cl2.opened
