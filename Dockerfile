@@ -27,6 +27,10 @@ COPY src/ ./src/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
 COPY tests/ ./tests/
+# checks/ — аналітичні читачки (twin_curve.py тощо). Без них
+# задокументована команда `docker compose exec -T stakan-bot python
+# /app/checks/twin_curve.py` не працює взагалі: тека в образ не їхала.
+COPY checks/ ./checks/
 
 # Non-root user
 RUN useradd -m -u 1000 stakan && chown -R stakan:stakan /app

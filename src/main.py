@@ -304,31 +304,57 @@ async def dolos_config_refresh_loop(webkey_store, interval_sec: int = 21600) -> 
     """
     from src.execution.webkey import dolos_config as _dcfg
     _no_key_warned = False
+    _fail = 0
     while True:
         try:
             visitor = None
+            visitor_slot = None
             for s in await webkey_store.list_all():
                 v = getattr(s, "visitor_id", None)
                 if v:
                     visitor = v
+                    # Номер слота потрібен, щоб забір ішов ПІД ТИМ САМИМ
+                    # пристроєм, що й ордери цього ж mtoken. Інакше один
+                    # акаунт світить дві ідентичності з однієї IP.
+                    visitor_slot = getattr(s, "slot_id", None)
                     break
             if visitor:
-                cfg = await asyncio.to_thread(_dcfg.fetch_sync, visitor)
-                if not _dcfg.CACHE.apply(cfg):
+                cfg = await asyncio.to_thread(_dcfg.fetch_sync, visitor, 8.0,
+                                              visitor_slot)
+                if _dcfg.CACHE.apply(cfg):
+                    _fail = 0
+                else:
+                    # Невдалий забір АБО відхилений конфіг — обидва означають
+                    # «нового значення немає», тож обидва мають ретраїтись.
+                    _fail += 1
                     logger.warning("[DOLOS CFG] оновити не вдалось — працюємо "
                                    "на попередньому конфізі")
-            elif not _no_key_warned:
-                # ОДИН РАЗ на рівні INFO, не DEBUG. На клоні це вилізло одразу:
-                # ключів немає, забір мовчки пропускався, і «конфіг не тягнеться»
-                # виглядало так само, як «задача мертва». Повторювати щошість
-                # годин не треба — стан не змінюється сам.
-                _no_key_warned = True
-                logger.info("[DOLOS CFG] жодного слота з вебкеєм — забір "
-                            "пропущено, працюємо на знімку (це нормально для "
-                            "бота без ключів)")
+            else:
+                # Немає ключів — це не збій, ретраїти нема сенсу.
+                _fail = 0
+                if not _no_key_warned:
+                    # ОДИН РАЗ на рівні INFO, не DEBUG. На клоні це вилізло
+                    # одразу: ключів немає, забір мовчки пропускався, і «конфіг
+                    # не тягнеться» виглядало так само, як «задача мертва».
+                    # Повторювати щошість годин не треба — стан не змінюється сам.
+                    _no_key_warned = True
+                    logger.info("[DOLOS CFG] жодного слота з вебкеєм — забір "
+                                "пропущено, працюємо на знімку (це нормально "
+                                "для бота без ключів)")
         except Exception:
             logger.exception("[DOLOS CFG] цикл оновлення впав")
-        await asyncio.sleep(interval_sec)
+            _fail += 1
+        # БЕКОФ. Було: провал коштує повних 6 годин до наступної спроби, і
+        # перша спроба припадає на старт контейнера — тобто ребілд у момент
+        # блимання мережі залишав нас на знімку до вечора. Тепер невдача
+        # переспитує через 1/2/4/8… хвилин, зі стелею у звичайний інтервал.
+        if _fail:
+            delay = min(float(interval_sec), 60.0 * (2 ** min(_fail - 1, 6)))
+            logger.info("[DOLOS CFG] повтор через %.0fс (невдач поспіль: %d)",
+                        delay, _fail)
+        else:
+            delay = float(interval_sec)
+        await asyncio.sleep(delay)
 
 
 async def slot_balance_refresh_loop(webkey_store, webkey_client_pool, interval_sec: int = 60) -> None:
@@ -931,11 +957,24 @@ async def main() -> None:
     try:
         from src.execution.webkey import client as _wc
         from src.execution.webkey import device_profile as _dpf
-        logger.info("[PATH MODE] %s — dolos на /order/create: %s | зсув профілів: %d%s",
+        logger.info("[PATH MODE] %s — dolos на /order/create: %s | зсув профілів: %d",
                     _wc._PATH_MODE, "ТАК" if _wc._DOLOS_ON_ORDER else "ні",
-                    _dpf.machine_offset(),
-                    "" if _dpf.seed_is_explicit() or os.environ.get("MEXC_DEVICE_OFFSET")
-                    else "  ⚠️ MEXC_DEVICE_OFFSET не задано — профілі можуть збігтись з іншим ботом")
+                    _dpf.machine_offset())
+        # КОНʼЮНКЦІЯ, не диз'юнкція. Було `seed_is_explicit() OR offset заданий`,
+        # а посів заданий у compose обох машин — тож гілка була МЕРТВА і
+        # попередження не спрацювало б ніколи. Захищає САМЕ зсув: обидва наші
+        # справжні посіви дають `sha256%6 = 5`, тобто запасний шлях розрізняє
+        # машини лише випадково. Без явного зсуву два боти = один пристрій.
+        if not _dpf.offset_is_explicit():
+            logger.warning(
+                "⚠️ [DEVICE] MEXC_DEVICE_OFFSET не заданий (або не число) — "
+                "зсув %d узятий із посіву, а він НЕ гарантує розрізнення машин: "
+                "обидва наші справжні посіви дають той самий зсув. Задай явне "
+                "число в docker-compose.yml, різне на кожному боті.",
+                _dpf.machine_offset())
+        if _wc._CHROME_VER_ENV:
+            logger.info("[DEVICE] MEXC_CHROME_VER=%s перебиває версію профілю "
+                        "(ОС профілю лишається)", _wc._CHROME_VER_ENV)
     except Exception:
         logger.exception("[PATH MODE] не вдалось надрукувати режим")
 

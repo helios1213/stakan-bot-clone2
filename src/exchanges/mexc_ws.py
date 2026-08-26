@@ -195,12 +195,19 @@ class MexcWSClient:
     async def _connect_once(self) -> None:
         url = self.cfg.ws_base
         logger.info("Connecting MEXC WS: %d symbols", len(self._symbols_mexc))
+        # Той самий helper, що й у приватного каналу. Публічний фід іде на ТОЙ
+        # САМИЙ хост contract.mexc.com цілодобово, тож лишити тут
+        # `User-Agent: Python/3.11 websockets/13.1` означало б знецінити фікс
+        # приватного каналу: два зʼєднання з однієї IP, одне «браузерне», друге
+        # ні, — це гірше, ніж два однакових.
+        from src.exchanges.mexc_private_ws import _ws_header_kwargs
         async with websockets.connect(
             url,
             ping_interval=None,    # MEXC has its own ping
             close_timeout=5,
             max_size=10 * 1024 * 1024,
             compression=None,  # disable permessage-deflate: cuts decode CPU on hot WS path; data identical, +bandwidth (fine on VPS)
+            **_ws_header_kwargs(None),
         ) as ws:
             self._ws = ws
             # On (re)connect — reset state

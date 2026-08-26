@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import time
+from src.env_config import env_int
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,8 @@ LEGACY_PARAMETERS = [
     "mtoken", "ts", "symbol", "side", "openType", "type", "vol", "leverage",
 ]
 
-_ORDER_SCENE = int(os.environ.get("MEXC_DOLOS_SCENE", "28"))
+# Одруживка тут раніше клала бота НА ІМПОРТІ — до торгівлі справа не доходила.
+_ORDER_SCENE = env_int("MEXC_DOLOS_SCENE", 28)
 
 
 def _decrypt(blob_b64: str) -> str:
@@ -77,25 +79,63 @@ def _decrypt(blob_b64: str) -> str:
     return AESGCM(_CONFIG_KEY).decrypt(raw[:12], raw[12:], None).decode()
 
 
-def fetch_sync(visitor_id: str, timeout: float = 8.0) -> dict | None:
+def fetch_sync(visitor_id: str, timeout: float = 8.0,
+               slot_id: int | None = None) -> dict | None:
     """Забрати і розшифрувати конфіг. Блокуюча — викликати ТІЛЬКИ у потоці.
 
     Повертає {'chash': ..., 'parameters': [...], 'data_upload': 1} або None.
+
+    ВІДБИТОК МУСИТЬ ЗБІГАТИСЬ ІЗ ОРДЕРНИМ ШЛЯХОМ ТОГО САМОГО СЛОТА. Тут іде
+    `mtoken` — той самий `visitor_id`, яким підписуються ордери. До 2026-08-26
+    запит ішов з дефолтами curl_cffi (`Chrome/146 Macintosh`), тоді як ордер
+    того ж слота міг іти з `Windows NT 10.0` і `sys='Windows'` у p0. Один
+    акаунт, одна IP, один mtoken — і ДВІ різні ідентичності. Це рівно та
+    неузгодженість, заради усунення якої писався `device_profile`.
+
+    І ЩЕ ОДНЕ: заголовки були НАВІГАЦІЙНІ (`Sec-Fetch-Dest: document`,
+    `Upgrade-Insecure-Requests`), хоча це XHR по JSON. Браузер такого не шле.
     """
     try:
         from curl_cffi import requests as curl_requests
+        from . import device_profile
+        try:
+            prof = (device_profile.for_slot(slot_id) if slot_id is not None
+                    else device_profile.for_slot(None))
+        except Exception:
+            logger.warning("[DOLOS CFG] профіль пристрою не побудовано",
+                           exc_info=True)
+            prof = None
         mhash = hashlib.md5(visitor_id.encode("utf-8")).hexdigest()
         body = {
             "ts": int(time.time() * 1000), "type": 0, "platform_type": 3,
             "product_type": 0, "scene": 0, "app_v": "", "sdk_v": _SDK_V,
             "mtoken": visitor_id,
         }
-        s = curl_requests.Session(impersonate="chrome146")
+        headers = {
+            "origin": "https://www.mexc.com",
+            "content-type": "application/json",
+            "referer": "https://www.mexc.com/futures/BTC_USDT",
+            "accept": "*/*",
+            # XHR, не навігація. curl_cffi за замовчуванням підставляє
+            # навігаційний набір, і JSON-запит із `Sec-Fetch-Dest: document`
+            # видно без будь-якого аналізу трафіку.
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        }
+        impersonate = "chrome146"
+        if prof is not None:
+            impersonate = prof.impersonate
+            headers["user-agent"] = prof.user_agent
+            headers["accept-language"] = prof.accept_language
+            if prof.sec_ch_ua:
+                headers["sec-ch-ua"] = prof.sec_ch_ua
+                headers["sec-ch-ua-mobile"] = "?0"
+                headers["sec-ch-ua-platform"] = prof.sec_ch_ua_platform
+        s = curl_requests.Session(impersonate=impersonate)
         try:
             r = s.post(f"{_CONFIG_URL}?mhash={mhash}", json=body, timeout=timeout,
-                       headers={"origin": "https://www.mexc.com",
-                                "content-type": "application/json",
-                                "referer": "https://www.mexc.com/futures/BTC_USDT"})
+                       headers=headers)
             payload = r.json()
         finally:
             s.close()
@@ -150,15 +190,49 @@ class DolosConfigCache:
         return (time.time() - self._fetched_at) if self._fetched_at else -1.0
 
     def apply(self, cfg: dict | None) -> bool:
-        """Прийняти новий конфіг. Порожній/битий — мовчки ігнорується."""
-        if not cfg or not cfg.get("chash") or not cfg.get("parameters"):
+        """Прийняти новий конфіг. Порожній/битий — відхиляється ЦІЛКОМ.
+
+        ВАЛІДАЦІЯ ТИПІВ, а не лише наявності. Сервер віддає JSON, тобто
+        `parameters` цілком може приїхати списком словників або з `null`
+        усередині; `chash` — числом. Такі значення проходили перевірку
+        «не порожнє» і лягали в кеш, а падали вже в `sign_dolos` — тобто на
+        ГАРЯЧОМУ шляху ордера, де єдиний наслідок це «шлемо без dolos».
+        Це і був єдиний реальний тригер голого `close_all`.
+
+        Присвоєння ОДНИМ БЛОКОМ у кінці: часткове оновлення отруювало б кеш —
+        новий chash зі старими полями не відповідає жодній серверній сцені.
+        """
+        if not cfg:
             return False
-        changed = (cfg["chash"] != self._chash
-                   or list(cfg["parameters"]) != self._parameters)
+        chash = cfg.get("chash")
+        params = cfg.get("parameters")
+        if not isinstance(chash, str) or not chash.strip():
+            logger.warning("[DOLOS CFG] відхилено: chash не рядок (%r)",
+                           type(chash).__name__)
+            return False
+        if not isinstance(params, (list, tuple)) or not params:
+            logger.warning("[DOLOS CFG] відхилено: parameters не список (%r)",
+                           type(params).__name__)
+            return False
+        if not all(isinstance(x, str) and x for x in params):
+            logger.warning(
+                "[DOLOS CFG] відхилено: серед parameters є не-рядки — %r",
+                [type(x).__name__ for x in params if not isinstance(x, str)][:5])
+            return False
+        try:
+            data_upload = int(cfg.get("data_upload", 1))
+        except (TypeError, ValueError):
+            logger.warning("[DOLOS CFG] відхилено: data_upload не число (%r)",
+                           cfg.get("data_upload"))
+            return False
+
+        new_params = [str(x) for x in params]
+        changed = (chash != self._chash or new_params != self._parameters)
         was_from_server = self._from_server
-        self._chash = cfg["chash"]
-        self._parameters = list(cfg["parameters"])
-        self._data_upload = int(cfg.get("data_upload", 1))
+        # --- від цього рядка присвоєння атомарне: до нього жодного запису ---
+        self._chash = chash
+        self._parameters = new_params
+        self._data_upload = data_upload
         self._fetched_at = time.time()
         self._from_server = True
         if changed:

@@ -193,36 +193,39 @@ def test_all_four_production_accounts_are_distinct_devices():
     assert len(set(got)) == 4, f"пристрої повторюються: {got}"
 
 
-def test_offset_beats_the_seed():
+# monkeypatch, а не пряма мутація `os.environ`. Три тести нижче колись
+# БЕЗУМОВНО робили `os.environ.pop(...)` у `finally` — тобто прогін у робочому
+# контейнері лишав процес БЕЗ `MEXC_DEVICE_SEED` і `MEXC_DEVICE_OFFSET`, хоч
+# вони там задані. Наступний тест у тому ж прогоні бачив уже інший світ.
+# monkeypatch відновлює ПОПЕРЕДНЄ значення, а не видаляє його.
+
+def test_offset_beats_the_seed(monkeypatch):
     """Хеш посіву — везіння; явний зсув — гарантія. Зсув має перемагати."""
-    import os
-    os.environ["MEXC_DEVICE_SEED"] = "будь-що"
-    os.environ["MEXC_DEVICE_OFFSET"] = "3"
-    try:
-        assert dp.machine_offset() == 3
-    finally:
-        os.environ.pop("MEXC_DEVICE_SEED", None)
-        os.environ.pop("MEXC_DEVICE_OFFSET", None)
+    monkeypatch.setenv("MEXC_DEVICE_SEED", "будь-що")
+    monkeypatch.setenv("MEXC_DEVICE_OFFSET", "3")
+    assert dp.machine_offset() == 3
 
 
-def test_broken_offset_does_not_crash():
-    import os
-    os.environ["MEXC_DEVICE_OFFSET"] = "не-число"
-    try:
-        assert 0 <= dp.machine_offset() < dp.profile_count()
-    finally:
-        os.environ.pop("MEXC_DEVICE_OFFSET", None)
+def test_broken_offset_does_not_crash(monkeypatch):
+    monkeypatch.setenv("MEXC_DEVICE_OFFSET", "не-число")
+    assert 0 <= dp.machine_offset() < dp.profile_count()
 
 
-def test_missing_seed_is_detectable():
+def test_broken_offset_is_not_silently_explicit(monkeypatch):
+    """Одруживка в compose провалюється у запасний шлях — і має бути видно.
+
+    `offset_is_explicit()` каже False саме тому, що попередження в main.py
+    мусить спрацювати: інакше оператор думає, що захист від збігу профілів
+    стоїть, а він мовчки зник.
+    """
+    monkeypatch.setenv("MEXC_DEVICE_OFFSET", "не-число")
+    assert dp.offset_is_explicit() is False
+
+
+def test_missing_seed_is_detectable(monkeypatch):
     """Мовчазний дефолт означав би однакові пристрої на двох ботах."""
-    import os
-    had = os.environ.pop("MEXC_DEVICE_SEED", None)
-    try:
-        assert dp.seed_is_explicit() is False
-    finally:
-        if had is not None:
-            os.environ["MEXC_DEVICE_SEED"] = had
+    monkeypatch.delenv("MEXC_DEVICE_SEED", raising=False)
+    assert dp.seed_is_explicit() is False
 
 
 def test_seed_comes_from_env(monkeypatch):
@@ -233,3 +236,114 @@ def test_seed_comes_from_env(monkeypatch):
 
 def test_profile_is_stable_across_restarts_for_a_slot():
     assert dp.for_slot(2, seed="s") == dp.for_slot(2, seed="s")
+
+
+# ---------------------------------------------------------------------------
+# MEXC_CHROME_VER мусить ПЕРЕБИВАТИ профіль (аудит 2026-08-26)
+# ---------------------------------------------------------------------------
+
+def test_chrome_version_override_keeps_the_profile_os():
+    """Примусова версія не має міняти ОС — інакше ми створюємо розсинхрон.
+
+    Важіль був МЕРТВИЙ: при увімкнених профілях (дефолт) усі чотири поля
+    бралися з профілю, бо умова `impersonate == _CHROME_IMPERSONATE`
+    лишалась істинною і з env, і без нього.
+    """
+    base = dp.for_slot(1, offset=1)          # якийсь конкретний профіль
+    forced = base.with_chrome_version("133a")
+    assert forced.impersonate == "chrome133a"
+    assert "Chrome/133a" in forced.user_agent
+    assert '"Google Chrome";v="133a"' in forced.sec_ch_ua
+    # ОС і все, що з неї випливає, лишається профільним:
+    assert forced.sec_ch_ua_platform == base.sec_ch_ua_platform
+    assert (forced.sys, forced.sys_ver) == (base.sys, base.sys_ver)
+
+
+def test_chrome_version_override_stays_coherent_across_all_sources():
+    """Та сама вимога, що й до звичайного профілю: TLS ↔ UA ↔ sec-ch-ua."""
+    import re
+    forced = dp.for_slot(0, offset=0).with_chrome_version(142)
+    v = forced.impersonate.removeprefix("chrome")
+    assert re.search(rf"Chrome/{v}\.", forced.user_agent)
+    assert f'"Google Chrome";v="{v}"' in forced.sec_ch_ua
+    assert f'"Chromium";v="{v}"' in forced.sec_ch_ua
+
+
+def test_spot_client_takes_the_same_device_as_the_slot():
+    """Спот і фʼючерси ходять під ОДНИМ акаунтом з ОДНІЄЇ IP.
+
+    До 2026-08-26 спот хардкодив `Chrome/151` при `impersonate="chrome"`
+    (цілі 151 у curl_cffi НЕМАЄ) і не слав `sec-ch-ua` взагалі.
+    """
+    from src.execution.webkey.spot_client import SpotWebClient
+    c = SpotWebClient("dummy-key", slot_id=2)
+    prof = dp.for_slot(2)
+    assert c._profile.user_agent == prof.user_agent
+    h = c._headers()
+    assert h["user-agent"] == prof.user_agent
+    assert h["sec-ch-ua"] == prof.sec_ch_ua
+    assert h["sec-ch-ua-platform"] == prof.sec_ch_ua_platform
+    assert "151" not in h["user-agent"], "хардкод Chrome/151 повернувся"
+
+
+def test_ws_handshake_is_not_a_python_client():
+    """`User-Agent: Python/3.11 websockets/13.1` вʼяже акаунт із неброузерним
+    клієнтом напряму — і на ПРИВАТНОМУ каналі, який шле вебкей."""
+    from src.exchanges.mexc_private_ws import _ws_headers
+    h = _ws_headers(1)
+    assert h and "Python" not in h["User-Agent"]
+    assert h["User-Agent"] == dp.for_slot(1).user_agent
+
+
+def test_trochilus_uid_is_per_slot(monkeypatch):
+    """uid різний НА КОЖЕН АКАУНТ, тобто на слот. Одна глобальна змінна
+    відправляла б чужий uid із сусіднього акаунта."""
+    from src.execution.webkey import client as cl
+    monkeypatch.setenv("MEXC_TROCHILUS_UID", "111")
+    monkeypatch.setenv("MEXC_TROCHILUS_UID_SLOT2", "222")
+    assert cl._trochilus_uid(2) == "222"
+    assert cl._trochilus_uid(1) == "111", "запасна глобальна перестала діяти"
+    monkeypatch.delenv("MEXC_TROCHILUS_UID")
+    assert cl._trochilus_uid(1) == "", "порожньо = заголовок не шлеться зовсім"
+
+
+def test_no_hardcoded_browser_version_anywhere_in_src():
+    """ЗАПОБІЖНИК ВІД ПОВЕРНЕННЯ. Хардкод версії браузера — це розсинхрон, що
+    чекає нагоди: TLS іде з curl_cffi, UA з константи, і вони розходяться
+    мовчки. `Chrome/151` як TLS-ціль НЕ ІСНУЄ взагалі, а UA з ним ішов у
+    чотирьох файлах, включно з тими, що ходять із вебкеєм.
+
+    Шукаємо `Chrome/<число>` у РЯДКОВИХ ЛІТЕРАЛАХ, не в коментарях: пояснення
+    в коментарі — це історія, а не поведінка.
+    """
+    import ast
+    import pathlib
+
+    bad = []
+    root = pathlib.Path(__file__).resolve().parent.parent / "src"
+    pat = re.compile(r"Chrome/\d")
+    for f in root.rglob("*.py"):
+        try:
+            tree = ast.parse(f.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        # Докстрінги — це ПОЯСНЕННЯ (зокрема історія цього самого дефекту),
+        # а не значення, що йде на дріт. Збираємо їх, щоб не ловити себе ж.
+        docs = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+                body = getattr(node, "body", None)
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    docs.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docs and pat.search(node.value)):
+                bad.append(f"{f.relative_to(root)}:{node.lineno}")
+    # device_profile сам будує UA — там літерал є за визначенням.
+    bad = [b for b in bad if not b.startswith("execution/webkey/device_profile.py")]
+    assert not bad, (
+        "версію браузера прибито в рядку — бери її з device_profile: "
+        + ", ".join(bad))

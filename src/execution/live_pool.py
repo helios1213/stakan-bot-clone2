@@ -326,7 +326,19 @@ class LiveExecutorPool:
                     await self.live_db.execute(
                         "DELETE FROM live_state WHERE key = ?", (req_key,))
 
-                # 2. Дзеркало поточного стану.
+                # 2. Природне протермінування кіла теж має пережити рестарт.
+                #    Контролер лише ставить прапорець (БД він не бачить) —
+                #    зберігаємо тут і одразу скидаємо, щоб не писати щоцикла.
+                if ctl is not None and getattr(
+                        ctl.state, "kill_auto_released", False):
+                    await self.persist_kill_release(sid)
+                    ctl.state.kill_auto_released = False
+                    logger.info(
+                        "[KILL RESET] slot %d: кіл протермінувався сам — "
+                        "перебазування піку збережено, ребілд його не скасує",
+                        sid)
+
+                # 3. Дзеркало поточного стану.
                 st_key = self._kill_state_key(sid)
                 if ctl is not None and ctl.is_killed():
                     reason = getattr(ctl.state, "kill_reason", "") or "peak drawdown"

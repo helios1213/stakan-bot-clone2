@@ -79,7 +79,11 @@ class SlotWarmer:
         # Warming is a finite 3-day job, not a permanent mode.
         self.campaign = SoftStartCampaign(
             f"{data_dir}/soft_start_campaign_slot{slot_id}.json", campaign_days)
-        self.spot_client = SpotWebClient(webkey, dry_run=dry_run)
+        # slot_id -> той самий профіль пристрою, що й на фʼючерсному шляху
+        # цього слота. Без нього спот ходив під ІНШИМ відбитком з тієї ж
+        # IP і того ж акаунта.
+        self.spot_client = SpotWebClient(webkey, dry_run=dry_run,
+                                         slot_id=slot_id)
         self.spot: SpotSoftStart | None = None
         self.futures: FuturesSoftStart | None = None
         # Live status message in Telegram. None disables reporting entirely —
@@ -90,7 +94,15 @@ class SlotWarmer:
     async def _read_balances(self) -> tuple[float, float]:
         """(spot_usdt, futures_usdt). A read failure returns 0.0, and 0.0 means
         'too small to warm' downstream — failing closed rather than guessing a
-        balance and sizing orders off a fiction."""
+        balance and sizing orders off a fiction.
+
+        СВІДОМО НЕ ГЕЙТИТЬСЯ `dry_run`. Так, натискання 🌱 одразу шле
+        автентифікований GET — але це ЧИТАННЯ балансу, воно нічого не рухає, і
+        без нього дай-ран сайзив би ордери з вигаданого числа, тобто перестав
+        би бути репетицією. Аудит 2026-08-26 підняв цей шлях справедливо, але
+        проблемою був ВІДБИТОК (спот ходив під `Chrome/151` при TLS 146 і без
+        `sec-ch-ua`), а не сам факт запиту. Відбиток полагоджено — спот тепер
+        бере профіль того ж слота, що й фʼючерси."""
         spot = fut = 0.0
         try:
             bals = await self.spot_client.balances([USDT_CURRENCY_ID])

@@ -71,7 +71,13 @@ class MexcServerError(MexcClientError):
 # 146, бо це найновіша ціль, яку знає curl_cffi (реальний браузер оператора —
 # 147, знімок 2026-08-26). Рівність не потрібна, потрібна УЗГОДЖЕНІСТЬ трьох
 # джерел і близькість до реального; 136 відставав на 11 версій.
-_CHROME_VER = os.environ.get("MEXC_CHROME_VER", "146").strip() or "146"
+# Порожньо = «не задано»: важіль має ПЕРЕБИВАТИ профіль пристрою, тож треба
+# відрізняти явний вибір оператора від дефолту. Раніше цієї різниці не було —
+# і при увімкнених профілях (а це дефолт) змінна не діяла ЗОВСІМ: усі чотири
+# поля брались із профілю, бо умова `impersonate == _CHROME_IMPERSONATE`
+# лишалась істинною хоч із env, хоч без.
+_CHROME_VER_ENV = os.environ.get("MEXC_CHROME_VER", "").strip()
+_CHROME_VER = _CHROME_VER_ENV or "146"
 _CHROME_IMPERSONATE = f"chrome{_CHROME_VER}"
 _DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -165,9 +171,30 @@ logger.info("[PATH MODE] %s — dolos на /order/create: %s",
 # але константа "0" — це найдешевший можливий маркер «це не браузер».
 # Тепер: якщо MEXC_TROCHILUS_UID не заданий, заголовок НЕ надсилається зовсім.
 # Відсутній заголовок — слабший сигнал, ніж явно синтетичне значення.
-# Значення НЕ секрет (це публічний id акаунта), але воно РІЗНЕ на двох ботах,
-# тому живе в env кожного, а не в коді.
+# Значення НЕ секрет (це публічний id акаунта), але воно РІЗНЕ НА КОЖЕН
+# АКАУНТ, тобто на кожен СЛОТ — а слотів на боті до чотирьох. Одна глобальна
+# змінна відправляла б чужий uid із сусіднього акаунта, що гірше за жодного.
+# Тому: спершу `MEXC_TROCHILUS_UID_SLOT<N>`, потім глобальна як запасна
+# (вона доречна лише на боті з одним слотом).
+# Знімок на імпорті лишається для сумісності (його читають тести відкату), але
+# ДЖЕРЕЛОМ ІСТИНИ він не є.
 _TROCHILUS_UID = os.environ.get("MEXC_TROCHILUS_UID", "").strip()
+
+
+def _trochilus_uid(slot_id: int | None) -> str:
+    """uid для цього слота. Читає env ПІД ЧАС ВИКЛИКУ, а не на імпорті.
+
+    Інакше вийшов би розсинхрон: по-слотне значення динамічне, а глобальне
+    застигле на момент імпорту — і два шляхи в одній функції поводились би
+    по-різному. Динамічне читання ще й прибирає потребу в `importlib.reload`
+    для перевірки, а reload у цьому репо вже ламав ідентичність класів
+    винятків і клав 7 тестів.
+    """
+    if slot_id is not None:
+        v = os.environ.get(f"MEXC_TROCHILUS_UID_SLOT{slot_id}", "").strip()
+        if v:
+            return v
+    return os.environ.get("MEXC_TROCHILUS_UID", "").strip()
 
 
 # Повна емуляція dolos: класти в p0 САМЕ ті поля, яких вимагає серверна сцена
@@ -291,6 +318,16 @@ class MexcWebClient:
                                  else device_profile.for_visitor(visitor_id))
             except Exception:
                 logger.warning("[DEVICE] профіль не побудовано", exc_info=True)
+        if self._profile is not None and _CHROME_VER_ENV:
+            # Оператор явно попросив версію -> вона перебиває профіль, але ОС
+            # профілю лишається. Перезбираємо профіль ЦІЛКОМ, бо TLS, UA і
+            # sec-ch-ua мусять рухатись разом: примусити лише TLS означало б
+            # створити рівно той розсинхрон, проти якого весь цей код.
+            try:
+                self._profile = self._profile.with_chrome_version(_CHROME_VER)
+            except Exception:
+                logger.warning("[DEVICE] MEXC_CHROME_VER=%s не застосовано",
+                               _CHROME_VER, exc_info=True)
         if self._profile is not None:
             # Явно передані аргументи мають пріоритет: тести й ручні проби
             # задають їх свідомо.
@@ -400,7 +437,7 @@ class MexcWebClient:
         host = self.BASE_URL.split("//", 1)[-1]
         return {
             "hostname": host,
-            "member_id": _TROCHILUS_UID,
+            "member_id": _trochilus_uid(self.slot_id),
             "platform_type": 3,
             "product_type": 0,
             "request_id": _new_request_id(),
@@ -464,8 +501,9 @@ class MexcWebClient:
             "user-agent": self.user_agent,
             "x-language": "en-US",
         }
-        if _TROCHILUS_UID:
-            h["trochilus-uid"] = _TROCHILUS_UID
+        _uid = _trochilus_uid(self.slot_id)
+        if _uid:
+            h["trochilus-uid"] = _uid
         if with_layer2_sign:
             h.update(with_layer2_sign)
         return h
@@ -524,9 +562,24 @@ class MexcWebClient:
                 sep = "&" if "?" in url else "?"
                 url += f"{sep}mhash={dolos_sig['mhash']}"
             except Exception:
-                logger.error(
-                    "[DOLOS] %s: підпис не зібрано — ордер іде БЕЗ dolos", endpoint,
-                    exc_info=True)
+                # Рівень залежить від ЕНДПОІНТА, а не від типу винятку.
+                # На /order/create деградація доведено безпечна (абляція
+                # 2026-08-12: біржа приймає плоске тіло, 12 476 ордерів).
+                # А от /position/close_all слав dolos БЕЗПЕРЕРВНО весь час
+                # існування бота — там абляції НЕ БУЛО, тобто ми вперше
+                # спробували б голий вихід саме в момент аварійного закриття.
+                # Тихо змішувати ці два випадки в один ERROR не можна.
+                if "close_all" in endpoint:
+                    logger.critical(
+                        "🚨 [DOLOS] %s: підпис не зібрано — АВАРІЙНЕ ЗАКРИТТЯ "
+                        "піде БЕЗ dolos. Цей шлях ніколи не перевірявся голим. "
+                        "Якщо закриття не пройде — запасний шлях це "
+                        "market_close_position (/order/create type=5), він у "
+                        "bare і так іде без dolos.", endpoint, exc_info=True)
+                else:
+                    logger.error(
+                        "[DOLOS] %s: підпис не зібрано — ордер іде БЕЗ dolos",
+                        endpoint, exc_info=True)
                 full_body = body
         t2 = time.perf_counter_ns()
 

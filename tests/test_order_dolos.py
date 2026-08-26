@@ -118,17 +118,73 @@ def test_flag_env_override(monkeypatch, val, expect):
 
 # ---- збій dolos не має вбивати ордер -------------------------------------
 
-def test_dolos_failure_degrades_instead_of_killing_the_order():
-    """Найважливіше тут. dolos — це ПІДПИС, а не торгове рішення: біржа
-    приймає і плоске тіло. Виняток тут означав би втрачений ордер на живих
-    грошах, причому на шляху, який до 25.08 не виконувався взагалі."""
-    import inspect
-    src = inspect.getsource(client_mod.MexcWebClient._request)
-    i = src.index("if needs_dolos and body is not None:")
-    seg = src[i:i + 2200]   # блок підріс разом із _device_payload()
-    assert "try:" in seg and "except Exception:" in seg
-    assert "full_body = body" in seg, "деградація має повертати ПЛОСКЕ тіло"
-    assert "logger.error" in seg, "мовчазна деградація зробила б проблему невидимою"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint,expect_level", [
+    ("/order/create", "ERROR"),
+    ("/position/close_all", "CRITICAL"),
+])
+async def test_dolos_failure_degrades_instead_of_killing_the_order(
+        monkeypatch, caplog, endpoint, expect_level):
+    """Найважливіше тут — і тепер це ВИКОНУЄТЬСЯ, а не грепається.
+
+    dolos — це ПІДПИС, а не торгове рішення: біржа приймає і плоске тіло
+    (абляція 2026-08-12). Виняток тут означав би втрачений ордер на живих
+    грошах. Стара версія тесту шукала рядки `try:` / `logger.error` у джерелі
+    — тобто `raise` всередині `except` проходив би ЗЕЛЕНИМ. Аудит 2026-08-26
+    показав це мутантом.
+
+    Заразом пінимо рівень логу: на `/order/create` деградація доведено
+    безпечна, а `close_all` голим НІКОЛИ не перевірявся — змішувати їх в один
+    ERROR не можна.
+    """
+    import logging
+    from src.execution.webkey.client import MexcWebClient
+
+    cl = MexcWebClient.__new__(MexcWebClient)
+    cl.API_URL, cl.API_BASE = "https://example.invalid", "/api/v1/private"
+    cl.dolos = type("D", (), {"visitor_id": "", "mhash": ""})()   # -> ValueError
+    cl.slot_id = 1
+    cl.timeout = 5.0
+
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        text = '{"code":0}'
+        def json(self):
+            return {"code": 0}
+
+    async def _fake_session():
+        class _S:
+            async def post(self, url, **kw):
+                sent["body"] = kw.get("json")
+                sent["url"] = url
+                return _Resp()
+            async def get(self, url, **kw):
+                return await self.post(url, **kw)
+        return _S()
+
+    monkeypatch.setattr(cl, "_ensure_session", _fake_session)
+    monkeypatch.setattr(cl, "_common_headers",
+                        lambda *a, **k: {}, raising=False)
+    monkeypatch.setattr(cl, "_webkey", "k", raising=False)
+
+    body = {"symbol": "PEPE_USDT", "vol": 1}
+    with caplog.at_level(logging.INFO):
+        await cl._request("POST", endpoint, body=body,
+                          needs_dolos=True, needs_web_sign=False)
+
+    # 1. Ордер ПІШОВ, і пішов ПЛОСКИМ тілом — не вмер і не поніс порожній p0.
+    assert sent.get("body") is not None, "ордер не відправлено взагалі"
+    assert "p0" not in sent["body"], f"у тілі лишився недозібраний dolos: {sent['body']}"
+    assert sent["body"]["symbol"] == "PEPE_USDT"
+    assert "mhash=" not in sent["url"], "mhash у URL без dolos у тілі"
+
+    # 2. Деградація ГУЧНА, і рівень відповідає ендпоінту.
+    rec = [r for r in caplog.records if "[DOLOS]" in r.getMessage()]
+    assert rec, "деградація пройшла мовчки — саме це робить проблему невидимою"
+    assert rec[0].levelname == expect_level, \
+        f"{endpoint}: очікував {expect_level}, отримав {rec[0].levelname}"
 
 
 def test_empty_visitor_id_is_caught_explicitly():
@@ -225,31 +281,52 @@ def test_referer_defaults_safely_when_there_is_no_symbol():
     assert 'symbol or _WARMUP_SYMBOL' in src
 
 
+def _headers_of(slot_id=1):
+    """Справжні заголовки справжнього клієнта, без мережі й без reload.
+
+    Раніше обидва тести нижче робили `importlib.reload(client_mod)`. Це та
+    сама пастка, що описана в CLAUDE.md: reload не відновлює ІДЕНТИЧНІСТЬ
+    класів, і вона вже клала 7 тестів у `test_webkey_credentials.py` — причому
+    лише коли той файл ішов ПІСЛЯ. Тепер env читається під час виклику, тож
+    reload не потрібен узагалі.
+    """
+    from src.execution.webkey.client import MexcWebClient
+    cl = MexcWebClient.__new__(MexcWebClient)
+    cl.slot_id = slot_id
+    cl.user_agent = "UA"
+    cl.sec_ch_ua = '"X";v="1"'
+    cl.sec_ch_ua_platform = '"macOS"'
+    cl.BASE_URL = "https://futures.mexc.com"
+    # Атрибути з __init__, які читає _common_headers. Через __new__ їх треба
+    # дзеркалити руками — це вже двічі ламало сюїту, тож список тримати повним.
+    cl._profile = None
+    cl.webkey = "test-webkey-not-a-real-key"
+    cl.dolos = type("D", (), {"visitor_id": "vis", "mhash": "m"})()
+    return cl._common_headers({}, symbol="PEPE_USDT")
+
+
 def test_no_literal_zero_trochilus_uid(monkeypatch):
     """Слали `trochilus-uid: 0` — найдешевший маркер «це не браузер».
     Тепер: не задано в env -> заголовка немає взагалі."""
-    import importlib
     monkeypatch.delenv("MEXC_TROCHILUS_UID", raising=False)
-    m = importlib.reload(client_mod)
-    try:
-        assert m._TROCHILUS_UID == ""
-        src = __import__("inspect").getsource(m.MexcWebClient._common_headers)
-        assert '"trochilus-uid": "0"' not in src
-        assert 'if _TROCHILUS_UID:' in src
-    finally:
-        importlib.reload(client_mod)
+    monkeypatch.delenv("MEXC_TROCHILUS_UID_SLOT1", raising=False)
+    h = _headers_of(1)
+    assert "trochilus-uid" not in h, f"заголовок пішов зі значенням {h.get('trochilus-uid')!r}"
 
 
 def test_trochilus_uid_is_sent_when_configured(monkeypatch):
-    """Значення РІЗНЕ на двох ботах (це id акаунта), тому env, а не константа."""
-    import importlib
+    """Значення РІЗНЕ на кожному АКАУНТІ, тобто на слоті."""
     monkeypatch.setenv("MEXC_TROCHILUS_UID", "12345678")
-    m = importlib.reload(client_mod)
-    try:
-        assert m._TROCHILUS_UID == "12345678"
-    finally:
-        monkeypatch.delenv("MEXC_TROCHILUS_UID", raising=False)
-        importlib.reload(client_mod)
+    monkeypatch.delenv("MEXC_TROCHILUS_UID_SLOT1", raising=False)
+    assert _headers_of(1)["trochilus-uid"] == "12345678"
+
+
+def test_trochilus_uid_per_slot_beats_the_global(monkeypatch):
+    """Глобальна змінна на боті з двома акаунтами відправляла б ЧУЖИЙ uid."""
+    monkeypatch.setenv("MEXC_TROCHILUS_UID", "111")
+    monkeypatch.setenv("MEXC_TROCHILUS_UID_SLOT2", "222")
+    assert _headers_of(2)["trochilus-uid"] == "222"
+    assert _headers_of(1)["trochilus-uid"] == "111"
 
 
 def test_sec_ch_ua_matches_the_browser_format():

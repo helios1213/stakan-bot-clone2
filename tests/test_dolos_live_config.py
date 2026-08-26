@@ -18,6 +18,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 import inspect
 from pathlib import Path
 
@@ -112,18 +114,56 @@ def test_refresh_loop_exists_and_is_wired():
     assert 'name="dolos_config"' in MAIN
 
 
-def test_refresh_runs_the_blocking_fetch_off_the_event_loop():
-    """fetch_sync робить HTTP; без to_thread він заблокував би цикл подій,
-    а в цьому циклі живе детектор."""
-    i = MAIN.index("async def dolos_config_refresh_loop")
-    seg = MAIN[i:i + 1800]
-    assert "asyncio.to_thread" in seg
+@pytest.mark.asyncio
+async def test_refresh_runs_the_blocking_fetch_off_the_event_loop(monkeypatch):
+    """fetch_sync робить HTTP; у циклі подій живе ДЕТЕКТОР.
+
+    Перевіряємо ПОТІК, у якому фактично виконався забір, а не наявність рядка
+    `asyncio.to_thread` у джерелі. Стара грепна версія до того ж мовчки
+    зламалась, щойно блок виріс за 1800 символів — тобто «зелена» вона була
+    рівно доти, доки випадково влучала у вікно зрізу.
+    """
+    import asyncio as _aio
+    import threading
+    import src.main as main_mod
+    from src.execution.webkey import dolos_config as dc
+
+    seen = {}
+
+    def _fake(v, timeout=8.0, slot_id=None):
+        seen["thread"] = threading.current_thread()
+        return {"chash": "e" * 64, "parameters": ["mtoken"]}
+
+    monkeypatch.setattr(dc, "fetch_sync", _fake)
+    monkeypatch.setattr(dc, "CACHE", dc.DolosConfigCache())
+
+    class _Store:
+        async def list_all(self):
+            return [type("S", (), {"visitor_id": "v", "slot_id": 1})()]
+
+    task = _aio.create_task(
+        main_mod.dolos_config_refresh_loop(_Store(), interval_sec=3600))
+    for _ in range(50):
+        await _aio.sleep(0.005)
+        if seen:
+            break
+    task.cancel()
+    try:
+        await task
+    except _aio.CancelledError:
+        pass
+
+    assert seen, "забір не викликався"
+    assert seen["thread"] is not threading.main_thread(), (
+        "блокуючий HTTP виконався В ЦИКЛІ ПОДІЙ — це зупиняє детектор на час "
+        "запиту")
 
 
-def test_refresh_loop_survives_failures():
-    i = MAIN.index("async def dolos_config_refresh_loop")
-    seg = MAIN[i:i + 1800]
-    assert "except Exception:" in seg and "logger.exception" in seg
+# Стійкість циклу до збою перевіряється ВИКОНАННЯМ у
+# tests/test_audit_behavioural_coverage.py::test_refresh_loop_survives_a_failing_fetch
+# (грепна версія тут була видалена: вона шукала `except Exception:` у зрізі
+# джерела і зламалась від того, що блок підріс — тобто перевіряла довжину
+# функції, а не поведінку).
 
 
 # ---- «усе працює» і «задача мертва» мусять виглядати ПО-РІЗНОМУ ----------
@@ -172,18 +212,87 @@ def test_startup_prints_the_active_mode():
     assert "_PATH_MODE" in seg and "_DOLOS_ON_ORDER" in seg
 
 
-def test_startup_warns_when_the_device_offset_is_missing():
-    """Без зсуву два боти можуть дати однакові профілі — мовчати не можна."""
-    i = MAIN.index('logger.info("[PATH MODE]')
-    seg = MAIN[i:i + 700]
-    assert "MEXC_DEVICE_OFFSET" in seg
+@pytest.mark.parametrize("raw,explicit", [
+    (None, False),        # не задано взагалі
+    ("", False),          # порожньо — те саме, що не задано
+    ("не число", False),  # одруківка в compose мовчки провалювалась у посів
+    ("0", True),
+    ("2", True),
+])
+def test_offset_is_explicit_detects_every_way_it_can_be_missing(
+        monkeypatch, raw, explicit):
+    """ВИКОНУЄМО функцію, а не грепаємо джерело.
+
+    Попередня версія цього тесту перевіряла лише, що рядок
+    "MEXC_DEVICE_OFFSET" трапляється біля логу — тобто лишалась би зеленою з
+    назавжди мертвою гілкою попередження. Саме так дефект і прожив: умова була
+    диз'юнкцією (`посів заданий АБО зсув заданий`), а посів заданий у compose
+    ОБОХ машин, тож попередження не спрацювало б ніколи.
+    """
+    from src.execution.webkey import device_profile as dp
+    if raw is None:
+        monkeypatch.delenv("MEXC_DEVICE_OFFSET", raising=False)
+    else:
+        monkeypatch.setenv("MEXC_DEVICE_OFFSET", raw)
+    assert dp.offset_is_explicit() is explicit
 
 
-def test_missing_webkey_is_reported_once_not_hidden_at_debug():
+def test_seed_alone_does_not_separate_our_two_real_machines():
+    """Підстава для попередження, вимірювана, а не декларативна.
+
+    Обидва СПРАВЖНІ посіви дають той самий `sha256%6`, тож запасний шлях
+    розрізняє машини лише випадково. Якщо колись профілів стане більше і
+    посіви розійдуться — тест впаде і змусить перечитати попередження, а не
+    лишить його брехати.
+    """
+    import hashlib
+    from src.execution.webkey import device_profile as dp
+    n = dp.profile_count()
+    a = hashlib.sha256(b"primary-vultr-45.32.12.27").digest()[0] % n
+    b = hashlib.sha256(b"clone1-vultr-45.76.96.241").digest()[0] % n
+    assert a == b, (
+        "посіви розійшлись — перечитай попередження в main.py, воно "
+        "спирається на те, що вони збігаються")
+
+
+@pytest.mark.asyncio
+async def test_missing_webkey_is_reported_once_not_hidden_at_debug(
+        monkeypatch, caplog):
     """На клоні ключів немає — забір пропускається. Але «нема ключів» і
-    «задача мертва» не мусять виглядати однаково: DEBUG цього не показує."""
-    i = MAIN.index("async def dolos_config_refresh_loop")
-    seg = MAIN[i:i + 2200]
-    assert "_no_key_warned" in seg, "має бути прапорець «сказано один раз»"
-    assert 'logger.debug("[DOLOS CFG] жодного' not in seg
-    assert "logger.info" in seg
+    «задача мертва» не мусять виглядати однаково.
+
+    ВИКОНУЄМО цикл замість грепу зрізу джерела: попередня версія шукала
+    підрядки у перших 2200 символах функції і зламалась, щойно функція
+    підросла. Тобто вона перевіряла ДОВЖИНУ коду, а не поведінку.
+    """
+    import asyncio as _aio
+    import logging
+    import src.main as main_mod
+    from src.execution.webkey import dolos_config as dc
+
+    called = []
+    monkeypatch.setattr(dc, "fetch_sync",
+                        lambda *a, **k: called.append(1))
+
+    class _EmptyStore:
+        async def list_all(self):
+            return [type("S", (), {"visitor_id": None, "slot_id": 1})()]
+
+    with caplog.at_level(logging.INFO):
+        task = _aio.create_task(
+            main_mod.dolos_config_refresh_loop(_EmptyStore(), interval_sec=0.01))
+        await _aio.sleep(0.08)
+        task.cancel()
+        try:
+            await task
+        except _aio.CancelledError:
+            pass
+
+    assert not called, "без ключа забір не має відбуватись узагалі"
+    said = [r for r in caplog.records
+            if "жодного слота з вебкеєм" in r.getMessage()]
+    assert said, "мовчазний пропуск — «нема ключів» і «задача мертва» злились"
+    assert said[0].levelno >= logging.INFO, "на DEBUG цього не видно"
+    assert len(said) == 1, (
+        f"сказано {len(said)} разів за ~8 ітерацій — прапорець «один раз» "
+        f"не працює, лог засмічуватиметься")

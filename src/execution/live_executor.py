@@ -38,6 +38,7 @@ from typing import Any
 # _poll_close_fill must be multiplied by get_binance_scale(mexc_symbol)
 # before they leak out into pos.entry_price / pos.exit_price.
 from src.exchanges.mexc_rest import get_binance_scale, to_binance
+from src.env_config import env_float
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +246,7 @@ IOC_PRE_RETRY_POSITION_CHECK = True
 # /order/create rate-limit). This is the direct guard against the 2026-07-20
 # PEPE liquidation (believed-expired IOC that actually filled → 49min naked
 # short → −$25.82 liquidation, with no bot record and no TG alert).
-PHANTOM_FILL_CHECK_DELAY_SEC = float(os.environ.get("PHANTOM_FILL_CHECK_DELAY_SEC", "2.5"))
+PHANTOM_FILL_CHECK_DELAY_SEC = env_float("PHANTOM_FILL_CHECK_DELAY_SEC", 2.5, lo=0.0)
 # Multi-window phantom re-check: a believed-EXPIRED IOC can have its fill/deal
 # land on MEXC AFTER the first (2.5s) window, so a single check left the naked
 # position to the 60s reconcile. Re-check at these ABSOLUTE delays (seconds) and
@@ -301,7 +302,7 @@ PRIVATE_WS_FILL_ENABLED = os.environ.get("PRIVATE_WS_FILL", "1") == "1"
 # within 0-68ms. A short window catches ~all of them while bounding the extra
 # slot-lock hold on the common expired-IOC case (which finds no push and falls
 # through to the REST poll). 100ms is the catch-all-fills / minimal-stall knee.
-PRIVATE_WS_FILL_WAIT_SEC = float(os.environ.get("PRIVATE_WS_FILL_WAIT_MS", "100")) / 1000.0
+PRIVATE_WS_FILL_WAIT_SEC = env_float("PRIVATE_WS_FILL_WAIT_MS", 100.0, lo=0.0) / 1000.0
 
 # WS-expiry-trust: when the private WS pushes a TERMINAL order with dealVol==0
 # (state=4 cancelled = IOC expired, confirmed by live probe 2026-06-07), trust
@@ -320,7 +321,7 @@ PRIVATE_WS_TRUST_EXPIRY = os.environ.get("PRIVATE_WS_TRUST_EXPIRY", "1") == "1"
 # arrive in the wait window, so a missed event NEVER strands a position as open.
 # Kill-switch: PRIVATE_WS_CLOSE_FILL=0.
 PRIVATE_WS_CLOSE_FILL_ENABLED = os.environ.get("PRIVATE_WS_CLOSE_FILL", "1") == "1"
-PRIVATE_WS_CLOSE_WAIT_SEC = float(os.environ.get("PRIVATE_WS_CLOSE_WAIT_MS", "400")) / 1000.0
+PRIVATE_WS_CLOSE_WAIT_SEC = env_float("PRIVATE_WS_CLOSE_WAIT_MS", 400.0, lo=0.0) / 1000.0
 
 # symmetric to fill-poll-fast but for the exit
 # path. _poll_close_fill polls /position/list/history_positions waiting for

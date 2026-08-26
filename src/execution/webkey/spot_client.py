@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from . import device_profile
 from .signing import sign_web
 from .spot_currency import SpotCurrency, SpotCurrencyResolver
 
@@ -41,8 +42,12 @@ WEB_ORIGIN = "https://www.mexc.com"
 SPOT_ORDER_URL = f"{WEB_ORIGIN}/api/platform/spot/order/place"
 BALANCES_URL = f"{WEB_ORIGIN}/api/gateway/spot/finance/asset/currency/balances"
 
-_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
+# ЗАПАСНИЙ відбиток, якщо профіль слота недоступний (ручні проби без slot_id).
+# Був хардкод `Chrome/151` при `impersonate="chrome"`, і це суперечило само
+# собі В ОДНОМУ ЗАПИТІ: UA казав 151, а TLS — те, що curl_cffi вважає свіжим
+# (146; цілі 151 у ньому НЕМАЄ взагалі). Плюс `sec-ch-ua` не слався зовсім,
+# хоча фронтенд MEXC його шле. Тепер джерело одне — `device_profile`.
+_FALLBACK_PROFILE = device_profile.for_slot(None)
 
 BUY, SELL = "BUY", "SELL"
 LIMIT, MARKET = "LIMIT_ORDER", "MARKET_ORDER"
@@ -102,10 +107,21 @@ class SpotWebClient:
 
     def __init__(self, webkey: str, *, dry_run: bool = True,
                  resolver: SpotCurrencyResolver | None = None,
-                 timeout: float = 20.0, quote: str = "USDT") -> None:
+                 timeout: float = 20.0, quote: str = "USDT",
+                 slot_id: int | None = None) -> None:
         if not webkey:
             raise ValueError("empty webkey")
         self._webkey = webkey
+        # ТОЙ САМИЙ пристрій, що й на фʼючерсному шляху цього слота. Спот і
+        # фʼючерси ходять під ОДНИМ акаунтом з ОДНІЄЇ IP — два різні відбитки
+        # на один акаунт гірші за один нехай і неідеальний.
+        self.slot_id = slot_id
+        try:
+            self._profile = (device_profile.for_slot(slot_id)
+                             if slot_id is not None else _FALLBACK_PROFILE)
+        except Exception:
+            logger.warning("[SPOT] профіль пристрою не побудовано", exc_info=True)
+            self._profile = _FALLBACK_PROFILE
         self.dry_run = bool(dry_run)
         self.quote = quote.upper()
         self._timeout = timeout
@@ -127,7 +143,10 @@ class SpotWebClient:
         if self._session is not None:
             return self._session
         from curl_cffi import requests as curl_requests
-        s = curl_requests.AsyncSession(impersonate="chrome")
+        # Конкретна ціль із профілю, не загальний алias "chrome": алias
+        # резолвиться у те, що curl_cffi вважає свіжим сьогодні, і після
+        # оновлення бібліотеки TLS поїхав би, а UA лишився б на місці.
+        s = curl_requests.AsyncSession(impersonate=self._profile.impersonate)
         s.cookies.set("u_id", self._webkey, domain=".mexc.com")
         s.cookies.set("uc_token", self._webkey, domain=".mexc.com")
         self._session = s
@@ -141,8 +160,13 @@ class SpotWebClient:
             "origin": WEB_ORIGIN,
             "platform": "WEB",
             "referer": f"{WEB_ORIGIN}/exchange/MX_{self.quote}",
-            "user-agent": _UA,
+            "user-agent": self._profile.user_agent,
+            "accept-language": self._profile.accept_language,
         }
+        if self._profile.sec_ch_ua:
+            h["sec-ch-ua"] = self._profile.sec_ch_ua
+            h["sec-ch-ua-mobile"] = "?0"
+            h["sec-ch-ua-platform"] = self._profile.sec_ch_ua_platform
         if sign:
             h.update(sign)
         return h

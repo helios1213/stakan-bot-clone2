@@ -58,6 +58,20 @@ class DeviceProfile:
     def is_chromium(self) -> bool:
         return bool(self.sec_ch_ua)
 
+    @property
+    def os_kind(self) -> str:
+        return "mac" if "mac" in self.sec_ch_ua_platform.lower() else "win"
+
+    def with_chrome_version(self, ver) -> "DeviceProfile":
+        """Той самий пристрій, але примусова версія Chrome.
+
+        Потрібно для `MEXC_CHROME_VER`: оператор просить конкретну версію, а
+        ОС має лишитись тією, що в профілю. Міняти версію «наполовину» не
+        можна — TLS, UA і sec-ch-ua мусять рухатись разом, тож профіль
+        перезбирається цілком, а не патчиться поле за полем.
+        """
+        return _chrome(ver, self.os_kind)
+
 
 def _chrome(ver: int, os_kind: str) -> DeviceProfile:
     if os_kind == "mac":
@@ -114,6 +128,26 @@ def seed_is_explicit() -> bool:
     return machine_seed() != _DEFAULT_SEED
 
 
+def offset_is_explicit() -> bool:
+    """Чи заданий зсув ЯВНО і чи він читається.
+
+    Саме це, а не посів, є справжнім захистом від збігу профілів двох машин:
+    ВИМІРЯНО, що обидва наші справжні посіви дають `sha256%6 = 5`, тобто
+    запасний шлях розрізняє машини лише випадково. Непарсабельне значення
+    (одруківка в compose) теж повертає False — воно мовчки провалюється у той
+    самий запасний шлях, і оператор має про це почути.
+    """
+    import os
+    raw = os.environ.get("MEXC_DEVICE_OFFSET", "").strip()
+    if not raw:
+        return False
+    try:
+        int(raw)
+    except ValueError:
+        return False
+    return True
+
+
 def machine_offset() -> int:
     """Зсув профілів для ЦІЄЇ машини.
 
@@ -130,7 +164,12 @@ def machine_offset() -> int:
         try:
             return int(raw) % len(_PROFILES)
         except ValueError:
-            pass
+            # Мовчки не проковтувати: одруківка в compose знімає ЄДИНИЙ
+            # реальний захист від того, що два боти стануть одним пристроєм.
+            import logging
+            logging.getLogger(__name__).warning(
+                "[DEVICE] MEXC_DEVICE_OFFSET=%r не число — беру запасний шлях "
+                "із посіву, а він розрізняє машини лише випадково", raw)
     # Запасний шлях: із посіву. Не гарантує розрізнення двох машин — саме тому
     # MEXC_DEVICE_OFFSET має бути заданий явно.
     return hashlib.sha256(machine_seed().encode("utf-8")).digest()[0] % len(_PROFILES)

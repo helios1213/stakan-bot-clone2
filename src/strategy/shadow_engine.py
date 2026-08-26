@@ -64,6 +64,7 @@ from src.storage.db import Database
 from src.strategy.shadow_position import ShadowPosition
 from src.strategy.signal import Signal
 from src.utils.pnl import calc_pnl_usdt
+from src.env_config import env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ def open_freq_limit_code(err_msg: str | None) -> str | None:
 # per-pair `max_hold_sec` exit-limit (yaml execution, ~60s). Different things,
 # similar names. Override via env STAKAN_ABSOLUTE_MAX_HOLD_SEC. Set 0 to disable
 # (NOT RECOMMENDED — disables a key safety net).
-_ABSOLUTE_MAX_HOLD_SEC = int(os.environ.get("STAKAN_ABSOLUTE_MAX_HOLD_SEC", "600"))
+_ABSOLUTE_MAX_HOLD_SEC = env_int("STAKAN_ABSOLUTE_MAX_HOLD_SEC", 600)
 
 # ─── Position-watcher tuning (event-driven exits + staleness guard) ──────────
 # Timer floor for the watch loop: even with no book updates, re-check this
@@ -106,13 +107,13 @@ _ABSOLUTE_MAX_HOLD_SEC = int(os.environ.get("STAKAN_ABSOLUTE_MAX_HOLD_SEC", "600
 # guard still fire. Book updates wake the loop sooner (event-driven) for
 # PRICE-based exits (stop, trail) — keeps the old robustness-against-WS-stall
 # intent (a timeout floor) while reacting instantly to real price moves.
-_WATCH_TIME_TICK_SEC = float(os.environ.get("STAKAN_WATCH_TIME_TICK_SEC", "0.05"))
+_WATCH_TIME_TICK_SEC = env_float("STAKAN_WATCH_TIME_TICK_SEC", 0.05, lo=0.001)
 # Force-close a position if its MEXC book hasn't updated within this window. A
 # stalled feed means the watcher reads a frozen price and no price-exit can
 # fire, so the position would ride blind until _ABSOLUTE_MAX_HOLD_SEC (600s).
 # This tightens that net to ~2s. Conservative enough that a healthy-but-quiet
 # book on an active pair won't false-trigger. Env-tunable; 0 disables.
-_FEED_STALE_MS = int(os.environ.get("STAKAN_FEED_STALE_MS", "2000"))
+_FEED_STALE_MS = env_int("STAKAN_FEED_STALE_MS", 2000, lo=0)
 
 
 def _feed_is_stale(last_update_ts_ms: int, now_ms: int, stale_ms: int) -> bool:
@@ -193,7 +194,7 @@ def _entry_spread_bps(best_bid: float, best_ask: float) -> float:
 # close (/position/close_all) sweeps the WHOLE gap when binance_reversal fires
 # into a violent move (the −13bps fills). A capped IOC-limit crosses only this
 # many ticks then cancels (falling back to market), bounding the sweep. Tunable.
-_REVERSAL_CLOSE_CAP_TICKS = float(os.environ.get("STAKAN_REVERSAL_CLOSE_CAP_TICKS", "5"))
+_REVERSAL_CLOSE_CAP_TICKS = env_float("STAKAN_REVERSAL_CLOSE_CAP_TICKS", 5.0)
 # When 1 (default): binance_reversal cut uses the FAST close_all (market, ~66ms
 # MEXC-side) instead of capped IOC (/order/create, ~150ms). 84ms-less latency =
 # book drifts less before close lands -> tighter realized cut, often beating the
@@ -586,8 +587,16 @@ class ShadowEngine:
         self._twin_tape_task: asyncio.Task | None = None
         # 10мс крок / 250 кадрів = ~2.5с історії. Вікно навмисно більше за
         # найгірший латентність-дроу (205мс) і за p99 submit RTT (~625мс).
-        self._twin_tape_interval_s = self._env_float("TWIN_TAPE_INTERVAL_MS", 10.0) / 1000.0
-        self._twin_tape_len = int(self._env_float("TWIN_TAPE_LEN", 250.0))
+        # НИЖНІ МЕЖІ, а не сирий env. `TWIN_TAPE_INTERVAL_MS=0` дало б
+        # `await asyncio.sleep(0)` у нескінченному циклі — busy-loop, який на
+        # одному ядрі відбирає час у САМОГО детектора; `TWIN_TAPE_LEN=0` дало б
+        # `deque(maxlen=0)`, тобто стрічку, яка мовчки НІКОЛИ нічого не памʼятає
+        # і при цьому виглядає робочою. Обидва — аналітика, що тихо бреше.
+        # Стеля на крок теж потрібна: 10с між кадрами роблять стрічку марною,
+        # бо дедлайни twin лежать у 150-205мс.
+        self._twin_tape_interval_s = min(
+            1.0, max(0.001, self._env_float("TWIN_TAPE_INTERVAL_MS", 10.0) / 1000.0))
+        self._twin_tape_len = max(10, int(self._env_float("TWIN_TAPE_LEN", 250.0)))
         self._burst_diag_ts = 0.0
         self._max_book_age_ms = max(0, int(getattr(cfg, "max_book_age_ms", 0)))
         # T1.2; 1.0 = вимкнено. Обмежено (0, 1] — 0 означав би «жодної
@@ -1884,7 +1893,13 @@ class ShadowEngine:
             except Exception:
                 logger.error("[TWIN TAPE] ітерація впала", exc_info=True)
             try:
-                await asyncio.sleep(self._twin_tape_interval_s)
+                # Без live-пар писати нічого. Прокидатись 100 разів на секунду
+                # заради порожнього циклу — це відбирати такти в детектора на
+                # ЄДИНОМУ ядрі. Прокидаємось раз на секунду й перевіряємо; поява
+                # live-пари затримається щонайбільше на цю секунду, а стрічка
+                # потрібна лише з першого ЖИВОГО ордера по ній.
+                idle = not self._twin_tape_symbols
+                await asyncio.sleep(1.0 if idle else self._twin_tape_interval_s)
             except asyncio.CancelledError:
                 raise
         logger.info("[TWIN TAPE] зупинено")

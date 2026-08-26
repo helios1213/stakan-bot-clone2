@@ -59,8 +59,15 @@ logger = logging.getLogger(__name__)
 PAGE_URL = "https://www.mexc.com/exchange/{base}_{quote}"
 _INFO_RE = re.compile(r'"info"\s*:\s*\{')
 
-_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
+# Той самий профіль пристрою, що й решта шляху. Сторінка пари публічна, але
+# запит іде з ТІЄЇ САМОЇ IP і в тому самому процесі, що й автентифікований
+# спот-ордер за секунду по тому — два різні браузери в одній сесії гірші за
+# один. Був хардкод `Chrome/151` при `impersonate="chrome"`: цілі 151 у
+# curl_cffi НЕМАЄ, тобто UA і TLS суперечили одне одному в одному запиті.
+from . import device_profile as _dp
+
+_PROFILE = _dp.for_slot(None)
+_UA = _PROFILE.user_agent
 
 # currencyIds never change, so the cache can be long-lived. 24h is a compromise
 # between "never re-fetch" and picking up a delisting/relist.
@@ -259,8 +266,10 @@ class SpotCurrencyResolver:
         except ImportError:
             return await asyncio.to_thread(_fetch_urllib, url, self._timeout)
 
-        async with curl_requests.AsyncSession(impersonate="chrome") as s:
-            r = await s.get(url, headers={"accept": "*/*", "language": "en-US"},
+        async with curl_requests.AsyncSession(
+                impersonate=_PROFILE.impersonate) as s:
+            r = await s.get(url, headers={"accept": "*/*", "language": "en-US",
+                                          "user-agent": _UA},
                             timeout=self._timeout)
             if r.status_code != 200:
                 raise SpotCurrencyError(f"{url} -> HTTP {r.status_code}")

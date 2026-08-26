@@ -137,6 +137,7 @@ class MexcPrivateWS:
                     close_timeout=5,
                     max_size=8 * 1024 * 1024,
                     compression=None,
+                    **_ws_header_kwargs(self.slot_id),
                 ) as ws:
                     self._ws = ws
                     await ws.send(
@@ -392,3 +393,54 @@ class MexcPrivateWSPool:
         for ws in self._instances.values():
             await ws.stop()
         self._instances.clear()
+
+
+def _ws_headers(slot_id: int | None = None) -> dict[str, str]:
+    """Заголовки рукостискання WS під тим самим пристроєм, що й REST.
+
+    За замовчуванням бібліотека шле `User-Agent: Python/3.11 websockets/13.1`.
+    Для ПРИВАТНОГО каналу це особливо помітно: він автентифікується вебкеєм,
+    тобто прямо вʼяже акаунт із неброузерним клієнтом, без жодних здогадок про
+    IP. Публічний фід ходить на ТОЙ САМИЙ хост, тож лагодити треба обидва —
+    інакше «браузерний» приватний канал поруч із пітонівським публічним
+    виглядає гірше, ніж два однакових.
+
+    Профіль не побудувався — краще без заголовка, ніж із вигаданим.
+    """
+    try:
+        from src.execution.webkey import device_profile
+        prof = device_profile.for_slot(slot_id)
+    except Exception:
+        return {}
+    return {"User-Agent": prof.user_agent,
+            "Accept-Language": prof.accept_language,
+            "Origin": "https://www.mexc.com"}
+
+
+def _ws_header_kwargs(slot_id: int | None = None) -> dict:
+    """Ім'я параметра ЗАЛЕЖИТЬ ВІД ВЕРСІЇ `websockets` — тому воно визначається,
+    а не вгадується.
+
+    13.1 (наша) приймає `extra_headers`; новий asyncio-клієнт — `additional_headers`.
+    Передати не те = `TypeError` У МОМЕНТ ПІДКЛЮЧЕННЯ, тобто WS не піднявся б
+    узагалі, і побачили б ми це вже на живому боті, а не в тестах. Я саме на
+    цьому й спіймався, перевіряючи сигнатуру.
+
+    Якщо жодного з імен немає — повертаємо порожньо: неідеальний UA кращий за
+    бота без ринкових даних.
+    """
+    headers = _ws_headers(slot_id)
+    if not headers:
+        return {}
+    try:
+        import inspect
+        import websockets
+        target = websockets.connect
+        params = set(inspect.signature(
+            getattr(target, "__init__", target)).parameters)
+    except Exception:
+        return {}
+    for name in ("extra_headers", "additional_headers"):
+        if name in params:
+            return {name: headers}
+    return {}

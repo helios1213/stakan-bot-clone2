@@ -24,8 +24,12 @@ import sqlite3
 import sys
 import urllib.request
 
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
+# Профіль пристрою, а не хардкод: цей інструмент ходить із ВЕБКЕЄМ, тобто
+# автентифіковано під тим самим акаунтом, що й бот. `Chrome/151` не існує як
+# TLS-ціль curl_cffi, тож UA суперечив би відбитку.
+from src.execution.webkey import device_profile as _dp
+
+UA = _dp.for_slot(None).user_agent
 
 
 def public_contract_detail() -> dict[str, dict]:

@@ -55,6 +55,11 @@ class SafetyState:
     kill_active: bool = False
     kill_reason: str = ""
     kill_until_ts: int = 0  # 0 = indefinite
+    # Кіл протермінувався САМ і пік перебазовано. Прапорець одноразовий: пул
+    # побачить його, збереже маркер у live_state і скине. Без цього природне
+    # протермінування не переживало рестарт — `_hydrate_safety` відновлював
+    # дорелізний пік і слот халтився знову, аж до півночі.
+    kill_auto_released: bool = False
     open_live_positions: dict[str, int] = field(default_factory=dict)  # symbol → count
 
 
@@ -239,6 +244,16 @@ class LiveSafetyController:
                 logger.info("Kill switch expired — resuming live trading")
                 self.state.kill_active = False
                 self.state.kill_reason = ""
+                # ПОЗНАЧАЄМО, ЩО ПЕРЕБАЗУВАННЯ СТАЛОСЬ — щоб воно пережило
+                # рестарт. Перебазування нижче живе ЛИШЕ в памʼяті, а
+                # `_hydrate_safety` після перезапуску переграє денні угоди
+                # наново і відновлює ДОРЕЛІЗНИЙ пік. Тобто природне
+                # протермінування кіла скасовувалось будь-яким ребілдом: слот
+                # знову халтився, і так до півночі. Ручне зняття цю проблему
+                # вже лікує маркером (`persist_kill_release`) — тут його просто
+                # не застосували. Прапорець знімає пул у `sync_kill_state`:
+                # у контролера немає і не має бути доступу до БД.
+                self.state.kill_auto_released = True
                 # Re-baseline the drawdown high-water mark to the resume point.
                 # Otherwise peak_pnl still holds the pre-kill high, so the FIRST
                 # losing close after resume instantly re-crosses the drawdown

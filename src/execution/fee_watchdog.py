@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+from src.env_config import env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +56,10 @@ logger = logging.getLogger(__name__)
 # (ордер раз на ~8с) — здебільшого ні. Довести до нуля платних ордерів можна
 # лише перевіркою ПЕРЕД кожним ордером, а це +19мс на критичний шлях, і такий
 # обмін відкинуто свідомо: дві комісійні події на 16 932 ордери, $0.43 сумарно.
-POLL_SEC = float(os.environ.get("FEE_WATCHDOG_SEC", "60"))          # у простої
-ACTIVE_SEC = float(os.environ.get("FEE_WATCHDOG_ACTIVE_SEC", "10")) # слот озброєний
+POLL_SEC = env_float("FEE_WATCHDOG_SEC", 60.0, lo=1.0)               # у простої
+ACTIVE_SEC = env_float("FEE_WATCHDOG_ACTIVE_SEC", 10.0, lo=1.0)      # слот озброєний
 # Скільки ненульових читань поспіль потрібно, щоб халтити (див. правило 2).
-CONFIRMATIONS = max(1, int(os.environ.get("FEE_WATCHDOG_CONFIRM", "2")))
+CONFIRMATIONS = env_int("FEE_WATCHDOG_CONFIRM", 2, lo=1)
 ENABLED = os.environ.get("FEE_WATCHDOG", "1").strip().lower() not in (
     "0", "false", "no", "off")
 

@@ -70,11 +70,11 @@ def looks_feeish(payload) -> list[str]:
 
 
 def public_get(url: str):
+    from src.execution.webkey import device_profile as _dp
     req = urllib.request.Request(url, headers={
         "accept": "*/*",
-        "user-agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/151.0.0.0 Safari/537.36"),
+        # Профіль, а не хардкод неіснуючої версії Chrome/151.
+        "user-agent": _dp.for_slot(None).user_agent,
     })
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
