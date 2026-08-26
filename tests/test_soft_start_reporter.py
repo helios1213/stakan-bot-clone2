@@ -90,7 +90,7 @@ async def test_status_line_carries_day_budget_and_position():
     t = b.sent[-1]
     # Формат змінено 2026-08-26 разом зі зняттям стелі витрат: знаменник
     # лишається лише коли стеля справді задана.
-    assert "day 2/3" in t and "витрачено 0.310 USDT" in t and "HYPE_USDT" in t
+    assert "day 2/3" in t and "комісії+спред 0.310" in t and "HYPE_USDT" in t
 
 
 @pytest.mark.asyncio
@@ -240,5 +240,73 @@ def test_report_does_not_advertise_a_ceiling_that_no_longer_exists():
     from src.execution.soft_start_reporter import SoftStartReporter
     r = SoftStartReporter(None, 1, dry_run=True)
     out = r.render(day=1, days=3, spent=0.117, ceiling=None, position=None)
-    assert "витрачено 0.117 USDT" in out
+    assert "комісії+спред 0.117" in out
     assert "/5.00" not in out and "стеля" not in out
+
+
+# ---- PnL і тривалість у звіті (2026-08-26) --------------------------------
+
+@pytest.mark.asyncio
+async def test_close_line_shows_how_long_it_was_held():
+    """Було «after 0min» на позиції, що трималась 53 хвилини: раннер передавав
+    літерал 0.0. Це гірше за порожнє поле — вигадане число виглядає як вимір."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=True)
+    await r.futures_close("1000PEPEUSDT", 53.3, realised=-0.3712)
+    out = r.render(day=1, days=3, spent=0.0, position=None)
+    assert "after 53min" in out
+    assert "-0.3712" in out
+
+
+@pytest.mark.asyncio
+async def test_unknown_pnl_says_so_instead_of_showing_zero():
+    """None — це «не прочитали», НЕ нуль. Показати збиткову угоду як
+    безкоштовну гірше, ніж чесно сказати «невідомо»."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=True)
+    await r.futures_close("XUSDT", 10.0, realised=None)
+    out = r.render(day=1, days=3, spent=0.0, position=None)
+    assert "PnL невідомий" in out
+    assert "+0.0000" not in out
+
+
+def test_net_cost_subtracts_what_is_still_held_in_coins():
+    """ФОРМУЛА, ЯКА МАЛА НЕ ЗІЙТИСЬ І НЕ ЗІЙШЛАСЬ БИ.
+
+    Спотова купівля йде в PnL мінусом, тож USDT, перетворені на монету,
+    виглядають як збиток. Без віднімання того, що ще лежить у монетах, звіт
+    показував «разом +5.93», хоча реальна вартість була 0.49 (комісії 0.117 +
+    фʼючерсний мінус 0.371) — решта просто змінила форму.
+    """
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=True)
+    out = r.render(day=1, days=3, spent=0.117, pnl=-5.81, held_value=5.44,
+                   position=None)
+    assert "разом +0.487 USDT" in out, out
+    assert "у монетах ~5.44" in out
+
+
+def test_budget_tracks_spend_and_pnl_separately():
+    """Різні за природою числа: `spent` — те, що платимо свідомо і знаємо ДО
+    відправки; `pnl` — рух ринку, відомий постфактум і здатний бути додатним.
+    Змішавши їх, ми б не могли сказати, скільки прогрів коштує сам по собі."""
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.charge(0.07, "round-trip")
+    b.record_pnl(-0.40, "futures PEPE")
+    b.record_pnl(0.12, "futures SOL")
+    assert abs(b.spent - 0.07) < 1e-9
+    assert abs(b.pnl - (-0.28)) < 1e-9
+    assert abs(b.net_cost - 0.35) < 1e-9
+
+
+def test_a_profit_really_reduces_the_cost():
+    """Двосторонній, на відміну від charge: прибуткове закриття справді
+    зменшує вартість прогріву, і ховати це було б брехнею в наш бік."""
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.charge(0.10, "cost")
+    b.record_pnl(0.50, "good close")
+    assert b.net_cost < 0, "прибуток не зменшив вартість"

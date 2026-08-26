@@ -111,10 +111,15 @@ class SoftStartReporter:
         del self.futures_log[:-self.max_futures]
         await self.action("📈", line, **st)
 
-    async def futures_close(self, symbol: str, held_min: float, **st) -> None:
+    async def futures_close(self, symbol: str, held_min: float,
+                            realised: float | None = None, **st) -> None:
         self.stats["futures_closes"] += 1
-        held = f" after {held_min:.0f}min" if held_min else ""
-        line = f"FUTURES CLOSE {symbol}{held}"
+        held = f" after {held_min:.0f}min" if held_min else " (тримання невідоме)"
+        # None — це «не прочитали», НЕ нуль: показати збиткову угоду як
+        # безкоштовну гірше, ніж чесно сказати «невідомо».
+        pnl = (f" | PnL {realised:+.4f}" if realised is not None
+               else " | PnL невідомий")
+        line = f"FUTURES CLOSE {symbol}{held}{pnl}"
         self.futures_log.append(f"{_hhmm()} 📉 {line}")
         del self.futures_log[:-self.max_futures]
         await self.action("📉", line, **st)
@@ -205,7 +210,8 @@ class SoftStartReporter:
 
     def render(self, *, day: int | None = None, days: int | None = None,
                spent: float | None = None, ceiling: float | None = None,
-               position: str | None = None) -> str:
+               position: str | None = None, pnl: float | None = None,
+               held_value: float | None = None) -> str:
         head = f"🌱 <b>Soft-start — slot {self.slot_id}</b>"
         if self.dry_run:
             head += "  <i>(DRY-RUN — nothing is sent)</i>"
@@ -218,8 +224,28 @@ class SoftStartReporter:
             # Без знаменника: стелю витрат прибрано (рішення оператора
             # 2026-08-26), і «0.117/5.00» читалось би як діючий ліміт, якого
             # немає. Облік лишився — саме число досі корисне.
-            meta.append(f"витрачено {spent:.3f} USDT"
+            meta.append(f"комісії+спред {spent:.3f}"
                         + (f" (стеля {ceiling:.2f})" if ceiling else ""))
+        if pnl is not None:
+            meta.append(f"PnL {pnl:+.3f}")
+        if spent is not None and pnl is not None:
+            # РАЗОМ = витрати - PnL - те, що ЩЕ ЛЕЖИТЬ У МОНЕТАХ.
+            #
+            # Без останнього доданка число бреше в наш бік навпаки: спотова
+            # купівля йде в PnL мінусом, тож USDT, перетворені на монету,
+            # виглядають як збиток. На першому ж живому дні це давало «разом
+            # +5.93», хоча реальна вартість прогріву була 0.49 (комісії 0.12 +
+            # фʼючерсний мінус 0.37) — решта просто змінила форму.
+            #
+            # Додатне = прогрів у мінус.
+            net = spent - pnl - (held_value or 0.0)
+            meta.append(f"разом {net:+.3f} USDT")
+        if held_value:   # див. «разом» вище — без цього число бреше
+            # ЧЕСНЕ ЗАСТЕРЕЖЕННЯ. Спотовий «PnL» тут — це КЕШ-ФЛО: купівля йде
+            # мінусом, продаж плюсом. Поки монети не продані, їхня вартість
+            # сидить у мінусі й виглядає як збиток, яким не є. Тому поруч
+            # завжди стоїть, скільки саме лежить у монетах.
+            meta.append(f"у монетах ~{held_value:.2f}")
         meta.append(f"position: {position}" if position else "position: none")
         lines.append(" · ".join(meta))
         lines.append("")

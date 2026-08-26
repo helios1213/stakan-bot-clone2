@@ -211,6 +211,9 @@ class FuturesSoftStart:
         self.cfg.validate()
         self.client = client
         self.fee_gate = fee_gate
+        # Деталі останнього закриття — читає раннер для звіту (тримання, PnL).
+        # Раніше звіт друкував «after 0min», бо тривалості не було звідки взяти.
+        self.last_closed: dict | None = None
         self.universe = list(universe)
         self.rng = rng or random.Random()
         self.dry_run = bool(dry_run)
@@ -545,11 +548,57 @@ class FuturesSoftStart:
                          pos.symbol, json.dumps(resp or {})[:200])
             return False
 
-        logger.info("[futures] CLOSED %s after %.1fmin%s",
-                    pos.symbol, pos.held_minutes(), " (forced)" if forced else "")
+        held = pos.held_minutes()
+        # РЕАЛІЗОВАНИЙ PnL із біржі, а не з наших припущень. Модель вартості
+        # рахувала лише спред+фандинг+комісію і свідомо ігнорувала рух ринку —
+        # але за 53 хвилини тримання рух і є основною частиною вартості: на
+        # першому ж живому циклі фʼючерсний баланс змінився на -0.40 USDT при
+        # комісії 0.03. Тепер це видно у звіті, а не лишається за кадром.
+        realised = await self._realised_pnl(pos)
+        self.last_closed = {"symbol": pos.symbol, "held_min": held,
+                            "realised": realised}
+        logger.info("[futures] CLOSED %s after %.1fmin%s%s",
+                    pos.symbol, held, " (forced)" if forced else "",
+                    f" | realised={realised:+.4f} USDT"
+                    if realised is not None else " | realised=невідомо")
+        if realised is not None and self.budget is not None:
+            try:
+                self.budget.record_pnl(realised, f"futures {pos.symbol}")
+            except Exception:
+                logger.debug("futures soft-start: PnL не записано", exc_info=True)
         self.state.position = None
         save_state(self.cfg.state_path, self.state)
         return True
+
+    async def _realised_pnl(self, pos) -> float | None:
+        """Реалізований PnL щойно закритої позиції, або None якщо не прочитали.
+
+        None — це «невідомо», НЕ нуль: приписати нуль означало б показати
+        збиткову угоду як безкоштовну. Пошук за символом і часом відкриття,
+        бо на акаунті можуть бути й інші закриті позиції.
+        """
+        try:
+            from src.exchanges.mexc_rest import to_mexc
+            cs = to_mexc(pos.symbol)
+            r = await self.client.get_history_positions(symbol=cs, page_size=10)
+            rows = (r or {}).get("data") or []
+            opened_ms = int(pos.opened_at * 1000)
+            best = None
+            for row in rows:
+                if row.get("symbol") != cs:
+                    continue
+                # Допуск 60с: MEXC округлює час, а позиція одна за раз.
+                if int(row.get("createTime", 0) or 0) < opened_ms - 60_000:
+                    continue
+                best = row
+                break
+            if best is None:
+                return None
+            return float(best.get("realised") or 0.0)
+        except Exception:
+            logger.debug("futures soft-start: історію позицій не прочитано",
+                         exc_info=True)
+            return None
 
     # ---- asking the exchange --------------------------------------------
 

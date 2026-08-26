@@ -50,6 +50,12 @@ class BudgetState:
     max_usdt: float = DEFAULT_MAX_COST_USDT
     spent_usdt: float = 0.0
     entries: list = field(default_factory=list)   # recent charges, for the report
+    # Реалізований PnL прогріву (може бути ±). ОКРЕМО від `spent_usdt`, бо це
+    # різні за природою числа: `spent` — те, що ми свідомо платимо (спред,
+    # комісія, фандинг) і що відоме ДО відправки; `pnl` — рух ринку, відомий
+    # лише постфактум і здатний бути додатним. Змішавши їх в одне поле, ми б
+    # втратили можливість сказати, скільки прогрів коштує САМ ПО СОБІ.
+    pnl_usdt: float = 0.0
 
     def remaining(self) -> float:
         return max(0.0, self.max_usdt - self.spent_usdt)
@@ -105,6 +111,38 @@ class SoftStartBudget:
 
     # ---- charging -------------------------------------------------------
 
+    def record_pnl(self, usdt: float, reason: str) -> None:
+        """Записати реалізований PnL (±). Стелю не чіпає — її більше немає.
+
+        Двосторонній, на відміну від `charge`: прибуткове закриття справді
+        зменшує вартість прогріву, і ховати це було б брехнею в наш бік.
+        """
+        try:
+            amount = float(usdt)
+        except (TypeError, ValueError):
+            return
+        self.state.pnl_usdt += amount
+        self.state.entries.append(
+            {"ts": int(time.time()), "usdt": round(amount, 6),
+             "reason": f"PnL {reason}"})
+        if len(self.state.entries) > 200:
+            self.state.entries = self.state.entries[-200:]
+        self._save()
+        logger.info("soft-start PnL: %+.4f USDT (%s) — сумарно %+.4f",
+                    amount, reason, self.state.pnl_usdt)
+
+    @property
+    def pnl(self) -> float:
+        return self.state.pnl_usdt
+
+    @property
+    def net_cost(self) -> float:
+        """Скільки прогрів коштував РАЗОМ: свідомі витрати мінус зароблене.
+
+        Додатне = прогрів у мінус; від'ємне = вийшли в плюс попри витрати.
+        """
+        return self.state.spent_usdt - self.state.pnl_usdt
+
     def charge(self, cost_usdt: float, reason: str) -> None:
         """Book a cost. Negative amounts are ignored: a profit never refunds."""
         amount = max(0.0, float(cost_usdt))
@@ -117,12 +155,10 @@ class SoftStartBudget:
         if len(self.state.entries) > 200:
             self.state.entries = self.state.entries[-200:]
         self._save()
-        logger.info("soft-start budget: -%.4f USDT (%s) — spent %.4f / %.2f",
-                    amount, reason, self.state.spent_usdt, self.state.max_usdt)
-        if self.state.exhausted():
-            logger.warning("soft-start budget EXHAUSTED (%.4f / %.2f USDT) — "
-                           "no further warming orders will be placed",
-                           self.state.spent_usdt, self.state.max_usdt)
+        # Без «/стеля» і без попередження про вичерпання: стелю прибрано,
+        # і рядок, що обіцяє зупинку якої не буде, — це брехливий лог.
+        logger.info("soft-start витрати: -%.4f USDT (%s) — разом %.4f",
+                    amount, reason, self.state.spent_usdt)
 
     def reset(self) -> None:
         self.state = BudgetState(max_usdt=self.state.max_usdt)

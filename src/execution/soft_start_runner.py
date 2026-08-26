@@ -260,11 +260,15 @@ class SlotWarmer:
                     hold, vol=int(pos.get("vol") or 0),
                     notional=float(pos.get("notional") or 0.0), **st)
             elif p0 and not p1:
-                held = 0.0
+                # Тримання і PnL — із `last_closed`, який ставить сам рушій.
+                # Раніше сюди йшов літерал 0.0, і звіт друкував «after 0min»
+                # на позиції, що трималась 53 хвилини: число було не порожнє, а
+                # ВИГАДАНЕ, що гірше — воно виглядає як вимір.
                 last = getattr(self.futures, "last_closed", None) or {}
-                if last.get("symbol") == p0:
-                    held = float(last.get("held_min") or 0.0)
-                await self.reporter.futures_close(p0, held, **st)
+                held = (float(last.get("held_min") or 0.0)
+                        if last.get("symbol") == p0 else 0.0)
+                await self.reporter.futures_close(
+                    p0, held, realised=last.get("realised"), **st)
         except Exception as e:
             logger.debug("soft-start reporter diff failed: %s", e)
 
@@ -276,8 +280,29 @@ class SlotWarmer:
             "spent": self.budget.spent,
             # None = стелі немає. Облік витрат лишився, ліміт прибрано.
             "ceiling": None,
+            # Рух ринку: реалізований PnL фʼючерсів + спотовий кеш-фло.
+            "pnl": self.budget.pnl,
+            "held_value": self._held_spot_value(),
             "position": pos,
         }
+
+    def _held_spot_value(self) -> float:
+        """Скільки USDT зараз лежить у куплених монетах, приблизно.
+
+        Потрібне САМЕ поруч зі спотовим кеш-фло: купівля йде в облік мінусом, і
+        поки монету не продано, вона виглядає як збиток, яким не є. Рахуємо з
+        плану (витрачено мінус повернуто) — це не ринкова переоцінка, а
+        вкладена сума, і саме так вона й підписана у звіті.
+        """
+        try:
+            p = self.spot.plan
+            spent = float(getattr(p, "spent_usdt", 0.0) or 0.0)
+            back = sum(float(e.get("usdt") or 0.0)
+                       for e in (self.budget.state.entries or [])
+                       if str(e.get("reason", "")).startswith("PnL spot sell"))
+            return max(0.0, spent - back)
+        except Exception:
+            return 0.0
 
     def _apply_day_weight(self) -> None:
         """Reshape today's targets by the day's randomly drawn activity weight.

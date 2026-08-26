@@ -244,6 +244,8 @@ class SpotSoftStart:
                 "kind": "buy", "symbol": symbol, "usdt": usdt,
                 "qty": res.quantity, "price": res.price,
             }
+            if self.budget is not None and not res.dry_run:
+                self.budget.record_pnl(-usdt, f"spot buy {symbol}")
             save_plan(cfg, p)
             if self.budget is not None and not res.dry_run:
                 self.budget.charge(cost, f"spot buy {symbol}"
@@ -296,10 +298,19 @@ class SpotSoftStart:
                                      price=px * (1 - cfg.marketable_buffer))
         if res.ok:
             p.sells_done += 1
+            proceeds = qty * px
             self.last_action = {
-                "kind": "sell", "symbol": symbol, "usdt": qty * px,
+                "kind": "sell", "symbol": symbol, "usdt": proceeds,
                 "qty": res.quantity, "price": res.price,
             }
+            # СПОТОВИЙ КЕШ-ФЛО у той самий облік, що й фʼючерсний PnL.
+            # Покупка — це не витрата: USDT перетворились на монету, і вартість
+            # нікуди не зникла. Витратою є РІЗНИЦЯ між тим, що вклали, і тим,
+            # що повернули, і вона стає відомою лише на продажі. Тому продаж
+            # записується як +proceeds, а купівля як -usdt — сума по кампанії
+            # і є реалізованим спотовим результатом (решта лишається в монетах).
+            if self.budget is not None and not res.dry_run:
+                self.budget.record_pnl(proceeds, f"spot sell {symbol}")
             save_plan(cfg, p)
             if self.budget is not None and not res.dry_run:
                 self.budget.charge(cost, f"spot sell {symbol}"
