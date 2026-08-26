@@ -104,7 +104,10 @@ def test_hold_under_ten_minutes_is_rejected(tmp_path):
 def test_daily_plan_within_spec(tmp_path):
     for seed in range(40):
         ss, _, _ = mk(tmp_path, seed=seed)
-        assert 1 <= ss.state.orders_target <= 3
+        # 3 -> 6 (рішення оператора 2026-08-26). Пінимо КОНФІГ, а не число:
+        # інакше кожна зміна квоти ламає тест на рівному місці.
+        assert (ss.cfg.orders_per_day_min <= ss.state.orders_target
+                <= ss.cfg.orders_per_day_max)
 
 
 def test_pause_between_orders_is_3_to_10h(tmp_path):

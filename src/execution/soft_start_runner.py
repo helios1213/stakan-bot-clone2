@@ -324,9 +324,17 @@ class SlotWarmer:
         """
         sp, fu = self.spot.plan, self.futures.state
         before = (sp.buys_target, sp.sells_target, fu.orders_target)
-        sp.buys_target = min(sp.buys_target, self.campaign.scale_target(10))
-        sp.sells_target = min(sp.sells_target, self.campaign.scale_target(10))
-        fu.orders_target = min(fu.orders_target, self.campaign.scale_target(3))
+        # Бази беруться з КОНФІГУ, а не прибиті числами. Були 10/10/3 — рівно
+        # ті самі максимуми, що в конфігах; після підняття квоти вони мовчки
+        # стали б стелею НИЖЧОЮ за розіграний план, тобто квота піднялась би
+        # тільки на папері. Той самий клас, що й дубль формули ваги.
+        scfg, fcfg = self.spot.cfg, self.futures.cfg
+        sp.buys_target = min(
+            sp.buys_target, self.campaign.scale_target(scfg.buys_per_day_max))
+        sp.sells_target = min(
+            sp.sells_target, self.campaign.scale_target(scfg.sells_per_day_max))
+        fu.orders_target = min(
+            fu.orders_target, self.campaign.scale_target(fcfg.orders_per_day_max))
         after = (sp.buys_target, sp.sells_target, fu.orders_target)
         if after != before and after != self._weighted_logged:
             logger.info(

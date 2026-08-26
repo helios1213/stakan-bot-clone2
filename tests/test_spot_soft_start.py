@@ -149,14 +149,19 @@ async def test_targets_cap_the_day(tmp_path):
 
 
 def test_day_plan_respects_spec_bounds(tmp_path):
-    """1-4 tokens/day, 0-10 buys, 0-10 sells — across many rolls."""
+    """1-4 токени/день, купівлі й продажі — В МЕЖАХ КОНФІГУ.
+
+    Межі беруться з `c`, а не прибиті числами: квоту підняли 2026-08-26
+    (10/10 -> 25/20), і прибите число ламало б цей тест на кожній зміні
+    квоти, нічого при цьому не перевіряючи по суті.
+    """
     c = cfg(tmp_path, universe=("A", "B", "C", "D", "E", "F"))
     for seed in range(60):
         p = new_day_plan(c, random.Random(seed))
         assert 1 <= len(p.tokens) <= 4
         assert len(set(p.tokens)) == len(p.tokens), "no duplicate tokens"
-        assert 0 <= p.buys_target <= 10
-        assert 0 <= p.sells_target <= 10
+        assert c.buys_per_day_min <= p.buys_target <= c.buys_per_day_max
+        assert c.sells_per_day_min <= p.sells_target <= c.sells_per_day_max
 
 
 def test_active_hours_window(tmp_path):

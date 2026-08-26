@@ -40,7 +40,16 @@ logger = logging.getLogger(__name__)
 
 # Below this a spot account cannot place a compliant order at all: MEXC's
 # practical spot minimum is ~1.5 USDT and we keep a baseline hold per token.
-MIN_VIABLE_BALANCE_USDT = 25.0
+# Нижче цього балансу половина прогріву простоює. 25 -> 10 (рішення оператора
+# 2026-08-26): на живому дні спот просів 25.00 -> 13.21, бо покупки
+# перетворили USDT на монети, і половина стала — тобто поріг зупиняв фарм
+# рівно так само, як стеля витрат, яку прибрали.
+#
+# ЧОМУ САМЕ 10, А НЕ 5. Розмір ордера рахується як 12% балансу, а мінімальний
+# ноціонал на споті MEXC ~1 USDT. При балансі 5 стеля розміру була б 0.60 —
+# нижче мінімуму, і КОЖЕН ордер відхилявся б біржею. 10 лишає робочий діапазон
+# (див. scale_spot_config, який тепер теж масштабує НИЖНЮ межу).
+MIN_VIABLE_BALANCE_USDT = 10.0
 
 DEFAULT_MAX_COST_USDT = 5.0
 
@@ -227,10 +236,16 @@ def scale_spot_config(balance_usdt: float, *, max_tokens: int = 4) -> SpotSizing
     1.5-6.0 and 4.0 — bigger account, harder warming, same config object.
     """
     bal = max(0.0, float(balance_usdt))
-    order_max = max(1.5, round(bal * 0.12, 2))
+    # НИЖНЯ МЕЖА ТЕЖ МАСШТАБУЄТЬСЯ. Була прибита 1.5, і на малому балансі це
+    # ламало сайзинг: при 13 USDT стеля 12% = 1.59, тобто діапазон 1.5-1.59 —
+    # усі ордери фактично однакові, а нижче 12.5 нижня межа взагалі
+    # перевищувала верхню. 1.1 — запас над мінімальним ноціоналом MEXC (~1).
+    order_min = max(1.1, round(bal * 0.04, 2))
+    # Стеля не менша за 1.6x від низу, інакше «діапазон» вироджується в точку.
+    order_max = max(round(order_min * 1.6, 2), round(bal * 0.12, 2))
     baseline = max(1.0, round(bal * 0.08, 2))
     return SpotSizing(
-        order_usdt_min=1.5,
+        order_usdt_min=order_min,
         order_usdt_max=order_max,
         baseline_usdt_per_token=baseline,
         daily_buy_usdt_ceiling=round(bal, 2),

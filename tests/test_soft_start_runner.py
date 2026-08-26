@@ -415,6 +415,9 @@ class _FakeFutures:
         if position is _FakeFutures._DEFAULT:
             position = {"symbol": "HYPEUSDT"}
         self.state = type("S", (), {})()
+        # cfg дзеркалить реальний FuturesSoftStart: раннер бере базу ваги дня
+        # з конфігу, а не з прибитого числа.
+        self.cfg = type("FC", (), {"orders_per_day_max": 6})()
         self.state.position = position
         self.state.pending = pending
         self.state.needs_exchange_check = needs_check
@@ -466,6 +469,8 @@ async def test_an_idle_futures_half_still_drains_a_leftover_position():
     w.futures = _FakeFutures()
     w.spot = type("S", (), {"plan": type("P", (), {"buys_done": 0, "sells_done": 0,
                                                    "buys_target": 0, "sells_target": 0})(),
+                            "cfg": type("SC", (), {"buys_per_day_max": 25,
+                                                   "sells_per_day_max": 20})(),
                             "tick": _noop})()
     # scale_target — той самий дрейф фейків, що вже двічі ламав цю сюїту:
     # раннер тепер бере стелю з кампанії (одна формула замість дубля), тож

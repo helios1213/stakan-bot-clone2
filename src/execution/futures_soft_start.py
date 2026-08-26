@@ -65,7 +65,10 @@ ORDER_TYPE_MARKET = "5"
 @dataclass
 class FuturesSoftStartConfig:
     orders_per_day_min: int = 1
-    orders_per_day_max: int = 3
+    # 3 -> 6 (рішення оператора 2026-08-26). Пауза 3-10 год між відкриттями
+    # лишається, тож 6 ордерів фізично влазять лише при коротких паузах —
+    # це стеля, а не ціль.
+    orders_per_day_max: int = 6
     hold_minutes_min: int = 10           # spec: never less than 10
     hold_minutes_max: int = 300
     pause_hours_min: float = 3.0

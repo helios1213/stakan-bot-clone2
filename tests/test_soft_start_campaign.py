@@ -301,13 +301,18 @@ def test_scale_target_is_actually_used_by_the_runner():
     class _State:
         orders_target = 3
 
+    # cfg із максимумами: раннер бере бази ваги з КОНФІГУ, а не з прибитих
+    # чисел — інакше після підняття квоти стеля лишилась би старою і квота
+    # піднялась би тільки на папері.
+    _scfg = type("SC", (), {"buys_per_day_max": 25, "sells_per_day_max": 20})()
+    _fcfg = type("FC", (), {"orders_per_day_max": 6})()
     w.campaign = _Camp()
-    w.spot = type("S", (), {"plan": _Plan()})()
-    w.futures = type("F", (), {"state": _State()})()
+    w.spot = type("S", (), {"plan": _Plan(), "cfg": _scfg})()
+    w.futures = type("F", (), {"state": _State(), "cfg": _fcfg})()
 
     SlotWarmer._apply_day_weight(w)
 
-    assert calls == [10, 10, 3], (
+    assert calls == [25, 20, 6], (
         f"раннер не кличе campaign.scale_target — формула знову дублюється: "
         f"{calls}")
     assert w.spot.plan.buys_target == 2
@@ -324,9 +329,13 @@ def test_weight_never_raises_a_target_only_lowers_it():
     w._weighted_logged = None
     w.campaign = type("C", (), {"scale_target": lambda self, b: 99,
                                 "day_weight": lambda self: 1.0})()
+    _scfg = type("SC", (), {"buys_per_day_max": 25, "sells_per_day_max": 20})()
+    _fcfg = type("FC", (), {"orders_per_day_max": 6})()
     w.spot = type("S", (), {"plan": type("P", (), {"buys_target": 3,
-                                                   "sells_target": 1})()})()
-    w.futures = type("F", (), {"state": type("St", (), {"orders_target": 1})()})()
+                                                   "sells_target": 1})(),
+                            "cfg": _scfg})()
+    w.futures = type("F", (), {"state": type("St", (), {"orders_target": 1})(),
+                               "cfg": _fcfg})()
 
     SlotWarmer._apply_day_weight(w)
     assert (w.spot.plan.buys_target, w.spot.plan.sells_target,

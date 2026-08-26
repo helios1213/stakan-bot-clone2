@@ -49,10 +49,14 @@ class SoftStartConfig:
     universe: tuple[str, ...] = ("MX",)
     tokens_per_day_min: int = 1
     tokens_per_day_max: int = 4
+    # Денна квота піднята 2026-08-26 (рішення оператора): 10/10 давали ~10 дій
+    # на добу, і після розмазування по 17-годинному вікну акаунт виглядав
+    # майже мертвим. Продажів більше, ніж було, бо саме вони повертають USDT —
+    # без них покупки впираються в денну стелю (= баланс) і цикл глухне.
     buys_per_day_min: int = 0
-    buys_per_day_max: int = 10
+    buys_per_day_max: int = 25
     sells_per_day_min: int = 0
-    sells_per_day_max: int = 10
+    sells_per_day_max: int = 20
     order_usdt_min: float = 1.5          # keep >= the observed spot min notional
     order_usdt_max: float = 150.0
     baseline_usdt_per_token: float = 10.0   # never sell a token below this value

@@ -141,7 +141,11 @@ def test_baselines_never_lock_up_the_whole_balance():
 
 def test_order_size_never_drops_below_the_exchange_minimum():
     s = scale_spot_config(5.0)                 # tiny balance
-    assert s.order_usdt_min >= 1.5
+    # 1.5 -> 1.1 (2026-08-26): нижня межа тепер масштабується разом із
+    # балансом. Прибиті 1.5 при балансі 13 давали діапазон 1.5-1.59 (усі
+    # ордери однакові), а нижче 12.5 низ перевищував верх. Інваріанта, що
+    # ЛИШАЄТЬСЯ: не падати під мінімальний ноціонал спота MEXC (~1 USDT).
+    assert s.order_usdt_min >= 1.05
     assert s.order_usdt_max >= 1.5
 
 
@@ -174,7 +178,10 @@ def test_affordable_refuses_to_corner_the_wallet():
 
 
 def test_min_viable_balance_is_the_documented_floor():
-    assert MIN_VIABLE_BALANCE_USDT == 25.0
+    # 25 -> 10 (рішення оператора 2026-08-26): поріг зупиняв фарм так само,
+    # як стеля витрат, яку прибрали. 10, а не 5, бо при 5 стеля розміру (12%)
+    # була б 0.60 — нижче мінімального ноціоналу біржі.
+    assert MIN_VIABLE_BALANCE_USDT == 10.0
 
 
 # ---- integration with the spot warmer -----------------------------------
@@ -210,3 +217,31 @@ async def test_spot_warmer_keeps_buying_regardless_of_spend(tmp_path, monkeypatc
     assert await e.maybe_buy() is True
     assert c.orders, "стеля витрат більше не має блокувати прогрів"
     assert b.spent > 0.001, "витрати перестали обліковуватись"
+
+
+def test_order_range_never_degenerates_to_a_single_size():
+    """Нижня межа масштабується, але діапазон мусить лишатись діапазоном.
+
+    При прибитих 1.5 і балансі 13 виходило 1.50-1.59 — формально діапазон, а
+    практично одна й та сама сума в кожному ордері. Це рівно той підпис, проти
+    якого робилась рандомізація розміру.
+    """
+    from src.execution.soft_start_budget import (MIN_VIABLE_BALANCE_USDT,
+                                                 scale_spot_config)
+    for bal in (MIN_VIABLE_BALANCE_USDT, 13.21, 25.0, 50.0, 100.0):
+        s = scale_spot_config(bal)
+        assert s.order_usdt_max >= s.order_usdt_min * 1.5, (
+            f"баланс {bal}: діапазон {s.order_usdt_min}-{s.order_usdt_max} "
+            f"вироджений")
+        assert s.order_usdt_min >= 1.05, f"баланс {bal}: нижче мін. ноціоналу"
+
+
+def test_the_weight_cap_follows_the_config_not_a_hardcoded_number():
+    """Бази ваги дня були прибиті (10/10/3) — рівно старі максимуми. Після
+    підняття квоти вони мовчки стали б стелею НИЖЧОЮ за розіграний план, і
+    квота піднялась би тільки на папері."""
+    import inspect
+    from src.execution import soft_start_runner as ssr
+    src = inspect.getsource(ssr.SlotWarmer._apply_day_weight)
+    assert "buys_per_day_max" in src and "orders_per_day_max" in src
+    assert "scale_target(10)" not in src and "scale_target(3)" not in src
