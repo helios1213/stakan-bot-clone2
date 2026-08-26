@@ -84,6 +84,15 @@ class FuturesSoftStartConfig:
     # беруться теж, а комісія списується у бюджет як витрата.
     # `require_zero_taker=True` лишається як ПРІОРИТЕТ (спершу шукаємо 0/0),
     # а `allow_paid_fees=False` повертає стару жорстку поведінку.
+    # Години, у які дозволено ВІДКРИВАТИ. Спотова половина такий гейт мала з
+    # самого початку, фʼючерсна — ні, і 26.08 вона відкрила позицію о 01:35
+    # ночі, поки спот законно спав. Одна половина суворо тримається людських
+    # годин, друга торгує о третій ночі — це внутрішня неузгодженість, а саме
+    # неузгодженості й шукають системи, що ловлять автоматизацію.
+    # ЗАКРИТТЯ ЦИМ НЕ ГЕЙТИТЬСЯ І НЕ МОЖЕ БУТИ: позиція, відкрита о 22:30 з
+    # триманням 300 хв, мусить закритись о 03:30, інакше ми її осиротимо.
+    active_hour_start: int = 6
+    active_hour_end: int = 23
     require_zero_taker: bool = True      # спершу пробувати пари з 0/0
     allow_paid_fees: bool = True         # якщо 0% немає — гріти платно і рахувати
     max_fee_frac: float = 0.001          # стеля: 10 bps за ногу, вище — не гріти
@@ -98,6 +107,8 @@ class FuturesSoftStartConfig:
             raise ValueError("pause window invalid")
         if not 1 <= self.orders_per_day_min <= self.orders_per_day_max:
             raise ValueError("orders per day invalid")
+        if not 0 <= self.active_hour_start < self.active_hour_end <= 24:
+            raise ValueError("active hours invalid")
         if self.margin_usdt_min <= 0 or self.margin_usdt_max < self.margin_usdt_min:
             raise ValueError("margin range invalid")
         if not 1 <= self.leverage_min <= self.leverage_max:
@@ -802,6 +813,12 @@ class FuturesSoftStart:
 
     # ---- loop -----------------------------------------------------------
 
+    def active_now(self, now=None) -> bool:
+        """Чи можна ВІДКРИВАТИ зараз. Закриття не питає цього ніколи."""
+        from datetime import datetime
+        h = (now or datetime.now()).hour
+        return self.cfg.active_hour_start <= h < self.cfg.active_hour_end
+
     async def tick(self) -> None:
         try:
             if not self.state.is_today():
@@ -822,6 +839,8 @@ class FuturesSoftStart:
                 return
             if time.time() < self.state.next_open_at:
                 return
+            if not self.active_now():
+                return                           # поза людськими годинами
             await self.open_position()
         except Exception as e:
             logger.warning("futures soft-start tick error (contained): %s", e)

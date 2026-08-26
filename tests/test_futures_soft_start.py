@@ -781,3 +781,62 @@ async def test_a_fee_that_disagrees_with_our_estimate_is_flagged(tmp_path, caplo
         await ss._realised_pnl(pos)
     assert any("комісія біржі" in r.getMessage() for r in caplog.records), \
         "розбіжність комісії пройшла мовчки"
+
+
+# ---- людські години і для фʼючерсів (2026-08-26) ---------------------------
+
+@pytest.mark.asyncio
+async def test_futures_does_not_open_outside_human_hours(tmp_path, live,
+                                                         monkeypatch):
+    """Спот мав вікно 6-23 з самого початку, фʼючерси — ні, і 26.08 вони
+    відкрили позицію о 01:35 ночі, поки спот законно спав. Одна половина
+    тримається людських годин, друга торгує о третій ночі — це внутрішня
+    неузгодженість, а саме її й шукають системи проти автоматизації.
+    """
+    ss, cl, _ = mk(tmp_path, {"HYPEUSDT": (0, 0)}, dry_run=False)
+    ss.state.orders_target = 3
+    ss.state.next_open_at = 0.0
+    monkeypatch.setattr(ss, "active_now", lambda now=None: False)
+    await ss.tick()
+    assert cl.opened == [], "ордер пішов поза активним вікном"
+
+    monkeypatch.setattr(ss, "active_now", lambda now=None: True)
+    await ss.tick()
+    assert cl.opened, "у активні години відкриття мусить працювати"
+
+
+@pytest.mark.asyncio
+async def test_a_position_still_closes_outside_the_window(tmp_path, live,
+                                                          monkeypatch):
+    """НАЙВАЖЛИВІШЕ ТУТ. Позиція, відкрита о 22:30 з триманням 300 хв, мусить
+    закритись о 03:30. Гейт на закритті осиротив би її на біржі — рівно та
+    аварія, проти якої писався весь recover/adopt механізм."""
+    ss, cl, _ = mk(tmp_path, {"HYPEUSDT": (0, 0)}, dry_run=False)
+    ss.state.orders_target = 1
+    ss.state.next_open_at = 0.0
+    monkeypatch.setattr(ss, "active_now", lambda now=None: True)
+    await ss.tick()
+    assert ss.state.position is not None
+
+    # Настав час закриватись, і ми вже поза вікном.
+    ss.state.position["close_after"] = 0.0
+    monkeypatch.setattr(ss, "active_now", lambda now=None: False)
+    await ss.tick()
+    assert ss.state.position is None, (
+        "позицію не закрито поза вікном — вона лишилась би висіти на біржі")
+
+
+def test_futures_window_matches_the_spot_one_by_default():
+    """Та сама людина — ті самі години. Різні вікна в двох половинах були б
+    такою ж неузгодженістю, як і повна відсутність вікна в одній із них."""
+    from src.execution.futures_soft_start import FuturesSoftStartConfig
+    from src.execution.spot_soft_start import SoftStartConfig
+    f, s = FuturesSoftStartConfig(), SoftStartConfig()
+    assert (f.active_hour_start, f.active_hour_end) == \
+           (s.active_hour_start, s.active_hour_end)
+
+
+def test_broken_window_is_rejected_at_config_time():
+    from src.execution.futures_soft_start import FuturesSoftStartConfig
+    with pytest.raises(ValueError, match="active hours"):
+        FuturesSoftStartConfig(active_hour_start=23, active_hour_end=6).validate()
