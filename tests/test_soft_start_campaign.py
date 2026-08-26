@@ -342,3 +342,103 @@ def test_the_rolled_plan_log_does_not_claim_to_be_final():
     src = inspect.getsource(SpotSoftStart.__init__)
     assert "РОЗІГРАНО" in src and "вага дня застосується далі" in src
     assert '"soft-start plan %s' not in src
+
+
+# ---- вибір ПАР: спот і фʼючерси (2026-08-26) -------------------------------
+
+def test_campaign_token_pool_is_rolled_once_and_remembered(tmp_path):
+    """Рестарт не має міняти те, чим акаунт торгує — це виглядало б як інша
+    людина за тим самим ключем."""
+    import random
+    from src.execution.soft_start_campaign import SoftStartCampaign
+    path = str(tmp_path / "c.json")
+    c1 = SoftStartCampaign(path, 3, rng=random.Random(1))
+    first = c1.token_pool(["MX", "DOGE", "XRP", "SOL", "TRX", "ADA"])
+    assert 1 <= len(first) <= 5
+
+    c2 = SoftStartCampaign(path, 3, rng=random.Random(999))
+    assert c2.token_pool(["MX", "DOGE", "XRP", "SOL", "TRX", "ADA"]) == first
+
+
+def test_token_pool_is_not_always_the_same_across_campaigns(tmp_path):
+    """Різні кампанії (різні слоти/машини) мусять отримувати різні набори —
+    інакше «випадковий вибір» вироджується в один список для всіх."""
+    import random
+    from src.execution.soft_start_campaign import SoftStartCampaign
+    cands = ["MX", "DOGE", "XRP", "SOL", "TRX", "ADA", "LTC", "SHIB", "PEPE"]
+    pools = set()
+    for seed in range(12):
+        c = SoftStartCampaign(str(tmp_path / f"c{seed}.json"), 3,
+                              rng=random.Random(seed))
+        pools.add(tuple(c.token_pool(cands)))
+    assert len(pools) >= 6, f"набори майже не різняться: {pools}"
+
+
+def test_a_delisted_token_drops_out_of_a_saved_pool(tmp_path):
+    import random
+    from src.execution.soft_start_campaign import SoftStartCampaign
+    path = str(tmp_path / "c.json")
+    c = SoftStartCampaign(path, 3, rng=random.Random(1))
+    c.state.tokens = ["MX", "GONE", "DOGE"]
+    kept = c.token_pool(["MX", "DOGE", "XRP"])
+    assert "GONE" not in kept and set(kept) <= {"MX", "DOGE"}
+
+
+@pytest.mark.asyncio
+async def test_futures_pair_is_random_among_equally_priced_ones():
+    """ДЕФЕКТ, ЯКИЙ ЦЕ ЛІКУЄ (мій власний): було `paid.sort(); paid[0]`.
+    Ставки рівні (на акаунті без промо всі пари 0.0004), тож нічия ламалась
+    за НАЗВОЮ — і завжди вигравала алфавітно перша (`1000PEPEUSDT`).
+    Випадковість вибору пари зникала повністю, і помітно це лише з логів.
+    """
+    import random
+    from src.execution.futures_soft_start import (FuturesSoftStart,
+                                                  FuturesSoftStartConfig)
+
+    class _Fee:
+        def __init__(self, t): self.taker = t; self.maker = 0.0
+        @property
+        def zero_both(self): return self.taker == 0.0
+
+    class _Gate:
+        async def fee(self, sym): return _Fee(0.0004)
+
+    syms = ["1000PEPEUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT"]
+    picked = set()
+    for seed in range(30):
+        ss = FuturesSoftStart.__new__(FuturesSoftStart)
+        ss.universe = list(syms)
+        ss.fee_gate = _Gate()
+        ss.cfg = FuturesSoftStartConfig(state_path="/tmp/x.json")
+        ss.rng = random.Random(seed)
+        sym, fee = await ss.pick_pair()
+        assert fee == 0.0004
+        picked.add(sym)
+    assert len(picked) >= 4, f"пара майже не змінюється: {picked}"
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_cheaper_pair_still_wins():
+    """Випадковість — тільки СЕРЕД НАЙДЕШЕВШИХ, а не замість вибору."""
+    import random
+    from src.execution.futures_soft_start import (FuturesSoftStart,
+                                                  FuturesSoftStartConfig)
+
+    fees = {"AUSDT": 0.0004, "BUSDT": 0.0001, "CUSDT": 0.0004}
+
+    class _Fee:
+        def __init__(self, t): self.taker = t; self.maker = 0.0
+        @property
+        def zero_both(self): return self.taker == 0.0
+
+    class _Gate:
+        async def fee(self, sym): return _Fee(fees[sym])
+
+    for seed in range(15):
+        ss = FuturesSoftStart.__new__(FuturesSoftStart)
+        ss.universe = list(fees)
+        ss.fee_gate = _Gate()
+        ss.cfg = FuturesSoftStartConfig(state_path="/tmp/x.json")
+        ss.rng = random.Random(seed)
+        sym, fee = await ss.pick_pair()
+        assert sym == "BUSDT" and fee == 0.0001

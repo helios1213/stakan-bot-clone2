@@ -42,6 +42,21 @@ logger = logging.getLogger(__name__)
 
 POLL_SEC = 60
 
+# Кандидати на спотовий прогрів. Юніверс був `("MX",)` — один токен, тобто
+# всі покупки йшли по MX, а `tokens_per_day_max=4` не мав сенсу взагалі.
+#
+# Список — ЛІКВІДНІ USDT-пари, кожна перевірена на резолвність currencyId
+# (2026-08-26, публічна сторінка пари, без авторизації: усі 17 віддали
+# ps/qs). Фʼючерсні «акційні» контракти (SOXL, SNDK, SKHYNIX, SPCX, MU) сюди
+# НЕ входять — на споті їх немає.
+#
+# Із цього списку кампанія розігрує СВІЙ набір (3-5 токенів) один раз і
+# памʼятає його: кожен куплений токен лишає базовий залишок, який не можна
+# продати, тож нова монета щодня заблокувала б увесь баланс.
+SPOT_CANDIDATES = ("MX", "DOGE", "XRP", "SOL", "TRX", "ADA", "LTC", "SHIB",
+                   "PEPE", "LINK", "SUI", "ONDO", "ENA", "WLD", "PENGU",
+                   "XLM", "AVAX")
+
 # USDT on MEXC spot. Known constant — the balances endpoint is addressed by
 # currencyId, not by ticker.
 USDT_CURRENCY_ID = "128f589271cb4951b03e71e6323eb7be"
@@ -125,6 +140,31 @@ class SlotWarmer:
                            self.slot_id, e)
         return spot, fut
 
+    async def _spot_universe(self) -> list[str]:
+        """Токени кампанії, звірені з біржею ПЕРЕД використанням.
+
+        Резолвимо лише розіграний набір (3-5), а не всі 17 кандидатів: це
+        публічні запити, але зайві. Токен, що не резолвиться (делістинг, зміна
+        сторінки), просто випадає — краще гріти меншим набором, ніж кидати
+        ордери, які біржа відхилить. Якщо не лишилось нічого, падаємо на MX:
+        він і був єдиним юніверсом досі, тобто це рівно стара поведінка.
+        """
+        pool = self.campaign.token_pool(SPOT_CANDIDATES)
+        ok: list[str] = []
+        for t in pool:
+            try:
+                await self.spot_client._resolver.resolve(t)
+                ok.append(t)
+            except Exception as e:
+                logger.warning("soft-start slot %d: токен %s не резолвиться "
+                               "(%s) — пропускаю", self.slot_id, t, e)
+        if not ok:
+            logger.warning("soft-start slot %d: жоден токен набору не "
+                           "резолвиться — залишаюсь на MX", self.slot_id)
+            return ["MX"]
+        logger.info("soft-start slot %d: спотовий набір %s", self.slot_id, ok)
+        return ok
+
     async def start(self) -> None:
         spot_bal, fut_bal = await self._read_balances()
         logger.info("soft-start slot %d: balances spot=%.2f futures=%.2f USDT",
@@ -133,7 +173,9 @@ class SlotWarmer:
         # Sizing scales with the balance: 25 USDT warms gently, 50 warms harder,
         # same config object either way.
         sizing = scale_spot_config(spot_bal)
+        tokens = await self._spot_universe()
         spot_cfg = SoftStartConfig(
+            universe=tuple(tokens),
             state_path=f"{self.data_dir}/spot_soft_start_slot{self.slot_id}.json",
             order_usdt_min=sizing.order_usdt_min,
             order_usdt_max=sizing.order_usdt_max,

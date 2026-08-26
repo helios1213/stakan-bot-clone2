@@ -47,6 +47,12 @@ class CampaignState:
     # day index -> the activity weight rolled for that day (0.0-1.0). Persisted
     # so a restart resumes the same plan instead of rerolling it.
     day_weights: dict = field(default_factory=dict)
+    # Набір токенів на ВСЮ кампанію, розіграний один раз і збережений.
+    # Не «нові монети щодня»: кожен куплений токен лишає базовий залишок,
+    # який не можна продати, тож 12 різних монет за 3 дні заблокували б увесь
+    # спотовий баланс і прогрів став би нікуди. Плюс людина зазвичай крутить
+    # кілька своїх монет, а не нову щодня.
+    tokens: list = field(default_factory=list)
 
     def elapsed_days(self, now: float | None = None) -> float:
         if not self.started_at:
@@ -134,6 +140,30 @@ class SoftStartCampaign:
             logger.info("soft-start campaign: day %s weight %.2f",
                         key, self.state.day_weights[key])
         return float(self.state.day_weights[key])
+
+    def token_pool(self, candidates, n_min: int = 3, n_max: int = 5) -> list:
+        """Набір токенів кампанії: розіграти один раз і памʼятати.
+
+        Персиститься з тієї ж причини, що й вага дня: рестарт не має міняти
+        те, чим акаунт торгує, — це виглядало б як інша людина за тим самим
+        ключем. Якщо збережений набір більше не входить у кандидатів (токен
+        зник із біржі), відсіюємо його, а порожній набір розігруємо наново.
+        """
+        cands = [c for c in dict.fromkeys(candidates) if c]
+        if not cands:
+            return []
+        kept = [t for t in (self.state.tokens or []) if t in cands]
+        if kept:
+            if len(kept) != len(self.state.tokens or []):
+                self.state.tokens = kept
+                self._save()
+            return list(kept)
+        n = max(1, min(len(cands), self.rng.randint(n_min, n_max)))
+        picked = sorted(self.rng.sample(cands, n))
+        self.state.tokens = picked
+        self._save()
+        logger.info("soft-start campaign: набір токенів %s", picked)
+        return list(picked)
 
     def scale_target(self, base_max: int) -> int:
         """Стеля денної цілі (купівлі, продажі, фʼючерсні ордери) за вагою дня.
