@@ -237,6 +237,42 @@ async def db_prune_loop(db_path: str, live_db_path: str, research_path: str, int
         await asyncio.sleep(interval_sec)
 
 
+async def fee_watchdog_loop(webkey_store, webkey_client_pool, live_pool) -> None:
+    """Питати біржу про ставку і халтити слот ДО платного філу.
+
+    Наявний fee-guard реактивний — він спрацьовує вже на філі з комісією
+    (2026-08-25 це коштувало $0.407004). Тут ми питаємо
+    `/account/tiered_fee_rate/v2` напряму і зупиняємось раніше.
+
+    БЕЗПЕКА: помилка мережі НІКОЛИ не халтить (див. `fee_watchdog.py`),
+    потрібні два ненульові читання поспіль, і питаємо ПАРУ СЛОТА, а не BTC
+    (у BTC `taker 0.0002` навіть із промо — була б вічна хибна тривога).
+    """
+    from src.execution import fee_watchdog as _fw
+    from src.exchanges.mexc_rest import to_mexc
+    if not _fw.ENABLED:
+        logger.info("[FEE WATCH] вимкнено (FEE_WATCHDOG=0)")
+        return
+    logger.info("[FEE WATCH] старт: кожні %.0fс, підтверджень %d",
+                _fw.POLL_SEC, _fw.CONFIRMATIONS)
+    while True:
+        await asyncio.sleep(_fw.POLL_SEC)
+        try:
+            for slot in await webkey_store.list_live_active():
+                sid = slot.slot_id
+                pair = getattr(slot, "assigned_pair", None)
+                if not pair:
+                    continue
+                try:
+                    client = await webkey_client_pool.get(sid)
+                except Exception:
+                    continue          # немає ключа — нема про що питати
+                ex = (live_pool.active_executors() or {}).get(sid)
+                await _fw.WATCHDOG.check_slot(sid, client, to_mexc(pair), ex)
+        except Exception:
+            logger.exception("[FEE WATCH] цикл упав")
+
+
 async def dolos_config_refresh_loop(webkey_store, interval_sec: int = 21600) -> None:
     """Тягнути живий конфіг dolos (chash + parameters) раз на 6 годин.
 
@@ -973,6 +1009,13 @@ async def main() -> None:
         )
         # Initial sync from DB
         await live_pool.rebuild_from_store()
+        # Сторож комісії: питає біржу і халтить слот ДО платного філу.
+        # ЗАПУСКАЄТЬСЯ САМЕ ТУТ, а не разом з іншими задачами вище: там
+        # `live_pool` ще не існує (створюється нижче за текстом), і задача
+        # впала б на старті бота. Спіймано перевіркою порядку визначень.
+        asyncio.create_task(
+            fee_watchdog_loop(webkey_store, webkey_client_pool, live_pool),
+            name="fee_watchdog")
         # Per-slot account-recovery monitor: read the account's accumulated
         # drawdown on enable, refuse if deeper than cap, auto-stop (live off +
         # shadow) once the loss is recovered to within `recovery_buffer_usdt`.
