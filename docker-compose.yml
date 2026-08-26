@@ -56,7 +56,7 @@ services:
       # слотах на машину профілі не можуть перекритись за побудовою.
       - MEXC_DEVICE_OFFSET=2
       # Режим шляху ордера — див. коментар на primary. full | bare.
-      - MEXC_PATH_MODE=full
+      - MEXC_PATH_MODE=bare
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
