@@ -393,8 +393,14 @@ class TelegramAlerts:
             from src.execution.webkey import device_profile as _dp
 
             mode = getattr(_wc, "_PATH_MODE", "?")
-            on_order = "ТАК" if getattr(_wc, "_DOLOS_ON_ORDER", False) else "ні"
-            line = f"Шлях: <b>{mode}</b> · dolos на ордері: <b>{on_order}</b>"
+            on_order = bool(getattr(_wc, "_DOLOS_ON_ORDER", False))
+            # Назва режиму сама каже про dolos (`full` = з ним, `bare` = без),
+            # тож у звичайному стані другого слова не треба. АЛЕ: окрема змінна
+            # `MEXC_DOLOS_ON_ORDER` перебиває режим, і тоді назва бреше — саме
+            # в цьому випадку dolos дописується явно.
+            line = f"Режим: <b>{mode}</b>"
+            if on_order != (mode == "full"):
+                line += f" · dolos: <b>{'ТАК' if on_order else 'ні'}</b>"
 
             flags = []
             if getattr(_wc, "_DOLOS_LEGACY", False):

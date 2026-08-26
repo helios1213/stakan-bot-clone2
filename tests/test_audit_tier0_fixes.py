@@ -251,12 +251,29 @@ def _mode_line(monkeypatch, **env):
 def test_startup_line_states_the_dolos_mode(monkeypatch):
     """`full` і `bare` різняться тим, чи йде dolos на /order/create — тобто
     поведінкою на ГРОШОВОМУ шляху. Переплутати режим коштує дорого, а в логи
-    оператор заглядає рідко."""
+    оператор заглядає рідко.
+
+    У ЗВИЧАЙНОМУ стані назва режиму вже все каже, тож рядок лишається одним
+    словом — dolos не дублюється.
+    """
     line = _mode_line(monkeypatch, _PATH_MODE="bare", _DOLOS_ON_ORDER=False)
-    assert "bare" in line and "ні" in line
+    assert "bare" in line and "dolos" not in line
 
     line = _mode_line(monkeypatch, _PATH_MODE="full", _DOLOS_ON_ORDER=True)
-    assert "full" in line and "ТАК" in line
+    assert "full" in line and "dolos" not in line
+
+
+def test_startup_line_spells_dolos_out_when_the_mode_name_lies(monkeypatch):
+    """`MEXC_DOLOS_ON_ORDER` перебиває режим — і тоді назва режиму БРЕШЕ.
+
+    Саме тут коротко бути не можна: `bare` без уточнення означав би для
+    оператора «без dolos», а насправді він іде.
+    """
+    line = _mode_line(monkeypatch, _PATH_MODE="bare", _DOLOS_ON_ORDER=True)
+    assert "bare" in line and "dolos" in line and "ТАК" in line
+
+    line = _mode_line(monkeypatch, _PATH_MODE="full", _DOLOS_ON_ORDER=False)
+    assert "full" in line and "dolos" in line and "ні" in line
 
 
 def test_startup_line_flags_active_rollbacks(monkeypatch):
