@@ -177,3 +177,13 @@ def test_startup_warns_when_the_device_offset_is_missing():
     i = MAIN.index('logger.info("[PATH MODE]')
     seg = MAIN[i:i + 700]
     assert "MEXC_DEVICE_OFFSET" in seg
+
+
+def test_missing_webkey_is_reported_once_not_hidden_at_debug():
+    """На клоні ключів немає — забір пропускається. Але «нема ключів» і
+    «задача мертва» не мусять виглядати однаково: DEBUG цього не показує."""
+    i = MAIN.index("async def dolos_config_refresh_loop")
+    seg = MAIN[i:i + 2200]
+    assert "_no_key_warned" in seg, "має бути прапорець «сказано один раз»"
+    assert 'logger.debug("[DOLOS CFG] жодного' not in seg
+    assert "logger.info" in seg

@@ -248,6 +248,7 @@ async def dolos_config_refresh_loop(webkey_store, interval_sec: int = 21600) -> 
     конфіг, тобто поведінка рівно та сама, що була до появи автозабору.
     """
     from src.execution.webkey import dolos_config as _dcfg
+    _no_key_warned = False
     while True:
         try:
             visitor = None
@@ -261,8 +262,15 @@ async def dolos_config_refresh_loop(webkey_store, interval_sec: int = 21600) -> 
                 if not _dcfg.CACHE.apply(cfg):
                     logger.warning("[DOLOS CFG] оновити не вдалось — працюємо "
                                    "на попередньому конфізі")
-            else:
-                logger.debug("[DOLOS CFG] жодного слота з visitor_id — пропуск")
+            elif not _no_key_warned:
+                # ОДИН РАЗ на рівні INFO, не DEBUG. На клоні це вилізло одразу:
+                # ключів немає, забір мовчки пропускався, і «конфіг не тягнеться»
+                # виглядало так само, як «задача мертва». Повторювати щошість
+                # годин не треба — стан не змінюється сам.
+                _no_key_warned = True
+                logger.info("[DOLOS CFG] жодного слота з вебкеєм — забір "
+                            "пропущено, працюємо на знімку (це нормально для "
+                            "бота без ключів)")
         except Exception:
             logger.exception("[DOLOS CFG] цикл оновлення впав")
         await asyncio.sleep(interval_sec)
