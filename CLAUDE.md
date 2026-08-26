@@ -244,7 +244,37 @@ primary `497d9be`, клон `744639c`. Сюїта **1141 / 1115**, 0 failed. `cl
 
 **⚠️ ВЕБКЕЙ БУВ ЕКСПОНОВАНИЙ 2026-08-26** — знімок надіслано разом із заголовком `authorization: WEB…`, `uc_token` і кукі. Оператору сказано вийти/зайти на MEXC для ротації. Нікуди на диск чи в git не потрапляло.
 
-### 2026-08-26 — СПРОСТУВАННЯ вчорашнього: ПРОМО ПРАЦЮЄ, я помилився
+### 2026-08-26 (фінально) — ПРО КОМІСІЮ: усе залежить від КОНКРЕТНОГО АКАУНТА
+**Це остаточний запис. Два попередні (нижче) містять хибні висновки — читати їх лише як історію помилки.**
+
+**ЩО ВСТАНОВЛЕНО, виміряно на слоті 1 primary 2026-08-26 07:54 UTC:**
+```
+акаунт із балансом $213.69 (промо Є):
+  PEPE_USDT   original 0/0        REAL 0/0
+  SOXL_USDT   original 0/0        REAL 0/0
+  BTC_USDT    original 0/0.0002   REAL 0/0.0002   <- taker НЕ нуль
+
+акаунт із балансом $51.13 (промо НЕМАЄ):
+  усі пари     original 0.0001/0.0004   REAL 0.0001/0.0004   feeRateType=BASE
+```
+
+**ВИСНОВОК: `/account/tiered_fee_rate` (і v1, і v2) ПОКАЗУЄ ПРАВДУ про промо.** Йому можна вірити. Але результат — властивість **КОНКРЕТНОГО АКАУНТА**, і саме тут я тричі помилився за одну годину.
+
+**ГОЛОВНА ПАСТКА, через яку все й поїхало.** Слот 1 за одну годину тримав ТРИ РІЗНІ акаунти: `$34.21` -> `$51.13` -> `$213.69`. Промо є лише на останньому. Я тричі питав ендпоінт, тричі бачив `0.0001` і тричі будував теорії («промо закінчилось», «ендпоінт не бачить промо», «ендпоінт таки бачить»), тоді як дані були правильні — **акаунт був не той**.
+**ПРАВИЛО: перш ніж робити БУДЬ-ЯКИЙ висновок про комісію, звір `walletBalance` із відповіді з тим, що оператор бачить в UI.** Не збігається — ти дивишся не на той акаунт, і всі інші числа безглузді. `walletBalance` є прямо у відповіді `tiered_fee_rate/v2`, окремий запит не потрібен.
+
+**ЕНДПОІНТ v2 БАГАТШИЙ ЗА v1 — використовувати його:**
+`GET /account/tiered_fee_rate/v2?symbol=<CONTRACT>` (той самий web-sign) віддає `originalMakerFee/originalTakerFee` (базова сітка), `realMakerFee/realTakerFee` (ефективна, з урахуванням знижок), `joinDiscount/enjoyDiscount/deductRate`, `feeRateType`, і `walletBalance`. v1 (`/account/tiered_fee_rate`) дає лише `makerFee/takerFee`.
+
+**BTC_USDT — ОКРЕМИЙ ВИПАДОК і на акаунті з промо:** `maker 0`, але **`taker 0.0002`**. Наші IOC перетинають спред, тобто платять ТЕЙКЕРА — на BTC це 2 bps. Узгоджується з тим, що soft-start вимагає `zero_both` і свідомо виключає BTC. На PEPE/SOXL нуль з обох боків.
+
+**БРАУЗЕРНИЙ СКРИПТ-СТОРОЖ ОПЕРАТОРА — АКТУАЛЬНИЙ.** Він опитує `tiered_fee_rate/v2?symbol=BTC_USDT` раз на секунду і малює банер. Дві поправки: (1) він перевіряє `originalTakerFee !== 0`, а на BTC це `0.0002` навіть із промо -> ПОСТІЙНА хибна тривога; питати треба пару, якою реально торгуєш (`PEPE_USDT`), або дивитись `realMakerFee`; (2) `fee-guard` у боті все одно спрацює раніше — він дивиться на ФАКТИЧНУ комісію філу і халтить слот.
+
+**ЩО ЗАЛИШАЄТЬСЯ ПРАВДОЮ З ПОПЕРЕДНІХ ЗАПИСІВ:** комісійних подій за всю історію логів — ДВІ на 16 932 ордери (`08-17 XMR $0.021859` = 2.00 bps, `08-25 PEPE $0.407004` = 4.00 bps). Обидві на слоті 1. Природний експеримент про dolos (4456 ордерів з ним / 0 подій проти 12476 без / 2 події) статистично НІЧОГО не доводить: очікувано 0.71 події, ймовірність нуля — 49%.
+
+---
+
+### 2026-08-26 — [ЧАСТКОВО ХИБНИЙ ВИСНОВОК, див. запис вище] промо працює
 **Мій висновок «промо закінчилось» (запис нижче) — ХИБНИЙ. Не діяти за ним.**
 
 **Земля — це ФІЛИ, а не тариф-ендпоінт.** Перевірено 13→26.08 на ОБОХ базах:
@@ -927,7 +957,7 @@ MX returned exactly to 1.08. **The whole round trip cost 0.0031 USDT** — the b
 
 **Open / not-yet-actioned risks:**
 - **MEXC restricted the srv1 account**: `api_error_6002 "Position opening is forbidden. Contact Customer Service"`. Support ticket, not a code bug. Do not enable live until cleared.
-- **Fee rates: VERIFIED 0%, and there is now a live source for it.** `GET /account/tiered_fee_rate?symbol=<CONTRACT>` (contract.mexc.com/api/v1/private, webkey + web-sign) returns this ACCOUNT's real rate: `{"makerFee":0,"takerFee":0,...}`. Audited 2026-08-20 against the whole 24-pair universe on LOCAL slot 1: **all 24 are makerFee=0**. It also beats the public `contract/detail`, which lists 592 non-zero pairs — `TAO_USDT` and `XMR_USDT` are 0.0001 there but **0 for this account** (the promo is real and only the private endpoint sees it). Look up symbols via `to_mexc()` (`src/exchanges/mexc_rest.py`) — `1000PEPEUSDT -> PEPE_USDT`, `MUUSDT -> MUSTOCK_USDT`; a hand-rolled underscore rule silently mislabels those as unknown. Retry on a miss: a rate-limited `None` is NOT a non-zero fee.
+- **Fee rates: 0% ПІДТВЕРДЖЕНО, і джерело робоче — АЛЕ результат залежить від КОНКРЕТНОГО АКАУНТА у слоті (див. запис 2026-08-26 у ворклозі: слот 1 за годину тримав три різні акаунти, промо лише на одному). Звіряй `walletBalance` з UI, перш ніж вірити числу. Використовуй v2: `/account/tiered_fee_rate/v2?symbol=X` — він додає `realMakerFee`/`realTakerFee`, `walletBalance` і прапорці знижок.** `GET /account/tiered_fee_rate?symbol=<CONTRACT>` (contract.mexc.com/api/v1/private, webkey + web-sign) returns this ACCOUNT's real rate: `{"makerFee":0,"takerFee":0,...}`. Audited 2026-08-20 against the whole 24-pair universe on LOCAL slot 1: **all 24 are makerFee=0**. It also beats the public `contract/detail`, which lists 592 non-zero pairs — `TAO_USDT` and `XMR_USDT` are 0.0001 there but **0 for this account** (the promo is real and only the private endpoint sees it). Look up symbols via `to_mexc()` (`src/exchanges/mexc_rest.py`) — `1000PEPEUSDT -> PEPE_USDT`, `MUUSDT -> MUSTOCK_USDT`; a hand-rolled underscore rule silently mislabels those as unknown. Retry on a miss: a rate-limited `None` is NOT a non-zero fee.
 - **CORRECTION (2026-08-20): the "fee-guard tripped 417× in 24h" claim was FALSE** — a recon subagent invented it and it was repeated without checking. Ground truth on srv1: `shadow_open_misses` has exactly ONE reason, `ioc_expired_no_fill` (135,358 rows), zero fee-related rows, and `docker logs` has 0 occurrences of "FEE GUARD". Do not treat that number as history. Same source also claimed ~144k Telegram-token occurrences in the logs; the real count is **3** (in `stakan.log`) — the leak and `logs/ 0777` are real, the scale was not.
 - **Plaintext secrets on srv2**: 3 Telegram tokens in `/root/check-bots.sh` (+ `.bak`), Bybit key/secret in `binance-bot/state/config_state.json.bak-secrets` (mode 644), a live cookie in `bybit-card/`, `VILKA_MASTER_KEY` in one of six `.env.bak-*`. **Rotate first, delete backups second.** srv2 also has root+password SSH, no fail2ban, 43k failed logins in the current auth.log.
 - **Panel `:8777` is world-open** on LOCAL (`ufw ALLOW Anywhere`), fail2ban inactive. Bind to `127.0.0.1` + reach it over an ssh tunnel.
