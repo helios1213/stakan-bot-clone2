@@ -198,15 +198,22 @@ class SpotSoftStart:
             return False
         token = self.rng.choice(p.tokens)
         symbol = f"{token}{cfg.quote}"
-        usdt = round(self.rng.uniform(cfg.order_usdt_min, cfg.order_usdt_max), 2)
+
+        # ЦІНА ПЕРШОЮ, а сума після неї — саме заради розміру. Біржа бачить не
+        # долари, а КІЛЬКІСТЬ монет, тож щоб частину ордерів зробити «рівними»
+        # (1, 5, 10 монет — як у людини), сайзер має знати ціну. Раніше сума
+        # рахувалась до запиту ціни, і прив'язатись до кількості було нічим.
+        px = public_last_price(symbol)
+        if not px:
+            return False
+
+        from .soft_start_budget import human_order_usdt
+        usdt = human_order_usdt(self.rng, cfg.order_usdt_min,
+                                cfg.order_usdt_max, px)
 
         if p.spent_usdt + usdt > cfg.daily_buy_usdt_ceiling:
             logger.info("[buy] skip %s %.2f — daily ceiling %.0f (spent %.2f)",
                         symbol, usdt, cfg.daily_buy_usdt_ceiling, p.spent_usdt)
-            return False
-
-        px = public_last_price(symbol)
-        if not px:
             return False
 
         # The buffer we cross to get filled IS the cost of this order, and it is

@@ -630,3 +630,89 @@ async def test_the_budget_gate_prices_the_fee_too(tmp_path, live):
     ss2, cl2, _ = mk(tmp_path, {"HYPEUSDT": (0, 0)}, dry_run=False, budget=bud2)
     assert await ss2.open_position() is True
     assert cl2.opened
+
+
+# ---- рандомізація РОЗМІРУ (2026-08-26) ------------------------------------
+
+def test_margin_is_a_spread_not_a_constant():
+    """Було рівно 10% балансу ЩОРАЗУ — тобто всі прогрівні позиції мали
+    однакову маржу з точністю до копійок. Це прибитий підпис."""
+    import random
+    from src.execution.soft_start_budget import (futures_target_margin,
+                                                 MARGIN_FRAC_MIN, MARGIN_FRAC_MAX)
+    r = random.Random(5)
+    vals = {futures_target_margin(26.13, r) for _ in range(50)}
+    assert len(vals) > 10, f"маржа майже не гуляє: {sorted(vals)}"
+    assert all(26.13 * MARGIN_FRAC_MIN - 0.01 <= v <= 26.13 * MARGIN_FRAC_MAX + 0.01
+               for v in vals), sorted(vals)
+
+
+def test_margin_without_rng_stays_the_old_deterministic_value():
+    """Старі виклики й тести не мають поїхати."""
+    from src.execution.soft_start_budget import futures_target_margin
+    assert futures_target_margin(25.0) == 2.5
+
+
+def test_order_size_never_leaves_the_band():
+    import random
+    from src.execution.soft_start_budget import human_order_usdt
+    r = random.Random(3)
+    for price in (2.66, 3.7e-6, 180.0, None):
+        for _ in range(300):
+            v = human_order_usdt(r, 1.5, 3.0, price)
+            assert 1.5 <= v <= 3.0, (price, v)
+
+
+def test_order_size_has_a_heavy_tail_not_a_flat_one():
+    """Рівномірний розподіл сам по собі підпис: сума ніколи не буває ані
+    частіше дрібною, ані зрідка помітною. Логарифмічний дає важкий хвіст."""
+    import random
+    from src.execution.soft_start_budget import human_order_usdt
+    r = random.Random(3)
+    vals = [human_order_usdt(r, 1.5, 6.0, None) for _ in range(2000)]
+    low = sum(1 for v in vals if v < 2.5)
+    high = sum(1 for v in vals if v > 4.5)
+    assert low > high * 1.5, f"хвіст не важкий: low={low} high={high}"
+
+
+def test_a_narrow_band_does_not_collapse_the_size_to_one_number():
+    """ПАСТКА, В ЯКУ Я ВЛІЗ І ВИЛІЗ.
+
+    Перша версія прив'язки до рівної кількості монет брала ПЕРШИЙ крок, що
+    влазить у діапазон. На MX ($2.66) у смугу 1.5-3.0 проходить рівно одна
+    рівна кількість — «1 монета», — і сума почала повторюватись у 8 випадках
+    із 20. Повторюване однакове число ЯСКРАВІШЕ за будь-який нерівний розкид,
+    тобто «фікс» робив гірше, ніж було.
+    """
+    import random
+    from collections import Counter
+    from src.execution.soft_start_budget import human_order_usdt
+
+    # КІЛЬКА ПОСІВІВ, не один: на одному посіві межа стояла за 3 спостереження
+    # від провалу (63 проти 60), тобто тест був би флакучим і «зеленів» би на
+    # зламаному коді від зміни посіву. Міряємо СЕРЕДНЮ частку модального
+    # значення. Виміряно: полагоджена версія ~16%, зламана ~32%.
+    shares, uniques = [], []
+    for seed in (11, 12, 13, 14, 15):
+        r = random.Random(seed)
+        vals = [human_order_usdt(r, 1.5, 3.0, 2.66) for _ in range(200)]
+        shares.append(Counter(vals).most_common(1)[0][1] / len(vals))
+        uniques.append(len(set(vals)))
+    avg = sum(shares) / len(shares)
+    assert avg <= 0.24, (
+        f"модальне значення займає {avg:.0%} — прив'язка вироджується в "
+        f"константу (частки по посівах: {[f'{x:.0%}' for x in shares]})")
+    assert min(uniques) >= 40, f"мало унікальних сум: {uniques}"
+
+
+def test_round_quantities_do_appear_when_the_band_allows():
+    """Біржа бачить КІЛЬКІСТЬ, не долари. Людина частіше купує 1/5/10 монет."""
+    import random
+    from src.execution.soft_start_budget import human_order_usdt
+    r = random.Random(2)
+    price = 0.25
+    qtys = [round(human_order_usdt(r, 1.5, 6.0, price) / price, 6)
+            for _ in range(200)]
+    round_ones = sum(1 for q in qtys if abs(q - round(q)) < 1e-6)
+    assert round_ones >= 10, f"рівних кількостей майже немає: {round_ones}/200"
+    assert round_ones <= 150, "рівні кількості СУЦІЛЬНО — це такий самий підпис"

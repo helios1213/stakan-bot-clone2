@@ -201,15 +201,80 @@ def scale_spot_config(balance_usdt: float, *, max_tokens: int = 4) -> SpotSizing
     )
 
 
-def futures_target_margin(balance_usdt: float) -> float:
-    """How much margin one warming position may use: ~10% of the balance.
+# Частка балансу під маржу однієї позиції прогріву. РОЗКИД, а не константа:
+# рівно 10% щоразу — це прибитий підпис, помітний навіть без аналізу, бо всі
+# наші прогрівні позиції мали б однакову маржу з точністю до копійок.
+MARGIN_FRAC_MIN = 0.06
+MARGIN_FRAC_MAX = 0.14
+
+
+def futures_target_margin(balance_usdt: float, rng=None) -> float:
+    """How much margin one warming position may use: 6-14% of the balance.
 
     One position at a time, so this is the whole futures exposure. At 25 USDT
-    that is 2.5 — enough for a 1-contract position on every pair in the universe
-    at 5x except the most expensive, which is handled by the affordability check
-    at open time.
+    that is 1.5-3.5 — enough for a 1-contract position on every pair in the
+    universe at 5x except the most expensive, which is handled by the
+    affordability check at open time.
+
+    `rng=None` дає детермінований центр діапазону (10%) — так поводяться старі
+    виклики й тести. Прогрів завжди передає свій генератор.
     """
-    return max(0.5, round(max(0.0, float(balance_usdt)) * 0.10, 2))
+    bal = max(0.0, float(balance_usdt))
+    frac = 0.10 if rng is None else rng.uniform(MARGIN_FRAC_MIN, MARGIN_FRAC_MAX)
+    return max(0.5, round(bal * frac, 2))
+
+
+def human_order_usdt(rng, lo: float, hi: float, price: float | None = None,
+                     qty_decimals: int = 4) -> float:
+    """Сума одного спот-ордера — так, щоб серія не виглядала машинною.
+
+    ТРИ ПРОБЛЕМИ РІВНОМІРНОГО `uniform(lo, hi)`, яким це було:
+
+    1. **Діапазон вузький** (при балансі 25 це 1.5-3.0, тобто рівно вдвічі),
+       тож на око кожна покупка «десь два бакси». Формально випадково —
+       практично однаково.
+    2. **Розподіл рівномірний**, а це сам по собі підпис: сума НІКОЛИ не буває
+       ані біля нижньої межі частіше, ані зрідка великою. У людини хвіст
+       важкий — багато дрібних і час від часу одна помітна.
+    3. **Кількість виходить «машинною».** Біржа бачить не долари, а КІЛЬКІСТЬ:
+       $1.78 при ціні 2.66 дає 0.6692 монети. Людина частіше купує 1, 2, 5, 10
+       монет — рівне число.
+
+    Тому: логарифмічно-рівномірний розіграш (важкий хвіст) + у частині випадків
+    прив'язка до РІВНОЇ КІЛЬКОСТІ монет, якщо ціна відома і така кількість
+    влазить у діапазон. Повертає суму в USDT.
+    """
+    lo = max(0.01, float(lo))
+    hi = max(lo, float(hi))
+    # log-uniform: рівна ймовірність на кожен ПОРЯДОК, а не на кожен долар.
+    import math
+    u = rng.uniform(math.log(lo), math.log(hi))
+    usdt = math.exp(u)
+
+    # У ~35% випадків цілимось у рівну кількість монет. Не завжди: суцільно
+    # рівні кількості були б таким самим підписом, як суцільно нерівні.
+    if price and price > 0 and rng.random() < 0.35:
+        # ЗБИРАЄМО ВСІ придатні варіанти, а не беремо перший-ліпший.
+        #
+        # ЧОМУ ЦЕ ВАЖЛИВО, і я на цьому спіймався: при вузькому діапазоні у
+        # нього влазить РІВНО ОДНА рівна кількість. На MX ($2.66) у смугу
+        # 1.5-3.0 проходить тільки «1 монета» — і прив'язка почала видавати
+        # 2.66 у 8 випадках із 20. Повторюване однакове число — підпис
+        # ЯСКРАВІШИЙ за будь-який нерівний розкид, тобто «фікс» робив гірше.
+        cands = set()
+        for step in (1000, 100, 50, 10, 5, 1, 0.5, 0.1):
+            for k in (0, 1):                       # вниз і вгору від розіграшу
+                snapped = (int(usdt / price / step) + k) * step
+                if snapped <= 0:
+                    continue
+                cand = round(snapped * price, 2)
+                if lo <= cand <= hi:
+                    cands.add(cand)
+        # Менше двох варіантів — прив'язка вироджується в константу; краще
+        # лишити «нерівну» суму, ніж повторювати одне й те саме число.
+        if len(cands) >= 2:
+            return rng.choice(sorted(cands))
+    return round(usdt, 2)
 
 
 def contracts_for_margin(target_margin_usdt: float, leverage: int,

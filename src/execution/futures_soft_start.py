@@ -280,7 +280,8 @@ class FuturesSoftStart:
             vol = 1
             target = self.rng.uniform(self.cfg.margin_usdt_min, self.cfg.margin_usdt_max)
         else:
-            target = futures_target_margin(self.balance_usdt)
+            # Свій генератор -> маржа гуляє 6-14%, а не завжди рівно 10%.
+            target = futures_target_margin(self.balance_usdt, self.rng)
             vol = contracts_for_margin(target, leverage, cs, px)
 
         notional = vol * cs * px
