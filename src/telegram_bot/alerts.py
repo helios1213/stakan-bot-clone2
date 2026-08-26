@@ -372,11 +372,51 @@ class TelegramAlerts:
         await self.send(text, category="kill", throttle_sec=0,
                         suppress_during_quiet=False)
 
+    @staticmethod
+    def _path_mode_line() -> str:
+        """Один рядок про режим ордерного шляху — у стартове повідомлення.
+
+        НАВІЩО В TELEGRAM, ЯКЩО ВОНО Є В ЛОГАХ. Рядок `[PATH MODE]` пишеться
+        при старті, але в логи оператор заглядає рідко, а переплутати, у якому
+        режимі піднявся бот, коштує дорого: `full` і `bare` відрізняються тим,
+        чи йде dolos на `/order/create`, тобто поведінкою на грошовому шляху.
+
+        Аварійні відкати (`MEXC_CHASH`, `MEXC_DOLOS_LEGACY`) показуються ЛИШЕ
+        коли задані — у звичайному стані рядок лишається коротким. Саме вони
+        найнебезпечніші, якщо про них забути: обидва тихо міняють підпис.
+
+        Ніколи не кидає: збій тут не має глушити повідомлення про старт.
+        """
+        try:
+            from src.execution.webkey import client as _wc
+            from src.execution.webkey import credentials as _cr
+            from src.execution.webkey import device_profile as _dp
+
+            mode = getattr(_wc, "_PATH_MODE", "?")
+            on_order = "ТАК" if getattr(_wc, "_DOLOS_ON_ORDER", False) else "ні"
+            line = f"Шлях: <b>{mode}</b> · dolos на ордері: <b>{on_order}</b>"
+
+            flags = []
+            if getattr(_wc, "_DOLOS_LEGACY", False):
+                flags.append("legacy chash+поля")
+            if getattr(_cr, "CHASH_ENV_OVERRIDE", ""):
+                flags.append("MEXC_CHASH override")
+            if getattr(_wc, "_CHROME_VER_ENV", ""):
+                flags.append(f"Chrome {_wc._CHROME_VER_ENV}")
+            if not _dp.offset_is_explicit():
+                flags.append("БЕЗ MEXC_DEVICE_OFFSET")
+            if flags:
+                line += "\n⚠️ " + " · ".join(flags)
+            return line
+        except Exception:
+            return "Шлях: <i>не визначено</i>"
+
     async def startup(self, state_manager=None, db=None) -> None:
         """Send simple startup notification."""
         await self.send(
             "✅ <b>Бот запущений</b>\n"
-            "Статус: <b>Running</b>",
+            "Статус: <b>Running</b>\n"
+            + self._path_mode_line(),
             category="startup",
             throttle_sec=0,
             suppress_during_quiet=False,

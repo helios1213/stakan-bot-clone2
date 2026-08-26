@@ -232,3 +232,79 @@ def test_twin_write_failure_is_not_silent():
 # вони потребують fastapi, якого в контейнері бота НЕМАЄ — панель працює з
 # host-venv. Тримати їх тут означало б вічний skip на обох ботах, тобто рівно
 # ту «зелену тишу», проти якої написаний цей файл.
+
+
+# ---------------------------------------------------------------------------
+# 5. Стартове повідомлення каже, у якому режимі бот піднявся
+# ---------------------------------------------------------------------------
+
+def _mode_line(monkeypatch, **env):
+    """Рядок режиму, зібраний РЕАЛЬНИМ кодом під заданим env."""
+    from src.telegram_bot.alerts import TelegramAlerts
+    from src.execution.webkey import client as wc
+    from src.execution.webkey import credentials as cr
+    for k, v in env.items():
+        monkeypatch.setattr(wc if hasattr(wc, k) else cr, k, v, raising=False)
+    return TelegramAlerts._path_mode_line()
+
+
+def test_startup_line_states_the_dolos_mode(monkeypatch):
+    """`full` і `bare` різняться тим, чи йде dolos на /order/create — тобто
+    поведінкою на ГРОШОВОМУ шляху. Переплутати режим коштує дорого, а в логи
+    оператор заглядає рідко."""
+    line = _mode_line(monkeypatch, _PATH_MODE="bare", _DOLOS_ON_ORDER=False)
+    assert "bare" in line and "ні" in line
+
+    line = _mode_line(monkeypatch, _PATH_MODE="full", _DOLOS_ON_ORDER=True)
+    assert "full" in line and "ТАК" in line
+
+
+def test_startup_line_flags_active_rollbacks(monkeypatch):
+    """Аварійні відкати тихо міняють підпис — про забутий відкат треба знати."""
+    line = _mode_line(monkeypatch, _PATH_MODE="full", _DOLOS_ON_ORDER=True,
+                      _DOLOS_LEGACY=True, CHASH_ENV_OVERRIDE="a" * 64)
+    assert "legacy" in line and "MEXC_CHASH" in line
+
+
+def test_startup_line_stays_short_when_nothing_is_overridden(monkeypatch):
+    """У звичайному стані — один рядок без попереджень."""
+    monkeypatch.setenv("MEXC_DEVICE_OFFSET", "0")
+    line = _mode_line(monkeypatch, _PATH_MODE="bare", _DOLOS_ON_ORDER=False,
+                      _DOLOS_LEGACY=False, CHASH_ENV_OVERRIDE="",
+                      _CHROME_VER_ENV="")
+    assert "\n" not in line and "⚠️" not in line
+
+
+def test_startup_line_never_raises(monkeypatch):
+    """Збій тут не має глушити саме повідомлення про старт."""
+    from src.telegram_bot.alerts import TelegramAlerts
+    import builtins
+    real = builtins.__import__
+
+    def _boom(name, *a, **kw):
+        if "webkey" in name:
+            raise RuntimeError("імпорт зламано")
+        return real(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _boom)
+    assert "не визначено" in TelegramAlerts._path_mode_line()
+
+
+@pytest.mark.asyncio
+async def test_startup_message_actually_carries_the_mode(monkeypatch):
+    """Наскрізь: рядок мусить потрапити В САМЕ ПОВІДОМЛЕННЯ, а не лишитись
+    гарною функцією, яку ніхто не викликає."""
+    from src.telegram_bot.alerts import TelegramAlerts
+    sent = {}
+
+    a = TelegramAlerts.__new__(TelegramAlerts)
+
+    async def _send(text, **kw):
+        sent["text"] = text
+
+    a.send = _send
+    monkeypatch.setattr(TelegramAlerts, "_path_mode_line",
+                        staticmethod(lambda: "Шлях: <b>ТЕСТ</b>"))
+    await TelegramAlerts.startup(a)
+    assert "Бот запущений" in sent["text"]
+    assert "Шлях: <b>ТЕСТ</b>" in sent["text"]
