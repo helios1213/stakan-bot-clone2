@@ -136,7 +136,14 @@ class SoftStartCampaign:
         return float(self.state.day_weights[key])
 
     def scale_target(self, base_max: int) -> int:
-        """Scale a per-day target (buys, sells, futures orders) by today's weight."""
+        """Стеля денної цілі (купівлі, продажі, фʼючерсні ордери) за вагою дня.
+
+        ЄДИНЕ ДЖЕРЕЛО ЦІЄЇ ФОРМУЛИ. До 2026-08-26 метод існував, але його не
+        викликав НІХТО: ту саму арифметику переписали вбудовано в
+        `SlotWarmer._apply_day_weight()`. Дубль нічого не ламав, але читаючи
+        цей метод можна було зробити хибний висновок про поведінку — власне
+        те, заради чого код і читають.
+        """
         return max(0, int(round(base_max * self.day_weight())))
 
 

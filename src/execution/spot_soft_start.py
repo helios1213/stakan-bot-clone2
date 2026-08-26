@@ -177,7 +177,14 @@ class SpotSoftStart:
         if self.plan is None or not self.plan.is_today():
             self.plan = new_day_plan(self.cfg, self.rng)
             save_plan(self.cfg, self.plan)
-        logger.info("soft-start plan %s: tokens=%s buys=%d sells=%d",
+        # «РОЗІГРАНО», а не «план». Вага дня застосовується ПІЗНІШЕ, у
+        # `SlotWarmer._apply_day_weight()`, тож ці числа — ще не те, що
+        # виконуватиметься: розіграні 9 покупок при вазі 0.771 стають 8.
+        # Рядок називався «soft-start plan …» і читався як остаточний план —
+        # через це я сам кілька хвилин гнався за фантомним багом, звіряючи лог
+        # із файлом стану. Ефективний план друкує раннер, після ваги.
+        logger.info("soft-start РОЗІГРАНО %s: tokens=%s buys=%d sells=%d "
+                    "(вага дня застосується далі)",
                     self.plan.date, self.plan.tokens,
                     self.plan.buys_target, self.plan.sells_target)
 

@@ -266,3 +266,79 @@ async def test_finished_campaign_switches_the_slot_off(monkeypatch):
     reason, kw = made[0].reported[0]
     assert "campaign" in reason
     assert kw["position_left"] is False
+
+
+# ---- вага дня: одна формула, і лог не бреше (2026-08-26) -------------------
+
+def test_scale_target_is_actually_used_by_the_runner():
+    """`scale_target` існував, але його не викликав НІХТО — ту саму формулу
+    переписали вбудовано в раннері. Дубль нічого не ламав, але читаючи метод
+    можна було зробити хибний висновок про поведінку.
+
+    Тест ВИКОНАВЧИЙ: підміняємо scale_target і дивимось, чи змінився результат.
+    Грепом по джерелу такий дубль не ловиться.
+    """
+    from src.execution.soft_start_runner import SlotWarmer
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w._weighted_logged = None
+
+    calls = []
+
+    class _Camp:
+        def scale_target(self, base):
+            calls.append(base)
+            return 2
+
+        def day_weight(self):
+            return 0.5
+
+    class _Plan:
+        buys_target = 9
+        sells_target = 9
+
+    class _State:
+        orders_target = 3
+
+    w.campaign = _Camp()
+    w.spot = type("S", (), {"plan": _Plan()})()
+    w.futures = type("F", (), {"state": _State()})()
+
+    SlotWarmer._apply_day_weight(w)
+
+    assert calls == [10, 10, 3], (
+        f"раннер не кличе campaign.scale_target — формула знову дублюється: "
+        f"{calls}")
+    assert w.spot.plan.buys_target == 2
+    assert w.futures.state.orders_target == 2
+
+
+def test_weight_never_raises_a_target_only_lowers_it():
+    """`min(поточне, стеля)` — вага РІЗАЄ активність, а не роздуває її.
+    Інакше тихий день міг би стати бурхливішим за розіграний."""
+    from src.execution.soft_start_runner import SlotWarmer
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w._weighted_logged = None
+    w.campaign = type("C", (), {"scale_target": lambda self, b: 99,
+                                "day_weight": lambda self: 1.0})()
+    w.spot = type("S", (), {"plan": type("P", (), {"buys_target": 3,
+                                                   "sells_target": 1})()})()
+    w.futures = type("F", (), {"state": type("St", (), {"orders_target": 1})()})()
+
+    SlotWarmer._apply_day_weight(w)
+    assert (w.spot.plan.buys_target, w.spot.plan.sells_target,
+            w.futures.state.orders_target) == (3, 1, 1)
+
+
+def test_the_rolled_plan_log_does_not_claim_to_be_final():
+    """Рядок друкувався як «soft-start plan …» ще ДО ваги, тож число в лозі
+    (buys=9) не збігалось із тим, що виконується (8). Тепер він явно каже, що
+    це розіграш, а не остаточний план."""
+    import inspect
+    from src.execution.spot_soft_start import SpotSoftStart
+    src = inspect.getsource(SpotSoftStart.__init__)
+    assert "РОЗІГРАНО" in src and "вага дня застосується далі" in src
+    assert '"soft-start plan %s' not in src

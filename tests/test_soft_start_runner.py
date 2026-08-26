@@ -467,13 +467,19 @@ async def test_an_idle_futures_half_still_drains_a_leftover_position():
     w.spot = type("S", (), {"plan": type("P", (), {"buys_done": 0, "sells_done": 0,
                                                    "buys_target": 0, "sells_target": 0})(),
                             "tick": _noop})()
+    # scale_target — той самий дрейф фейків, що вже двічі ламав цю сюїту:
+    # раннер тепер бере стелю з кампанії (одна формула замість дубля), тож
+    # фейк мусить це вміти. Якщо додаси раннеру ще виклик до campaign —
+    # дзеркаль його ТУТ у тому ж коміті.
     w.campaign = type("C", (), {"expired": lambda self: False,
                                 "day_weight": lambda self: 1.0,
+                                "scale_target": lambda self, base: base,
                                 "finish": lambda self: None,
                                 "state": type("St", (), {"days": 3,
                                                          "day_index": lambda self: 0})()})()
     w.budget = type("B", (), {"exhausted": lambda self: False, "spent": 0.0,
                               "state": type("S2", (), {"max_usdt": 5.0})()})()
+    w._weighted_logged = None
     w._spot_viable = False
     w._fut_viable = False                       # this half is switched off
     w.futures.state.orders_done = 0

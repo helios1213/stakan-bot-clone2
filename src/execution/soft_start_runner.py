@@ -69,6 +69,9 @@ class SlotWarmer:
         # Set once OFF has been requested: the slot may still have to be
         # drained, but it must never trade again.
         self.draining = False
+        # Останній надрукований зважений план — щоб рядок не повторювався
+        # щотіку (тік іде раз на POLL_SEC, а план змінюється раз на добу).
+        self._weighted_logged: tuple | None = None
         self._stop_attempts = 0
         self._final_sent = False
         self.fee_gate = FeeGate(client)
@@ -224,12 +227,31 @@ class SlotWarmer:
         Drawn once per campaign-day and persisted, so some days are busy and
         some are nearly quiet — and a restart cannot reroll a quiet day into a
         busy one and double the activity.
+
+        Стеля береться з `campaign.scale_target()`, а не рахується тут наново.
+        Раніше та сама формула жила у ДВОХ місцях: `SoftStartCampaign` мав
+        `scale_target()`, якого не викликав НІХТО, а тут стояла її копія. Дубль
+        нічого не ламав, але наступного разу підказав би неправильну
+        відповідь — читаєш `scale_target`, а виконується інше.
+
+        Логування — ТУТ, а не в конструкторі планів. `SpotSoftStart.__init__`
+        друкує щойно розіграний план (`buys=9`), а у файл лягає вже зважений
+        (`buys_target=8`), і читати лог означало вірити числу, яке не
+        виконується. Я сам через це кілька хвилин гнався за фантомним багом.
         """
-        w = self.campaign.day_weight()
         sp, fu = self.spot.plan, self.futures.state
-        sp.buys_target = min(sp.buys_target, max(0, int(round(10 * w))))
-        sp.sells_target = min(sp.sells_target, max(0, int(round(10 * w))))
-        fu.orders_target = min(fu.orders_target, max(0, int(round(3 * w))))
+        before = (sp.buys_target, sp.sells_target, fu.orders_target)
+        sp.buys_target = min(sp.buys_target, self.campaign.scale_target(10))
+        sp.sells_target = min(sp.sells_target, self.campaign.scale_target(10))
+        fu.orders_target = min(fu.orders_target, self.campaign.scale_target(3))
+        after = (sp.buys_target, sp.sells_target, fu.orders_target)
+        if after != before and after != self._weighted_logged:
+            logger.info(
+                "soft-start slot %d: план дня після ваги %.2f — "
+                "купівлі %d->%d, продажі %d->%d, фʼючерси %d->%d",
+                self.slot_id, self.campaign.day_weight(),
+                before[0], after[0], before[1], after[1], before[2], after[2])
+        self._weighted_logged = after
 
     async def tick(self) -> None:
         if self.spot is None or self.futures is None:
