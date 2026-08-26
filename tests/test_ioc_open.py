@@ -217,7 +217,7 @@ async def test_all_attempts_expired_returns_failure_no_market_fallback():
 
 
 @pytest.mark.asyncio
-async def test_pre_retry_position_check_aborts_duplicate():
+async def test_pre_retry_position_check_aborts_duplicate(monkeypatch):
     """
     Attempt 1 partially fills (we don't observe it within poll timeout, so
     we think it expired). Before attempt 2, position check sees an open
@@ -230,18 +230,28 @@ async def test_pre_retry_position_check_aborts_duplicate():
         "code": 0, "data": {"orderId": "p1"},
     })
 
-    # Sequence of get_open_positions:
-    #   call 1: during _poll_fill_price after attempt 1 → empty (no fill yet)
-    #   ... (multiple polls during timeout)
-    #   call N: pre-retry check before attempt 2 → has position!
-    call_count = {"n": 0}
+    # Позиція має з'явитись САМЕ ПІСЛЯ того, як полл філу здався — це і є
+    # «частковий філ приїхав пізно». Раніше момент задавався лічильником
+    # (`call_count <= 3`), тобто тест мовчки залежав від того, скільки разів
+    # цикл устигне крутнутись за 2 секунди. Щойно дедлайн полла стиснули для
+    # швидкості сюїти, поллів стало менше — і тест упав, хоча код правильний.
+    # Тепер прив'язка до ФАКТУ завершення полла, а не до його довжини.
+    poll_done = {"v": False}
+    from src.execution import live_executor as _le
+    _orig_poll = _le._poll_fill_price
+
+    async def _poll_then_mark(*a, **kw):
+        try:
+            return await _orig_poll(*a, **kw)
+        finally:
+            poll_done["v"] = True
+
+    monkeypatch.setattr(_le, "_poll_fill_price", _poll_then_mark)
 
     async def open_positions_side_effect():
-        call_count["n"] += 1
-        # First few calls: no positions (poll_fill returns 0)
-        if call_count["n"] <= 3:
+        if not poll_done["v"]:
             return {"code": 0, "data": []}
-        # After: position appears (partial fill landed late)
+        # Полл здався — позиція проявилась (частковий філ ліг пізно).
         return {
             "code": 0,
             "data": [{"symbol": "PEPE_USDT", "holdVol": 100, "holdAvgPrice": 0.000004144}],
