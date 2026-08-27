@@ -327,8 +327,9 @@ def test_final_report_shows_money_even_without_a_ceiling():
     """Було `if ceiling:` — а стелю прибрано, тож підсумковий звіт лишився б
     БЕЗ ЖОДНОЇ цифри про гроші, тобто без головного, заради чого його читають.
     """
-    out = _final(spent=0.9134, pnl=-4.21, held_value=3.60, ceiling=0.0)
-    assert "0.9134" in out and "-4.2100" in out
+    out = _final(spent=0.9134, pnl=-4.21, futures_pnl=-0.61, held_value=3.60,
+                 ceiling=0.0)
+    assert "0.9134" in out and "-0.6100" in out
     assert "3.6000" in out
     assert "РАЗОМ" in out and "+1.5234" in out
 
@@ -358,3 +359,46 @@ def test_final_report_still_flags_a_stuck_position():
     assert "All clear" not in out
     assert "could NOT be closed" in out
     assert "2 error" in out
+
+
+# ---- кеш-фло спота ≠ PnL (2026-08-27) -------------------------------------
+
+def test_report_does_not_call_spot_cash_flow_a_loss():
+    """ЩО ЦЕ ЛІКУЄ. Звіт друкував «PnL -4.358» при реальному результаті
+    -0.34, бо в одне поле складали ДВІ різні речі: реалізований фʼючерсний
+    PnL і спотовий КЕШ-ФЛО (USDT, що змінили форму на монети).
+
+    Живі числа слота 1: купівлі -12.98, продажі +7.97, фʼючерси +0.65 —
+    разом -4.358, хоча насправді 5.01 просто лежить у монетах, а результат
+    це комісії 0.306 мінус фʼючерсний прибуток 0.648.
+    """
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=False)
+    out = r.render(day=2, days=3, spent=0.3059, pnl=-4.3579,
+                   futures_pnl=0.6477, held_value=5.0056, position=None)
+    assert "фʼючерси +0.648" in out
+    assert "-4.358" not in out, "спотове кеш-фло знову показане як PnL"
+    assert "разом -0.342" in out
+    assert "у монетах ~5.01" in out
+
+
+def test_final_report_splits_futures_pnl_from_the_spot_flow():
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=False)
+    out = r.render_final("done", spent=0.3059, pnl=-4.3579,
+                         futures_pnl=0.6477, held_value=5.0056)
+    assert "+0.6477" in out and "-4.3579" not in out
+    assert "-0.3418" in out
+
+
+def test_budget_splits_futures_pnl_from_spot():
+    """Розділення робиться в бюджеті, а не в рендері — інакше кожен споживач
+    мусив би розбирати причини записів рядками."""
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.record_pnl(-12.98, "spot buy MXUSDT")
+    b.record_pnl(7.9744, "spot sell MXUSDT")
+    b.record_pnl(0.6477, "futures LINKUSDT")
+    assert abs(b.pnl - (-4.3579)) < 1e-6
+    assert abs(b.futures_pnl - 0.6477) < 1e-9, "фʼючерсний PnL забруднений спотом"

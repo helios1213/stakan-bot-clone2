@@ -135,7 +135,8 @@ class SoftStartReporter:
 
     def render_final(self, reason: str, *, spent: float = 0.0,
                      ceiling: float = 0.0, position_left: bool = False,
-                     pnl: float = 0.0, held_value: float = 0.0) -> str:
+                     pnl: float = 0.0, held_value: float = 0.0,
+                     futures_pnl: float = 0.0) -> str:
         s = self.stats
         elapsed_h = (time.time() - self.started_at) / 3600
         spot_total = s["spot_buys"] + s["spot_sells"]
@@ -168,8 +169,11 @@ class SoftStartReporter:
         lines += [
             "",
             "<b>Скільки коштувало</b>",
-            f"<code>комісії+спред : {spent:+.4f} USDT</code>",
-            f"<code>рух ринку     : {pnl:+.4f} USDT</code>",
+            f"<code>комісії+спред   : {spent:+.4f} USDT</code>",
+            # ТІЛЬКИ фʼючерси. Спотова частина — кеш-фло, а не PnL, і показана
+            # окремо як «у монетах»: змішавши їх, звіт друкував «-4.358» при
+            # реальному результаті -0.34 і читався як катастрофа.
+            f"<code>фʼючерси (PnL)  : {futures_pnl:+.4f} USDT</code>",
         ]
         if held_value:
             # ЗА ЦІНОЮ КУПІВЛІ, не за ринком — і так і підписано. Ми знаємо,
@@ -179,7 +183,7 @@ class SoftStartReporter:
             # переоцінкою число мінялось би щохвилини від курсу.
             lines.append(f"<code>у монетах (за купівлею): {held_value:.4f} "
                          f"USDT</code>")
-        lines.append(f"<code>РАЗОМ         : {net:+.4f} USDT</code>")
+        lines.append(f"<code>РАЗОМ           : {net:+.4f} USDT</code>")
         # Поріг, а не знак: біля нуля казати «в плюс» чи «в мінус» однаково
         # неправдиво, а вердикт із двох станів змушує обирати навмання.
         if net > 0.05:
@@ -193,7 +197,7 @@ class SoftStartReporter:
                          "їхній ринковий рух у підсумок не входить.</i>")
         if ceiling:
             pct = (spent / ceiling * 100) if ceiling else 0
-            lines.append(f"<code>стеля         : {spent:.4f} / {ceiling:.2f} "
+            lines.append(f"<code>стеля           : {spent:.4f} / {ceiling:.2f} "
                          f"({pct:.0f}%)</code>")
         lines.append("")
 
@@ -242,7 +246,8 @@ class SoftStartReporter:
     def render(self, *, day: int | None = None, days: int | None = None,
                spent: float | None = None, ceiling: float | None = None,
                position: str | None = None, pnl: float | None = None,
-               held_value: float | None = None) -> str:
+               held_value: float | None = None,
+               futures_pnl: float | None = None) -> str:
         head = f"🌱 <b>Soft-start — slot {self.slot_id}</b>"
         if self.dry_run:
             head += "  <i>(DRY-RUN — nothing is sent)</i>"
@@ -257,8 +262,9 @@ class SoftStartReporter:
             # немає. Облік лишився — саме число досі корисне.
             meta.append(f"комісії+спред {spent:.3f}"
                         + (f" (стеля {ceiling:.2f})" if ceiling else ""))
-        if pnl is not None:
-            meta.append(f"PnL {pnl:+.3f}")
+        if futures_pnl is not None:
+            # ОКРЕМИМ ЧИСЛОМ, бо це єдиний справжній прибуток/збиток тут.
+            meta.append(f"фʼючерси {futures_pnl:+.3f}")
         if spent is not None and pnl is not None:
             # РАЗОМ = витрати - PnL - те, що ЩЕ ЛЕЖИТЬ У МОНЕТАХ.
             #
@@ -271,11 +277,11 @@ class SoftStartReporter:
             # Додатне = прогрів у мінус.
             net = spent - pnl - (held_value or 0.0)
             meta.append(f"разом {net:+.3f} USDT")
-        if held_value:   # див. «разом» вище — без цього число бреше
-            # ЧЕСНЕ ЗАСТЕРЕЖЕННЯ. Спотовий «PnL» тут — це КЕШ-ФЛО: купівля йде
-            # мінусом, продаж плюсом. Поки монети не продані, їхня вартість
-            # сидить у мінусі й виглядає як збиток, яким не є. Тому поруч
-            # завжди стоїть, скільки саме лежить у монетах.
+        if held_value:
+            # Спотова частина НЕ показується як «PnL» узагалі: це кеш-фло,
+            # тобто USDT, що змінили форму. Показуємо лише скільки лежить у
+            # монетах — число, яке справді щось означає для оператора.
+            # Разом із «разом» воно й пояснює, куди пішли гроші.
             meta.append(f"у монетах ~{held_value:.2f}")
         meta.append(f"position: {position}" if position else "position: none")
         lines.append(" · ".join(meta))

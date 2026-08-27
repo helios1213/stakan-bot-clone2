@@ -282,6 +282,9 @@ class SlotWarmer:
             "ceiling": None,
             # Рух ринку: реалізований PnL фʼючерсів + спотовий кеш-фло.
             "pnl": self.budget.pnl,
+            # Окремо: єдиний справжній прибуток/збиток. Спотова частина `pnl`
+            # це кеш-фло і в звіті як «PnL» більше не показується.
+            "futures_pnl": self.budget.futures_pnl,
             "held_value": self._held_spot_value(),
             "position": pos,
         }
@@ -451,6 +454,7 @@ async def _final_report(w, slot_id: int, reason: str, *, position_left: bool) ->
             # Стелі немає — передаємо 0, щоб рядок про неї не зʼявлявся.
             ceiling=0.0,
             pnl=w.budget.pnl,
+            futures_pnl=w.budget.futures_pnl,
             held_value=w._held_spot_value(),
             position_left=position_left)
     except Exception:

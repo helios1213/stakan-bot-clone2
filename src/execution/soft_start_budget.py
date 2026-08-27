@@ -65,6 +65,12 @@ class BudgetState:
     # лише постфактум і здатний бути додатним. Змішавши їх в одне поле, ми б
     # втратили можливість сказати, скільки прогрів коштує САМ ПО СОБІ.
     pnl_usdt: float = 0.0
+    # РЕАЛІЗОВАНИЙ фʼючерсний PnL окремо від спотового кеш-фло. Разом вони
+    # дають `pnl_usdt`, але для читання це різні речі: фʼючерсний PnL —
+    # справжній прибуток/збиток, а спотовий кеш-фло — здебільшого USDT, що
+    # змінили форму на монети. Змішані в одному полі вони давали «PnL -4.358»
+    # при реальному результаті -0.34, і звіт читався як катастрофа.
+    futures_pnl_usdt: float = 0.0
 
     def remaining(self) -> float:
         return max(0.0, self.max_usdt - self.spent_usdt)
@@ -131,6 +137,8 @@ class SoftStartBudget:
         except (TypeError, ValueError):
             return
         self.state.pnl_usdt += amount
+        if str(reason).startswith("futures"):
+            self.state.futures_pnl_usdt += amount
         self.state.entries.append(
             {"ts": int(time.time()), "usdt": round(amount, 6),
              "reason": f"PnL {reason}"})
@@ -143,6 +151,11 @@ class SoftStartBudget:
     @property
     def pnl(self) -> float:
         return self.state.pnl_usdt
+
+    @property
+    def futures_pnl(self) -> float:
+        """Тільки реалізований фʼючерсний результат — без спотового кеш-фло."""
+        return self.state.futures_pnl_usdt
 
     @property
     def net_cost(self) -> float:
