@@ -410,3 +410,133 @@ def test_expired_kill_marks_itself_for_persistence():
     assert ctl.state.peak_pnl == ctl.state.today_pnl, "пік не перебазовано"
     assert ctl.state.kill_auto_released is True, (
         "факт авто-зняття не позначено — після рестарту халт повернеться")
+
+
+# ---- мертвий вебкей мусить КРИЧАТИ (2026-08-28) ----------------------------
+
+@pytest.mark.parametrize("msg,expect", [
+    ("code=401 msg=None", True),
+    ("api_error_401: Not logged in or login has expired", True),
+    ("User not log in.", True),
+    ("api_error_510: Requests are too frequent", False),
+    ("Balance insufficient", False),
+    ("", False),
+    (None, False),
+])
+def test_auth_errors_are_recognised(msg, expect):
+    """ЖИВИЙ ВИПАДОК 2026-08-28. Ключ слота 1 на primary помер, і бот про це
+    ЗНАВ — `last_error` містив `code=401`. Але алерту не було:
+    `is_slot_level_error` ловить «risk control» і «verification», а MEXC каже
+    «Not logged in or login has expired» / «User not log in».
+    Наслідок: прогрів мовчки стояв добу — гейт комісії не читав ЖОДНОЇ пари
+    («ставку не прочитано у 23 із 23»), спотові ордери відхилялись.
+    """
+    from src.main import _is_auth_error
+    assert _is_auth_error(msg) is expect
+
+
+def test_a_bare_401_in_any_number_is_not_an_auth_error():
+    """Ловимо ФРАЗИ, а не число: голе «401» як підрядок збіглося б із ціною
+    чи id ордера, і алерт став би шумом."""
+    from src.main import _is_auth_error
+    assert _is_auth_error("filled at 401.25") is False
+    assert _is_auth_error("orderId=4013377") is False
+
+
+@pytest.mark.asyncio
+async def test_dead_key_alert_is_sent_and_throttled():
+    from src.main import _alert_dead_key
+    sent = []
+
+    class _A:
+        async def send(self, text, **kw):
+            sent.append((text, kw))
+
+    await _alert_dead_key(_A(), 1, "code=401")
+    assert sent, "алерт про мертвий ключ не пішов"
+    text, kw = sent[0]
+    assert "SLOT1" in text and "вебкей не діє" in text
+    assert kw.get("throttle_sec") == 3600, "стан не змінюється сам — не спамити"
+    assert kw.get("suppress_during_quiet") is False, "це критично, тихі години не діють"
+
+
+@pytest.mark.asyncio
+async def test_dead_key_alert_never_breaks_the_loop():
+    """Телеграм упав — цикл балансів має жити далі."""
+    from src.main import _alert_dead_key
+
+    class _Boom:
+        async def send(self, *a, **k):
+            raise RuntimeError("telegram down")
+
+    await _alert_dead_key(_Boom(), 1, "code=401")   # не має кинути
+    await _alert_dead_key(None, 1, "code=401")
+
+
+def test_balance_loop_is_spawned_after_alerts_exist():
+    """ПОРЯДОК, а не наявність. Задача читає `alerts`; спавн до її створення
+    дав би NameError НА СТАРТІ бота. Той самий клас помилки вже був із
+    fee_watchdog_loop і live_pool — тому перевіряється явно."""
+    import inspect
+    import src.main as m
+    src = inspect.getsource(m)
+    spawn = src.index("slot_balance_refresh_loop(webkey_store, webkey_client_pool, 60,")
+    created = src.index("alerts = TelegramAlerts(")
+    assert created < spawn, (
+        "slot_balance_refresh_loop спавниться ДО створення alerts — "
+        "це NameError на старті")
+
+
+@pytest.mark.asyncio
+async def test_the_balance_loop_actually_fires_the_dead_key_alert(monkeypatch):
+    """ПРОВОДКА В САМОМУ ЦИКЛІ — п'ятий за сесію випадок цієї діри.
+
+    Тести вище перевіряють `_is_auth_error` і `_alert_dead_key` НАРІЗНО, і
+    мутант, що прибирає виклик із `slot_balance_refresh_loop`, проходив
+    зеленим: обидві функції правильні й невживані. Тут виконується сам цикл.
+    """
+    import asyncio as _aio
+    import src.main as m
+
+    fired = []
+    monkeypatch.setattr(m, "_alert_dead_key",
+                        lambda alerts, sid, err: fired.append((sid, err)) or _noop())
+
+    async def _noop():
+        return None
+
+    class _Slot:
+        slot_id = 1
+        is_complete = True
+
+    class _Store:
+        async def list_all(self):
+            return [_Slot()]
+
+        async def refresh_health(self, **kw):
+            return None
+
+    class _Client:
+        async def health_check(self):
+            return {"valid": False, "error": "code=401 msg=None",
+                    "latency_ms": 5, "balance": None}
+
+    class _Pool:
+        async def get(self, sid):
+            return _Client()
+
+    task = _aio.create_task(
+        m.slot_balance_refresh_loop(_Store(), _Pool(), 0.01, alerts_ref=object()))
+    for _ in range(50):
+        await _aio.sleep(0.005)
+        if fired:
+            break
+    task.cancel()
+    try:
+        await task
+    except _aio.CancelledError:
+        pass
+
+    assert fired, ("цикл балансів не кличе _alert_dead_key — мертвий ключ "
+                   "знову лишиться лише рядком у БД")
+    assert fired[0][0] == 1 and "401" in fired[0][1]

@@ -357,7 +357,46 @@ async def dolos_config_refresh_loop(webkey_store, interval_sec: int = 21600) -> 
         await asyncio.sleep(delay)
 
 
-async def slot_balance_refresh_loop(webkey_store, webkey_client_pool, interval_sec: int = 60) -> None:
+# Фрази, якими MEXC повідомляє про мертву сесію. Саме ФРАЗИ, а не код «401»:
+# голе число як підрядок збіглося б із будь-яким повідомленням, де воно
+# трапиться (ціна, id ордера), і алерт став би шумом.
+_AUTH_DEAD_MARKERS = (
+    "not logged in", "not log in", "login has expired",
+    "code=401", "api_error_401",
+)
+
+
+def _is_auth_error(msg) -> bool:
+    low = str(msg or "").lower()
+    return any(m in low for m in _AUTH_DEAD_MARKERS)
+
+
+async def _alert_dead_key(alerts, slot_id: int, err: str) -> None:
+    """Сказати оператору, що ключ треба перевипустити. Тротлиться годиною:
+    стан не змінюється сам, повторювати щохвилини марно."""
+    logger.error("🔑 [SLOT %d] вебкей НЕ ДІЄ (%s) — прогрів і торгівля на "
+                 "цьому слоті стоять, потрібен перелогін на MEXC",
+                 slot_id, str(err)[:120])
+    if alerts is None:
+        return
+    try:
+        await alerts.send(
+            text=(f"🔑 <b>SLOT{slot_id}: вебкей не діє</b>\n\n"
+                  f"<code>{str(err)[:200]}</code>\n\n"
+                  f"Біржа відповідає «не залогінений». Прогрів і торгівля на "
+                  f"цьому слоті СТОЯТЬ.\n"
+                  f"Треба зайти на MEXC і оновити вебкей."),
+            category=f"slot_{slot_id}_dead_key",
+            throttle_sec=3600,
+            suppress_during_quiet=False,
+        )
+    except Exception:
+        logger.exception("[SLOT %d] алерт про мертвий ключ не надіслано", slot_id)
+
+
+async def slot_balance_refresh_loop(webkey_store, webkey_client_pool,
+                                    interval_sec: int = 60,
+                                    alerts_ref=None) -> None:
     """Periodically refresh `last_balance_usdt` (and latency/error) for every
     configured slot, so the web panel always shows fresh balances for ALL
     slots without manual /webkey_test calls.
@@ -394,13 +433,26 @@ async def slot_balance_refresh_loop(webkey_store, webkey_client_pool, interval_s
                         )
                         if isinstance(bal, dict) else None
                     )
+                    _err = None if report.get("valid") else (report.get("error") or "n/a")
                     await webkey_store.refresh_health(
                         slot_id=s.slot_id,
                         latency_ms=report.get("latency_ms"),
                         balance_usdt=balance_str,
                         valid=bool(report.get("valid")),
-                        error=None if report.get("valid") else (report.get("error") or "n/a"),
+                        error=_err,
                     )
+                    # ПРОТУХЛИЙ ВЕБКЕЙ МАЄ КРИЧАТИ, А НЕ ЛЕЖАТИ В БАЗІ.
+                    #
+                    # 2026-08-28 ключ слота 1 на primary помер, і бот про це
+                    # ЗНАВ — `last_error` містив `code=401`. Але жодного алерту
+                    # не було: `is_slot_level_error` ловить «risk control» і
+                    # «verification», а MEXC каже «Not logged in or login has
+                    # expired» / «User not log in». Наслідок: прогрів мовчки
+                    # стояв добу — гейт комісії не міг прочитати ЖОДНОЇ пари
+                    # («ставку не прочитано у 23 із 23»), спотові ордери
+                    # відхилялись, і єдиним слідом були WARNING у лозі.
+                    if _err and _is_auth_error(_err):
+                        await _alert_dead_key(alerts_ref, s.slot_id, _err)
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -980,14 +1032,6 @@ async def main() -> None:
 
     asyncio.create_task(dolos_config_refresh_loop(webkey_store), name="dolos_config")
 
-    # Periodically refresh `last_balance_usdt` for ALL configured slots so the
-    # web panel (which reads from this cache) always shows fresh balances —
-    # without needing manual /webkey_test calls per slot.
-    asyncio.create_task(
-        slot_balance_refresh_loop(webkey_store, webkey_client_pool, 60),
-        name="slot_balance_refresh",
-    )
-
     # Daily DB prune so stakan.db doesn't grow forever — orderbook snapshots
     # and signals accumulate at ~50K/hour combined. See db_prune_loop docstring
     # for retention windows.
@@ -1131,6 +1175,20 @@ async def main() -> None:
         owner_id=env.telegram_owner_id,
         quiet_hours=None,
         alert_min_pnl_usdt=0.0,
+    )
+
+    # Periodically refresh `last_balance_usdt` for ALL configured slots so the
+    # web panel (which reads from this cache) always shows fresh balances —
+    # without needing manual /webkey_test calls per slot.
+    #
+    # СПАВНИТЬСЯ САМЕ ТУТ, а не вище: задача бере `alerts`, щоб кричати про
+    # мертвий вебкей, а `alerts` створюється щойно вище. Спроба запустити її
+    # раніше давала б NameError на старті — той самий клас помилки, що вже був
+    # із fee_watchdog_loop і live_pool.
+    asyncio.create_task(
+        slot_balance_refresh_loop(webkey_store, webkey_client_pool, 60,
+                                  alerts_ref=alerts),
+        name="slot_balance_refresh",
     )
 
     # Soft-start (account warming), driven by the per-slot Telegram button
