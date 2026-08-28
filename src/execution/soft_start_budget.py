@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,15 @@ class BudgetState:
     # змінили форму на монети. Змішані в одному полі вони давали «PnL -4.358»
     # при реальному результаті -0.34, і звіт читався як катастрофа.
     futures_pnl_usdt: float = 0.0
+    # Чистий спотовий кеш-фло за ВСЮ кампанію: купівлі мінусом, продажі
+    # плюсом. Відʼємне значення = стільки USDT зараз лежить у монетах.
+    #
+    # ЧОМУ ОКРЕМИМ ЛІЧИЛЬНИКОМ. Раніше «скільки в монетах» виводилось із
+    # `plan.spent_usdt` (ДЕННИЙ план, обнуляється щодоби) мінус усі продажі
+    # за кампанію — дві РІЗНІ ЧАСОВІ БАЗИ. Уже на другий день різниця ставала
+    # відʼємною, обрізалась у нуль, і «разом» показувало +46.57 замість 0.26.
+    # Тут обидва боки з одного джерела й одного періоду.
+    spot_flow_usdt: float = 0.0
 
     def remaining(self) -> float:
         return max(0.0, self.max_usdt - self.spent_usdt)
@@ -92,8 +101,23 @@ class SoftStartBudget:
         if p.exists():
             try:
                 raw = json.loads(p.read_text())
-                st = BudgetState(**raw)
+                # Невідомі поля з новішої версії не мають ламати завантаження,
+                # а відсутні — беруть дефолт.
+                known = {f.name for f in fields(BudgetState)}
+                st = BudgetState(**{k: v for k, v in raw.items() if k in known})
                 st.max_usdt = max_usdt          # operator may have raised/lowered it
+
+                # ЗАСІВ `spot_flow_usdt` ДЛЯ ФАЙЛІВ, ЗАПИСАНИХ ДО ЙОГО ПОЯВИ.
+                # Без цього поле стартує з нуля, тоді як `pnl_usdt` збережений,
+                # і «у монетах» стає 0 при живому кеш-фло — рівно той баг, що
+                # показував «разом +46.57» замість 0.26, тільки після деплою
+                # фіксу. Відновлення ТОЧНЕ і не залежить від обрізаного списку
+                # записів: pnl = фʼючерси + спот, отже спот = pnl - фʼючерси.
+                if "spot_flow_usdt" not in raw and st.pnl_usdt:
+                    st.spot_flow_usdt = st.pnl_usdt - st.futures_pnl_usdt
+                    logger.info("soft-start budget: спотовий потік відновлено "
+                                "зі старого файла — %.4f USDT",
+                                st.spot_flow_usdt)
                 return st
             except Exception as e:
                 logger.warning("soft-start budget unreadable (%s) — starting fresh", e)
@@ -139,6 +163,8 @@ class SoftStartBudget:
         self.state.pnl_usdt += amount
         if str(reason).startswith("futures"):
             self.state.futures_pnl_usdt += amount
+        elif str(reason).startswith("spot"):
+            self.state.spot_flow_usdt += amount
         self.state.entries.append(
             {"ts": int(time.time()), "usdt": round(amount, 6),
              "reason": f"PnL {reason}"})
@@ -151,6 +177,16 @@ class SoftStartBudget:
     @property
     def pnl(self) -> float:
         return self.state.pnl_usdt
+
+    @property
+    def held_spot_value(self) -> float:
+        """Скільки USDT зараз лежить у куплених монетах, ЗА ЦІНОЮ КУПІВЛІ.
+
+        Не ринкова переоцінка: ми знаємо, скільки вклали й скільки повернули,
+        але не переоцінюємо залишок за курсом — інакше число мінялось би
+        щохвилини, а підсумок здавався б точнішим, ніж він є.
+        """
+        return max(0.0, -self.state.spot_flow_usdt)
 
     @property
     def futures_pnl(self) -> float:

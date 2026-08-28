@@ -402,3 +402,117 @@ def test_budget_splits_futures_pnl_from_spot():
     b.record_pnl(0.6477, "futures LINKUSDT")
     assert abs(b.pnl - (-4.3579)) < 1e-6
     assert abs(b.futures_pnl - 0.6477) < 1e-9, "фʼючерсний PnL забруднений спотом"
+
+
+# ---- «у монетах» на другий день кампанії (2026-08-28) ----------------------
+
+def test_held_value_survives_the_daily_plan_reset():
+    """ЖИВИЙ БАГ, знайдений оператором на другий день кампанії.
+
+    Звіт показував `разом +46.572 USDT` — тобто стверджував, що прогрів зʼїв
+    46 доларів, яких ніхто не витрачав. Реальні числа (primary, slot 1):
+        купівлі -75.930 · продажі +29.622 · у монетах 46.308 · комісії 0.264
+
+    Причина: «скільки в монетах» виводилось як `plan.spent_usdt` (ДЕННИЙ
+    план, обнуляється щодоби) мінус УСІ продажі за кампанію. Дві різні часові
+    бази: на другий день різниця ставала відʼємною, обрізалась у нуль, і з
+    формули `spent - pnl - held` зникав цілий доданок.
+    """
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.charge(0.264, "fees")
+    b.record_pnl(-75.930, "spot buy MXUSDT")
+    b.record_pnl(29.622, "spot sell MXUSDT")
+
+    assert abs(b.pnl - (-46.308)) < 1e-6
+    assert abs(b.held_spot_value - 46.308) < 1e-6, (
+        "«у монетах» не бачить кеш-фло кампанії")
+    net = b.spent - b.pnl - b.held_spot_value
+    assert abs(net - 0.264) < 1e-6, f"разом={net}, а має бути рівно комісії"
+
+
+def test_held_value_is_never_negative():
+    """Продали більше, ніж купили за кампанію (був залишок від попередньої) —
+    це не «мінус монет», це нуль."""
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.record_pnl(-5.0, "spot buy X")
+    b.record_pnl(9.0, "spot sell X")
+    assert b.held_spot_value == 0.0
+
+
+def test_futures_pnl_does_not_leak_into_the_spot_flow():
+    """Два лічильники мають лишатись незалежними, інакше «у монетах» почне
+    рухатись від фʼючерсних угод."""
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.record_pnl(-10.0, "spot buy X")
+    b.record_pnl(-3.43, "futures LINKUSDT")
+    assert abs(b.held_spot_value - 10.0) < 1e-9
+    assert abs(b.futures_pnl - (-3.43)) < 1e-9
+
+
+def test_runner_reads_held_value_from_the_budget_not_the_day_plan():
+    """ПРОВОДКА. Формула може бути правильною й невживаною — це вже четвертий
+    випадок такої діри за сесію, тож перевіряємо саме виклик."""
+    from src.execution.soft_start_runner import SlotWarmer
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.budget = type("B", (), {"held_spot_value": 42.0})()
+    # Денний план навмисно суперечить бюджету: якщо раннер читає його —
+    # побачимо 0 замість 42.
+    w.spot = type("S", (), {"plan": type("P", (), {"spent_usdt": 0.0})()})()
+    assert SlotWarmer._held_spot_value(w) == 42.0
+
+
+def test_old_budget_file_gets_its_spot_flow_seeded(tmp_path):
+    """МІГРАЦІЯ, без якої фікс зламав би себе на деплої.
+
+    У файлах, записаних до появи `spot_flow_usdt`, поле відсутнє — воно
+    стартувало б з нуля, тоді як `pnl_usdt` збережений. «У монетах» стало б 0
+    при живому кеш-фло, і «разом +46.57» повернулось би одразу після
+    розкочування виправлення.
+
+    Відновлення ТОЧНЕ і не залежить від обрізаного списку записів:
+    pnl = фʼючерси + спот, отже спот = pnl - фʼючерси.
+    """
+    import json
+    from src.execution.soft_start_budget import SoftStartBudget
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({
+        "max_usdt": 5.0, "spent_usdt": 0.264, "pnl_usdt": -46.308,
+        "futures_pnl_usdt": 0.0, "entries": [],
+    }))
+    b = SoftStartBudget(str(p), 5.0)
+    assert abs(b.held_spot_value - 46.308) < 1e-6
+    assert abs((b.spent - b.pnl - b.held_spot_value) - 0.264) < 1e-6
+
+
+def test_seeding_separates_futures_from_spot(tmp_path):
+    """Якщо у старому файлі був і фʼючерсний PnL, у спот має піти лише його
+    частка, а не весь pnl."""
+    import json
+    from src.execution.soft_start_budget import SoftStartBudget
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({
+        "max_usdt": 5.0, "spent_usdt": 0.541, "pnl_usdt": -22.4,
+        "futures_pnl_usdt": -0.562, "entries": [],
+    }))
+    b = SoftStartBudget(str(p), 5.0)
+    assert abs(b.held_spot_value - (22.4 - 0.562)) < 1e-6
+
+
+def test_a_new_file_is_not_seeded_twice(tmp_path):
+    """Файл, що вже має поле, чіпати не можна — інакше кожен рестарт
+    подвоював би значення."""
+    import json
+    from src.execution.soft_start_budget import SoftStartBudget
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({
+        "max_usdt": 5.0, "spent_usdt": 0.1, "pnl_usdt": -10.0,
+        "futures_pnl_usdt": 0.0, "spot_flow_usdt": -4.0, "entries": [],
+    }))
+    b = SoftStartBudget(str(p), 5.0)
+    assert abs(b.held_spot_value - 4.0) < 1e-9
