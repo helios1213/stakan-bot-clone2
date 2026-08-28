@@ -369,7 +369,15 @@ class SlotWarmer:
             # лишається увімкненим, поки розпродаж не доведено до кінця.
             if self._spot_viable and not self._wound_down:
                 try:
-                    sent = await self.spot.wind_down(SPOT_WIND_DOWN_KEEP)
+                    # УСІ кандидати, а не лише токени денного плану: монети
+                    # накопичуються за всю історію слота, зокрема куплені під
+                    # старим юніверсом (на клоні це був MX на 12.10 USDT).
+                    _pool = list(dict.fromkeys(
+                        list(self.spot.plan.tokens)
+                        + list(self.campaign.state.tokens or [])
+                        + list(SPOT_CANDIDATES)))
+                    sent = await self.spot.wind_down(SPOT_WIND_DOWN_KEEP,
+                                                     tokens=_pool)
                     if sent:
                         logger.info("soft-start slot %d: розпродаж — %d ордер(ів)",
                                     self.slot_id, sent)

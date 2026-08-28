@@ -302,3 +302,78 @@ async def test_wind_down_survives_an_unreadable_balance(tmp_path, monkeypatch):
                      buys_target=0, sells_target=0)
     assert await e.wind_down(0.20) == 1
     assert sold == ["MX"]
+
+
+@pytest.mark.asyncio
+async def test_wind_down_sells_coins_bought_under_an_older_universe(
+        tmp_path, monkeypatch):
+    """ЖИВИЙ ВИПАДОК 29.08, знайдений оператором.
+
+    Розпродаж ішов по `plan.tokens` — сьогоднішньому денному плану. Але монети
+    накопичуються за ВСЮ історію слота: на клоні план був
+    ['LINK','PENGU','SUI','TRX'], а найбільший залишок — MX на 12.10 USDT,
+    куплений тоді, коли юніверс складався з одного MX. Він не потрапив би в
+    розпродаж НІКОЛИ.
+    """
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    held = {"MX": 12.10, "LINK": 1.83}
+    sold = []
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            t = ids[0].replace("id-", "")
+            return {t: {"available": held.get(t, 0.0)}}
+        async def sell(self, ticker, *, quantity, price):
+            sold.append(ticker)
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("LINK",),
+                                 order_usdt_min=0.5), rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["LINK"], buys_target=0,
+                     sells_target=0)
+
+    # Тільки план -> MX не бачимо.
+    assert await e.wind_down(0.20) == 1
+    assert sold == ["LINK"], sold
+
+    # З явним ширшим списком -> MX продається.
+    sold.clear()
+    assert await e.wind_down(0.20, tokens=["LINK", "MX", "PENGU"]) == 2
+    assert "MX" in sold, f"MX знову не потрапив у розпродаж: {sold}"
+
+
+@pytest.mark.asyncio
+async def test_wind_down_asks_for_one_coin_at_a_time(tmp_path, monkeypatch):
+    """ВИМІРЯНО 29.08: `balances()` із кількома coinId одразу віддає ПОРОЖНІЙ
+    словник — без помилки, тобто «нічого не тримаємо» замість реального
+    балансу. Тиха неправда: я сам на ній спіймався, роблячи перевірку
+    залишків, і побачив 0.00 там, де було 17.30 USDT.
+    """
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    sizes = []
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            sizes.append(len(ids))
+            return {ids[0].replace("id-", ""): {"available": 10.0}}
+        async def sell(self, ticker, *, quantity, price):
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=0.5),
+                      rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+    await e.wind_down(0.20, tokens=["MX", "LINK", "TRX"])
+    assert sizes and all(n == 1 for n in sizes), (
+        f"баланси питаються пачкою — вона віддає порожньо: {sizes}")

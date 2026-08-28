@@ -579,11 +579,16 @@ async def test_expired_campaign_winds_down_before_switching_off():
     order = []
 
     class _Camp:
+        # state.tokens — раннер бере набір кампанії, щоб розпродати й монети
+        # зі старого юніверсу. Фейк мусить це вміти, інакше виняток тихо
+        # проковтнеться і тест побачить лише «finish».
+        state = type("S", (), {"tokens": ["LINK"]})()
         def expired(self): return True
         def finish(self): order.append("finish")
 
     class _Spot:
-        async def wind_down(self, keep):
+        plan = type("P", (), {"tokens": ["LINK"]})()
+        async def wind_down(self, keep, tokens=None):
             order.append(("wind_down", keep))
             return 0                      # нічого продавати — завершено одразу
 
@@ -611,11 +616,13 @@ async def test_wind_down_gets_another_tick_while_it_still_sells():
     finished = []
 
     class _Camp:
+        state = type("S", (), {"tokens": ["LINK"]})()
         def expired(self): return True
         def finish(self): finished.append(1)
 
     class _Spot:
-        async def wind_down(self, keep):
+        plan = type("P", (), {"tokens": ["LINK"]})()
+        async def wind_down(self, keep, tokens=None):
             return 2                      # ще продає
 
     w = SlotWarmer.__new__(SlotWarmer)
@@ -640,11 +647,13 @@ async def test_a_failing_wind_down_does_not_wedge_the_slot_forever():
     finished = []
 
     class _Camp:
+        state = type("S", (), {"tokens": ["LINK"]})()
         def expired(self): return True
         def finish(self): finished.append(1)
 
     class _Spot:
-        async def wind_down(self, keep):
+        plan = type("P", (), {"tokens": ["LINK"]})()
+        async def wind_down(self, keep, tokens=None):
             raise RuntimeError("біржа мовчить")
 
     w = SlotWarmer.__new__(SlotWarmer)
@@ -658,3 +667,40 @@ async def test_a_failing_wind_down_does_not_wedge_the_slot_forever():
 
     await SlotWarmer.tick(w)
     assert finished, "слот завис після падіння розпродажу"
+
+
+@pytest.mark.asyncio
+async def test_runner_passes_the_full_token_pool_to_wind_down():
+    """ПРОВОДКА. `wind_down` уміє ширший список, але якщо раннер і далі шле
+    лише денний план, монети зі старого юніверсу (MX на 12.10 USDT) знову
+    лишаться замкненими. Сьомий за сесію тест саме на виклик."""
+    from src.execution.soft_start_runner import SlotWarmer, SPOT_CANDIDATES
+
+    got = {}
+
+    class _Camp:
+        state = type("S", (), {"tokens": ["LINK", "PENGU"]})()
+        def expired(self): return True
+        def finish(self): pass
+
+    class _Spot:
+        plan = type("P", (), {"tokens": ["LINK"]})()
+        async def wind_down(self, keep, tokens=None):
+            got["tokens"] = tokens
+            return 0
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w.draining = False
+    w._wound_down = False
+    w._spot_viable = True
+    w.campaign = _Camp()
+    w.spot = _Spot()
+    w.futures = object()
+
+    await SlotWarmer.tick(w)
+    toks = got.get("tokens") or []
+    assert "MX" in toks, "кандидати не передані — MX знову поза розпродажем"
+    assert "PENGU" in toks, "набір кампанії не переданий"
+    assert len(set(toks)) == len(toks), "дублі в списку"
+    assert set(SPOT_CANDIDATES) <= set(toks)

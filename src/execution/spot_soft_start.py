@@ -289,7 +289,8 @@ class SpotSoftStart:
         logger.warning("[buy] %s rejected: %s", symbol, res.error)
         return False
 
-    async def wind_down(self, keep_frac: float = 0.20) -> int:
+    async def wind_down(self, keep_frac: float = 0.20,
+                        tokens: list | None = None) -> int:
         """Розпродати монети наприкінці кампанії, лишивши ~`keep_frac` вартості.
 
         НАВІЩО ОКРЕМИЙ РЕЖИМ, А НЕ ЗВИЧАЙНІ ПРОДАЖІ. `maybe_sell` НІКОЛИ не
@@ -308,10 +309,25 @@ class SpotSoftStart:
         """
         cfg = self.cfg
         sent = 0
-        for token in list(self.plan.tokens):
+        # НЕ `plan.tokens`, А ВСЕ, ЩО МОЖЕ ЛЕЖАТИ НА БАЛАНСІ.
+        #
+        # Денний план містить лише сьогоднішні токени, а монети накопичуються
+        # за всю історію слота — зокрема куплені під СТАРИМ юніверсом. На
+        # клоні 29.08 план був ['LINK','PENGU','SUI','TRX'], а найбільший
+        # залишок — MX на 12.10 USDT, куплений тоді, коли юніверс складався
+        # з одного MX. Він не потрапив би в розпродаж ніколи.
+        #
+        # Порожній баланс токена коштує один запит і нічого не ламає, тож
+        # дешевше перевірити зайве, ніж лишити гроші замкненими.
+        pool = tokens if tokens is not None else list(self.plan.tokens)
+        for token in list(dict.fromkeys(pool)):
             symbol = f"{token}{cfg.quote}"
             try:
                 cur = await self.client.currency(token)
+                # ПО ОДНОМУ coinId. Виміряно 2026-08-29: запит із кількома
+                # id одразу віддає ПОРОЖНІЙ словник, без помилки — тобто
+                # «нічого не тримаємо» замість реального балансу. Тиха
+                # неправда, на якій я сам спіймався, роблячи цю перевірку.
                 bals = await self.client.balances([cur.currency_id])
                 held = float(bals.get(token, {}).get("available", 0) or 0)
             except Exception as e:
