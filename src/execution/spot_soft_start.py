@@ -289,6 +289,64 @@ class SpotSoftStart:
         logger.warning("[buy] %s rejected: %s", symbol, res.error)
         return False
 
+    async def wind_down(self, keep_frac: float = 0.20) -> int:
+        """Розпродати монети наприкінці кампанії, лишивши ~`keep_frac` вартості.
+
+        НАВІЩО ОКРЕМИЙ РЕЖИМ, А НЕ ЗВИЧАЙНІ ПРОДАЖІ. `maybe_sell` НІКОЛИ не
+        продає нижче `baseline_usdt_per_token` — це правильно під час прогріву
+        (акаунт має виглядати як такий, що ТРИМАЄ монети, а не як пилосос), але
+        рівно через це в кінці кампанії на балансі лишається все куплене.
+        На клоні 29.08 це було 4.36 і 7.90 USDT, замкнених назавжди.
+
+        Тут базовий залишок свідомо ІГНОРУЄТЬСЯ: прогрів завершився, тримати
+        більше нічого не треба. Лишаємо `keep_frac` від поточної вартості монет
+        — повний нуль виглядав би як «вийшов і забув», а це теж патерн.
+
+        Продажі йдуть по одному на виклик і НЕ рахуються в денний план: план
+        уже вичерпано, а розпродаж — окрема дія завершення.
+        Повертає кількість відправлених ордерів.
+        """
+        cfg = self.cfg
+        sent = 0
+        for token in list(self.plan.tokens):
+            symbol = f"{token}{cfg.quote}"
+            try:
+                cur = await self.client.currency(token)
+                bals = await self.client.balances([cur.currency_id])
+                held = float(bals.get(token, {}).get("available", 0) or 0)
+            except Exception as e:
+                logger.warning("[wind-down] %s: баланс не прочитано (%s)",
+                               symbol, e)
+                continue
+            px = public_last_price(symbol)
+            if not px or held <= 0:
+                continue
+            value = held * px
+            target_value = value * max(0.0, min(1.0, keep_frac))
+            sell_value = value - target_value
+            if sell_value < cfg.order_usdt_min:
+                logger.info("[wind-down] %s: лишок ~%.2f USDT — продавати нічого",
+                            symbol, value)
+                continue
+            qty = min(held, sell_value / px)
+            cost = _order_cost(qty * px, cfg.marketable_buffer, cfg.spot_fee_frac)
+            res = await self.client.sell(token, quantity=qty,
+                                         price=px * (1 - cfg.marketable_buffer))
+            if not res.ok:
+                logger.warning("[wind-down] %s відхилено: %s", symbol, res.error)
+                continue
+            sent += 1
+            proceeds = qty * px
+            self.last_action = {"kind": "sell", "symbol": symbol,
+                                "usdt": proceeds, "qty": res.quantity,
+                                "price": res.price}
+            logger.info("[wind-down] %s продано ~%.2f USDT, лишається ~%.2f",
+                        symbol, proceeds, target_value)
+            if self.budget is not None and not res.dry_run:
+                self.budget.record_pnl(proceeds, f"spot sell {symbol}")
+                self.budget.charge(cost, f"spot wind-down {symbol}")
+        return sent
+
     async def maybe_sell(self) -> bool:
         p, cfg = self.plan, self.cfg
         if p.sells_done >= p.sells_target or not p.tokens:

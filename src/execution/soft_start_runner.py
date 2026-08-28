@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 POLL_SEC = 60
 
+# Скільки вартості монет лишається на балансі після кампанії. Не нуль:
+# рахунок, вичищений у нуль рівно в мить завершення прогріву, — це теж
+# патерн, і помітніший за невеликий залишок.
+SPOT_WIND_DOWN_KEEP = 0.20
+
 # Кандидати на спотовий прогрів. Юніверс був `("MX",)` — один токен, тобто
 # всі покупки йшли по MX, а `tokens_per_day_max=4` не мав сенсу взагалі.
 #
@@ -87,6 +92,9 @@ class SlotWarmer:
         # Останній надрукований зважений план — щоб рядок не повторювався
         # щотіку (тік іде раз на POLL_SEC, а план змінюється раз на добу).
         self._weighted_logged: tuple | None = None
+        # Розпродаж наприкінці кампанії робиться один раз; прапорець не дає
+        # крутити його вічно, якщо продавати вже нічого.
+        self._wound_down = False
         self._stop_attempts = 0
         self._final_sent = False
         self.fee_gate = FeeGate(client)
@@ -350,6 +358,31 @@ class SlotWarmer:
             return                                  # OFF requested — stop() drains
 
         if self.campaign.expired():
+            # РОЗПРОДАЖ ПЕРЕД ВИМКНЕННЯМ. `maybe_sell` ніколи не продає нижче
+            # базового залишку — правильно під час прогріву, але через це в
+            # кінці на балансі лишалось усе куплене (на клоні 29.08 це були
+            # 4.36 і 7.90 USDT, замкнених назавжди). Тут базовий залишок
+            # свідомо ігнорується: гріти більше нічого.
+            #
+            # ЧОМУ ДО `finish()`, А НЕ ПІСЛЯ: `finished()` вимикає кнопку в БД
+            # і викидає warmer, тож після цього продавати вже нікому. Слот
+            # лишається увімкненим, поки розпродаж не доведено до кінця.
+            if self._spot_viable and not self._wound_down:
+                try:
+                    sent = await self.spot.wind_down(SPOT_WIND_DOWN_KEEP)
+                    if sent:
+                        logger.info("soft-start slot %d: розпродаж — %d ордер(ів)",
+                                    self.slot_id, sent)
+                        return          # ще один тік на решту
+                    self._wound_down = True
+                    logger.info("soft-start slot %d: розпродаж завершено, "
+                                "лишили ~%.0f%% у монетах",
+                                self.slot_id, SPOT_WIND_DOWN_KEEP * 100)
+                except Exception:
+                    logger.exception("soft-start slot %d: розпродаж упав — "
+                                     "вимикаюсь, монети лишаються",
+                                     self.slot_id)
+                    self._wound_down = True
             # Finite job: stop acting the moment the campaign is over. The loop
             # flips the DB button off so the UI stops claiming it is warming.
             self.campaign.finish()

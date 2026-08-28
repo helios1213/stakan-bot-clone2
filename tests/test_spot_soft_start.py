@@ -180,3 +180,125 @@ async def test_tick_is_inert_outside_active_hours(tmp_path, monkeypatch):
     monkeypatch.setattr(e, "active_now", lambda now=None: False)
     await e.tick()
     assert c.orders == []
+
+
+# ---- розпродаж наприкінці кампанії (2026-08-29) ----------------------------
+
+@pytest.mark.asyncio
+async def test_wind_down_ignores_the_baseline_that_blocks_normal_sells(
+        tmp_path, monkeypatch):
+    """ЩО ЦЕ ЛІКУЄ. `maybe_sell` НІКОЛИ не продає нижче базового залишку —
+    правильно під час прогріву (акаунт має виглядати як такий, що ТРИМАЄ
+    монети), але через це в кінці кампанії все куплене лишалось замкненим:
+    на клоні 29.08 це були 4.36 і 7.90 USDT.
+
+    Розпродаж базовий залишок свідомо ігнорує: гріти більше нічого.
+    """
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+
+    sold = []
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "cid"})()
+
+        async def balances(self, ids):
+            return {"MX": {"available": 10.0}}
+
+        async def sell(self, ticker, *, quantity, price):
+            sold.append((ticker, quantity))
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    # baseline 5.0 — звичайний продаж не зміг би опустити нижче нього
+    c = cfg(tmp_path, universe=("MX",), baseline_usdt_per_token=5.0,
+            order_usdt_min=0.5)
+    e = SpotSoftStart(_Cl(), c, rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0,
+                     sells_target=0)
+
+    sent = await e.wind_down(0.20)
+    assert sent == 1, "розпродаж нічого не відправив"
+    _t, qty = sold[0]
+    # тримали 10.0 за ціною 1.0 -> лишити 20% = 2.0, продати 8.0
+    assert abs(qty - 8.0) < 1e-6, f"продано {qty}, а мало 8.0 (лишити 20%)"
+
+
+@pytest.mark.asyncio
+async def test_wind_down_leaves_a_remainder_on_purpose(tmp_path, monkeypatch):
+    """Рахунок, вичищений у НУЛЬ рівно в мить завершення прогріву, — це теж
+    патерн, і помітніший за невеликий залишок."""
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    sold = []
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "cid"})()
+        async def balances(self, ids):
+            return {"MX": {"available": 10.0}}
+        async def sell(self, ticker, *, quantity, price):
+            sold.append(quantity)
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=0.5),
+                      rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+    await e.wind_down(0.20)
+    assert sold and sold[0] < 10.0, "продали ВСЕ — залишку не лишилось"
+
+
+@pytest.mark.asyncio
+async def test_wind_down_skips_dust(tmp_path, monkeypatch):
+    """Залишок нижче мінімального ноціоналу — не ордер, а відмова біржі."""
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "cid"})()
+        async def balances(self, ids):
+            return {"MX": {"available": 0.4}}
+        async def sell(self, *a, **k):
+            raise AssertionError("пил не має відправлятись")
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=1.5),
+                      rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+    assert await e.wind_down(0.20) == 0
+
+
+@pytest.mark.asyncio
+async def test_wind_down_survives_an_unreadable_balance(tmp_path, monkeypatch):
+    """Один токен не прочитався — решта мусить продатись."""
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    sold = []
+
+    class _Cl:
+        async def currency(self, t):
+            if t == "BAD":
+                raise RuntimeError("нема такого")
+            return type("C", (), {"currency_id": "cid"})()
+        async def balances(self, ids):
+            return {"MX": {"available": 10.0}}
+        async def sell(self, ticker, *, quantity, price):
+            sold.append(ticker)
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX", "BAD"),
+                                 order_usdt_min=0.5), rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["BAD", "MX"],
+                     buys_target=0, sells_target=0)
+    assert await e.wind_down(0.20) == 1
+    assert sold == ["MX"]

@@ -562,3 +562,99 @@ async def test_tick_actually_uses_the_pacing_not_a_constant(monkeypatch):
 
     await e.tick()
     assert calls, "tick() не питає _tick_probability — темп прибитий у коді"
+
+
+# ---- розпродаж на завершенні кампанії: ПРОВОДКА (2026-08-29) ---------------
+
+@pytest.mark.asyncio
+async def test_expired_campaign_winds_down_before_switching_off():
+    """ПРОВОДКА, а не формула. `wind_down()` може бути ідеальним і невживаним —
+    це вже шостий випадок такої діри за сесію.
+
+    Порядок критичний: розпродаж мусить статись ДО `finish()`, бо той вимикає
+    кнопку в БД і викидає warmer — після цього продавати вже нікому.
+    """
+    from src.execution.soft_start_runner import SlotWarmer
+
+    order = []
+
+    class _Camp:
+        def expired(self): return True
+        def finish(self): order.append("finish")
+
+    class _Spot:
+        async def wind_down(self, keep):
+            order.append(("wind_down", keep))
+            return 0                      # нічого продавати — завершено одразу
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w.draining = False
+    w._wound_down = False
+    w._spot_viable = True
+    w.campaign = _Camp()
+    w.spot = _Spot()
+    w.futures = object()
+
+    await SlotWarmer.tick(w)
+    assert order and order[0][0] == "wind_down", (
+        f"розпродаж не викликано або не першим: {order}")
+    assert order[-1] == "finish", "кнопку вимкнено до завершення розпродажу"
+
+
+@pytest.mark.asyncio
+async def test_wind_down_gets_another_tick_while_it_still_sells():
+    """Поки розпродаж відправляє ордери, слот НЕ вимикається: інакше половина
+    монет лишилась би непроданою."""
+    from src.execution.soft_start_runner import SlotWarmer
+
+    finished = []
+
+    class _Camp:
+        def expired(self): return True
+        def finish(self): finished.append(1)
+
+    class _Spot:
+        async def wind_down(self, keep):
+            return 2                      # ще продає
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w.draining = False
+    w._wound_down = False
+    w._spot_viable = True
+    w.campaign = _Camp()
+    w.spot = _Spot()
+    w.futures = object()
+
+    await SlotWarmer.tick(w)
+    assert not finished, "слот вимкнувся посеред розпродажу"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_wind_down_does_not_wedge_the_slot_forever():
+    """Розпродаж упав — слот усе одно мусить завершитись, інакше кампанія
+    висітиме вічно, а монети однаково лишаться."""
+    from src.execution.soft_start_runner import SlotWarmer
+
+    finished = []
+
+    class _Camp:
+        def expired(self): return True
+        def finish(self): finished.append(1)
+
+    class _Spot:
+        async def wind_down(self, keep):
+            raise RuntimeError("біржа мовчить")
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w.draining = False
+    w._wound_down = False
+    w._spot_viable = True
+    w.campaign = _Camp()
+    w.spot = _Spot()
+    w.futures = object()
+
+    await SlotWarmer.tick(w)
+    assert finished, "слот завис після падіння розпродажу"
