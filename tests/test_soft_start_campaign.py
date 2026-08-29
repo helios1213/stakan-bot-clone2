@@ -201,7 +201,13 @@ async def test_finished_campaign_switches_the_slot_off(monkeypatch):
             self.draining = False
             self._stop_attempts = 0
             self._final_sent = False
-            self.campaign = type("C", (), {"expired": lambda self: True})()
+            # state.stats і elapsed_hours() — фінальний звіт бере підсумки з
+            # КАМПАНІЇ, а не з репортера (той обнуляється на кожному рестарті).
+            self.campaign = type("C", (), {
+                "expired": lambda self: True,
+                "elapsed_hours": lambda self: 72.0,
+                "state": type("S", (), {"stats": {}, "tokens": []})(),
+            })()
             # pnl і entries — фінальний звіт тепер показує рух ринку і те,
             # що лишилось у монетах. Фейк мусить це вміти, інакше звіт падає
             # у своєму ж try/except і тест бачить лише «звіту не було».
@@ -704,3 +710,82 @@ async def test_runner_passes_the_full_token_pool_to_wind_down():
     assert "PENGU" in toks, "набір кампанії не переданий"
     assert len(set(toks)) == len(toks), "дублі в списку"
     assert set(SPOT_CANDIDATES) <= set(toks)
+
+
+@pytest.mark.asyncio
+async def test_runner_bumps_campaign_counters_on_every_action():
+    """ПРОВОДКА — восьмий за сесію тест саме на виклик.
+
+    `bump()` може бути ідеальним і невживаним: тоді підсумковий звіт знову
+    покаже нулі, як 29.08. Тут перевіряється, що дифер реально рахує.
+    """
+    from src.execution.soft_start_runner import SlotWarmer
+
+    bumped = []
+
+    class _Camp:
+        state = type("S", (), {"stats": {}, "day_index": lambda self: 0,
+                               "days": 3})()
+        def bump(self, key, n=1): bumped.append((key, n))
+        def day_weight(self): return 1.0
+
+    class _Rep:
+        async def spot_buy(self, *a, **k): pass
+        async def spot_sell(self, *a, **k): pass
+        async def futures_open(self, *a, **k): pass
+        async def futures_close(self, *a, **k): pass
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w.reporter = _Rep()
+    w.campaign = _Camp()
+    w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0,
+                              "held_spot_value": 0.0,
+                              "state": type("S2", (), {"max_usdt": 0.0,
+                                                       "entries": []})()})()
+    w.spot = type("S", (), {"cfg": type("C", (), {"order_usdt_max": 3.0})(),
+                            "last_action": {"symbol": "MXUSDT", "usdt": 1.5,
+                                            "qty": "1"}})()
+    w.futures = type("F", (), {"state": type("St", (), {"position": None})(),
+                               "last_closed": None})()
+
+    # 2 купівлі + 1 продаж + відкриття
+    await SlotWarmer._report_diff(w, (0, 0, 0, None), (2, 1, 1, "PEPEUSDT"))
+    d = dict(bumped)
+    assert d.get("spot_buys") == 2, bumped
+    assert d.get("spot_sells") == 1, bumped
+    assert "futures_opens" in d, bumped
+
+
+@pytest.mark.asyncio
+async def test_counter_failure_does_not_stop_the_telegram_report():
+    """Лічильники — це облік, звіт — це видимість. Падіння першого не має
+    глушити друге."""
+    from src.execution.soft_start_runner import SlotWarmer
+
+    sent = []
+
+    class _Camp:
+        state = type("S", (), {"stats": {}, "day_index": lambda self: 0,
+                               "days": 3})()
+        def bump(self, key, n=1): raise OSError("диск повний")
+        def day_weight(self): return 1.0
+
+    class _Rep:
+        async def spot_buy(self, *a, **k): sent.append("buy")
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w.reporter = _Rep()
+    w.campaign = _Camp()
+    w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0,
+                              "held_spot_value": 0.0,
+                              "state": type("S2", (), {"max_usdt": 0.0,
+                                                       "entries": []})()})()
+    w.spot = type("S", (), {"cfg": type("C", (), {"order_usdt_max": 3.0})(),
+                            "last_action": None})()
+    w.futures = type("F", (), {"state": type("St", (), {"position": None})(),
+                               "last_closed": None})()
+
+    await SlotWarmer._report_diff(w, (0, 0, 0, None), (1, 0, 0, None))
+    assert sent == ["buy"], "звіт заглушено падінням лічильника"

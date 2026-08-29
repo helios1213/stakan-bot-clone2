@@ -516,3 +516,73 @@ def test_a_new_file_is_not_seeded_twice(tmp_path):
     }))
     b = SoftStartBudget(str(p), 5.0)
     assert abs(b.held_spot_value - 4.0) < 1e-9
+
+
+# ---- підсумки КАМПАНІЇ, а не процесу (2026-08-29) --------------------------
+
+def test_final_report_prefers_persistent_campaign_stats():
+    """ЖИВИЙ ВИПАДОК 29.08. Фінальний звіт слота 1 показав
+        spot 0 buys, 0 sells · futures 2 opened, 2 closed · Ran for 14.0h
+    тоді як насправді за кампанію було 17 купівель, 9 продажів, 8 відкриттів
+    і 7 закриттів за ~3 доби.
+
+    Причина: лічильники жили в памʼяті репортера, який створюється наново на
+    КОЖНОМУ рестарті бота, а ми перезбирали боти багато разів. Звіт міряв час
+    від останнього рестарту, а не кампанію.
+    """
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=False)
+    r.stats.update({"spot_buys": 0, "spot_sells": 0,
+                    "futures_opens": 2, "futures_closes": 2})
+    out = r.render_final(
+        "campaign finished", spent=0.5335, futures_pnl=-0.3748,
+        pnl=-4.36, held_value=4.3579,
+        stats={"spot_buys": 17, "spot_sells": 9,
+               "futures_opens": 8, "futures_closes": 7},
+        elapsed_h=72.4)
+    assert "17 buys, 9 sells (26 orders)" in out
+    assert "8 opened, 7 closed" in out
+    assert "72.4h" in out
+    assert "0 buys" not in out and "14.0h" not in out
+
+
+def test_final_report_falls_back_to_in_memory_stats():
+    """Без персистентних чисел поведінка лишається старою, а не порожньою."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=False)
+    r.stats.update({"spot_buys": 3, "spot_sells": 1})
+    out = r.render_final("x", spent=0.0)
+    assert "3 buys, 1 sells" in out
+
+
+def test_campaign_counters_survive_a_restart(tmp_path):
+    """Лічильники мусять лежати на диску разом зі станом кампанії."""
+    import random
+    from src.execution.soft_start_campaign import SoftStartCampaign
+    path = str(tmp_path / "c.json")
+    c = SoftStartCampaign(path, 3, rng=random.Random(1))
+    c.bump("spot_buys", 5)
+    c.bump("futures_opens")
+    c.bump("futures_opens")
+
+    again = SoftStartCampaign(path, 3, rng=random.Random(2))
+    assert again.state.stats["spot_buys"] == 5
+    assert again.state.stats["futures_opens"] == 2
+
+
+def test_campaign_elapsed_is_the_campaign_not_the_process(tmp_path):
+    import random, time
+    from src.execution.soft_start_campaign import SoftStartCampaign
+    c = SoftStartCampaign(str(tmp_path / "c.json"), 3, rng=random.Random(1))
+    c.state.started_at = time.time() - 72 * 3600
+    assert 71.9 < c.elapsed_hours() < 72.1
+
+
+def test_bump_never_raises(tmp_path, monkeypatch):
+    """Збій запису не має зупиняти прогрів — гірший наслідок тут це неточний
+    підсумковий звіт, а не втрачена угода."""
+    import random
+    from src.execution.soft_start_campaign import SoftStartCampaign
+    c = SoftStartCampaign(str(tmp_path / "c.json"), 3, rng=random.Random(1))
+    monkeypatch.setattr(c, "_save", lambda: (_ for _ in ()).throw(OSError("ro")))
+    c.bump("spot_buys")          # не має кинути

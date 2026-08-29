@@ -53,6 +53,12 @@ class CampaignState:
     # спотовий баланс і прогрів став би нікуди. Плюс людина зазвичай крутить
     # кілька своїх монет, а не нову щодня.
     tokens: list = field(default_factory=list)
+    # ПІДСУМКИ КАМПАНІЇ, а не процесу. Лічильники жили в памʼяті репортера,
+    # який створюється наново на КОЖНОМУ рестарті бота — тож фінальний звіт
+    # 29.08 показав «spot 0 buys, futures 2 opened, Ran for 14.0h» замість
+    # реальних 17/9 і 8/7 за три доби. Він міряв час від останнього рестарту,
+    # а не кампанію. Тут вони переживають рестарт разом зі станом кампанії.
+    stats: dict = field(default_factory=dict)
 
     def elapsed_days(self, now: float | None = None) -> float:
         if not self.started_at:
@@ -164,6 +170,22 @@ class SoftStartCampaign:
         self._save()
         logger.info("soft-start campaign: набір токенів %s", picked)
         return list(picked)
+
+    def bump(self, key: str, n: int = 1) -> None:
+        """Порахувати дію кампанії. Best-effort: збій запису не має зупиняти
+        прогрів — гірший наслідок тут це неточний підсумковий звіт."""
+        try:
+            self.state.stats[key] = int(self.state.stats.get(key, 0)) + int(n)
+            self._save()
+        except Exception:
+            logger.debug("soft-start campaign: лічильник %s не збережено", key,
+                         exc_info=True)
+
+    def elapsed_hours(self) -> float:
+        """Скільки триває САМА КАМПАНІЯ, а не поточний процес."""
+        if not self.state.started_at:
+            return 0.0
+        return max(0.0, (time.time() - self.state.started_at) / 3600.0)
 
     def scale_target(self, base_max: int) -> int:
         """Стеля денної цілі (купівлі, продажі, фʼючерсні ордери) за вагою дня.

@@ -136,9 +136,19 @@ class SoftStartReporter:
     def render_final(self, reason: str, *, spent: float = 0.0,
                      ceiling: float = 0.0, position_left: bool = False,
                      pnl: float = 0.0, held_value: float = 0.0,
-                     futures_pnl: float = 0.0) -> str:
-        s = self.stats
-        elapsed_h = (time.time() - self.started_at) / 3600
+                     futures_pnl: float = 0.0,
+                     stats: dict | None = None,
+                     elapsed_h: float | None = None) -> str:
+        # ПІДСУМКИ КАМПАНІЇ, а не процесу. `self.stats` і `self.started_at`
+        # живуть у памʼяті репортера, який створюється наново на КОЖНОМУ
+        # рестарті бота: 29.08 звіт показав «spot 0 buys, futures 2 opened,
+        # Ran for 14.0h» замість реальних 17/9 і 8/7 за три доби. Коли
+        # викликач має персистентні числа — беремо їх.
+        s = dict(self.stats)
+        if stats:
+            s.update({k: v for k, v in stats.items() if v is not None})
+        elapsed_h = (elapsed_h if elapsed_h is not None
+                     else (time.time() - self.started_at) / 3600)
         spot_total = s["spot_buys"] + s["spot_sells"]
         fut_total = s["futures_opens"] + s["futures_closes"]
 

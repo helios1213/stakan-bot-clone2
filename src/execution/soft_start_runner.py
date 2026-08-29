@@ -253,6 +253,23 @@ class SlotWarmer:
         act = getattr(self.spot, "last_action", None) or {}
         sym = act.get("symbol") or "spot"
         qty = act.get("qty") or "?"
+        # Лічильники кампанії — ПОРУЧ із відправкою в Telegram, але окремо від
+        # неї: репортер живе в памʼяті процесу, кампанія — на диску. Раніше
+        # підсумок брався з репортера, тож кожен рестарт обнуляв статистику
+        # і фінальний звіт показував лише останній відрізок.
+        try:
+            if b1 > b0:
+                self.campaign.bump("spot_buys", b1 - b0)
+            if s1 > s0:
+                self.campaign.bump("spot_sells", s1 - s0)
+            if p1 and p1 != p0:
+                self.campaign.bump("futures_opens")
+            elif p0 and not p1:
+                self.campaign.bump("futures_closes")
+        except Exception:
+            logger.debug("soft-start slot %d: лічильники кампанії не оновлено",
+                         self.slot_id, exc_info=True)
+
         try:
             if b1 > b0:
                 await self.reporter.spot_buy(
@@ -487,7 +504,12 @@ async def _final_report(w, slot_id: int, reason: str, *, position_left: bool) ->
         return
     try:
         await w.reporter.final_report(
-            reason, spent=w.budget.spent,
+            reason,
+            # Підсумки і тривалість — З КАМПАНІЇ, не з репортера: той
+            # створюється наново на кожному рестарті бота.
+            stats=dict(w.campaign.state.stats or {}),
+            elapsed_h=w.campaign.elapsed_hours(),
+            spent=w.budget.spent,
             # Стелі немає — передаємо 0, щоб рядок про неї не зʼявлявся.
             ceiling=0.0,
             pnl=w.budget.pnl,
