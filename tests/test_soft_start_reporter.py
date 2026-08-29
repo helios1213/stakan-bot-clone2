@@ -272,19 +272,20 @@ async def test_unknown_pnl_says_so_instead_of_showing_zero():
     assert "+0.0000" not in out
 
 
-def test_net_cost_subtracts_what_is_still_held_in_coins():
-    """ФОРМУЛА, ЯКА МАЛА НЕ ЗІЙТИСЬ І НЕ ЗІЙШЛАСЬ БИ.
+def test_net_cost_is_fees_minus_both_pnls():
+    """ФОРМУЛА ЗМІНИЛАСЬ 29.08 і це навмисно.
 
-    Спотова купівля йде в PnL мінусом, тож USDT, перетворені на монету,
-    виглядають як збиток. Без віднімання того, що ще лежить у монетах, звіт
-    показував «разом +5.93», хоча реальна вартість була 0.49 (комісії 0.117 +
-    фʼючерсний мінус 0.371) — решта просто змінила форму.
+    Було `spent - pnl - held_value`, де pnl містив спотове КЕШ-ФЛО. Воно
+    скорочувалось із `held_value`, тож спотовий результат не входив у
+    підсумок ЗОВСІМ (купили на 10, продали за 8 — звіт казав 0.05 замість
+    2.05). Тепер прямо: витрати мінус фʼючерсний PnL мінус спотовий.
     """
     from src.execution.soft_start_reporter import SoftStartReporter
     r = SoftStartReporter(None, 1, dry_run=True)
-    out = r.render(day=1, days=3, spent=0.117, pnl=-5.81, held_value=5.44,
-                   position=None)
-    assert "разом +0.487 USDT" in out, out
+    out = r.render(day=1, days=3, spent=0.117, pnl=-5.81, futures_pnl=0.648,
+                   spot_pnl=-0.02, held_value=5.44, position=None)
+    # 0.117 - 0.648 - (-0.02) = -0.511
+    assert "разом -0.511 USDT" in out, out
     assert "у монетах ~5.44" in out
 
 
@@ -337,9 +338,11 @@ def test_final_report_shows_money_even_without_a_ceiling():
 def test_final_verdict_is_not_a_coin_flip_near_zero():
     """Вердикт із двох станів біля нуля змушує обирати навмання: і «в плюс», і
     «в мінус» там однаково неправдиві."""
-    assert "приблизно в нуль" in _final(spent=0.10, pnl=0.09, held_value=0.0)
-    assert "коштував грошей" in _final(spent=1.00, pnl=0.00, held_value=0.0)
-    assert "у плюс" in _final(spent=0.10, pnl=1.00, held_value=0.0)
+    # Параметри змінені 29.08: підсумок рахується з ОБОХ PnL напряму, а не з
+    # кеш-фло, яке скорочувалось саме із собою.
+    assert "приблизно в нуль" in _final(spent=0.10, futures_pnl=0.09)
+    assert "коштував грошей" in _final(spent=1.00, futures_pnl=0.00)
+    assert "у плюс" in _final(spent=0.10, futures_pnl=1.00)
 
 
 def test_final_report_says_the_held_value_is_at_cost():
@@ -422,13 +425,15 @@ def test_held_value_survives_the_daily_plan_reset():
     from src.execution.soft_start_budget import SoftStartBudget
     b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
     b.charge(0.264, "fees")
-    b.record_pnl(-75.930, "spot buy MXUSDT")
-    b.record_pnl(29.622, "spot sell MXUSDT")
+    # Купили на 75.93, продали частину рівно за собівартістю (29.622) —
+    # реалізований PnL нуль, решта лишається в монетах за собівартістю.
+    b.record_spot_buy("MX", 75.930, 75.930)
+    b.record_spot_sell("MX", 29.622, 29.622)
 
-    assert abs(b.pnl - (-46.308)) < 1e-6
+    assert abs(b.spot_pnl) < 1e-6, "продаж за собівартістю дав PnL"
     assert abs(b.held_spot_value - 46.308) < 1e-6, (
-        "«у монетах» не бачить кеш-фло кампанії")
-    net = b.spent - b.pnl - b.held_spot_value
+        "«у монетах» не бачить того, що справді лишилось")
+    net = b.spent - b.futures_pnl - b.spot_pnl
     assert abs(net - 0.264) < 1e-6, f"разом={net}, а має бути рівно комісії"
 
 
@@ -438,8 +443,8 @@ def test_held_value_is_never_negative():
     import tempfile, os
     from src.execution.soft_start_budget import SoftStartBudget
     b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
-    b.record_pnl(-5.0, "spot buy X")
-    b.record_pnl(9.0, "spot sell X")
+    b.record_spot_buy("X", 5.0, 5.0)
+    b.record_spot_sell("X", 9.0, 5.0)      # продали все дорожче
     assert b.held_spot_value == 0.0
 
 
@@ -449,10 +454,11 @@ def test_futures_pnl_does_not_leak_into_the_spot_flow():
     import tempfile, os
     from src.execution.soft_start_budget import SoftStartBudget
     b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
-    b.record_pnl(-10.0, "spot buy X")
+    b.record_spot_buy("X", 10.0, 10.0)
     b.record_pnl(-3.43, "futures LINKUSDT")
     assert abs(b.held_spot_value - 10.0) < 1e-9
     assert abs(b.futures_pnl - (-3.43)) < 1e-9
+    assert abs(b.spot_pnl) < 1e-9, "фʼючерсний PnL протік у спотовий"
 
 
 def test_runner_reads_held_value_from_the_budget_not_the_day_plan():
@@ -498,9 +504,11 @@ def test_seeding_separates_futures_from_spot(tmp_path):
     p = tmp_path / "b.json"
     p.write_text(json.dumps({
         "max_usdt": 5.0, "spent_usdt": 0.541, "pnl_usdt": -22.4,
-        "futures_pnl_usdt": -0.562, "entries": [],
+        "futures_pnl_usdt": -0.562, "spot_flow_usdt": -(22.4 - 0.562),
+        "entries": [],
     }))
     b = SoftStartBudget(str(p), 5.0)
+    # Старий файл -> монети лягають у legacy-відро за їхньою вартістю.
     assert abs(b.held_spot_value - (22.4 - 0.562)) < 1e-6
 
 
@@ -610,6 +618,8 @@ def test_seeding_splits_from_entries_not_just_the_formula(tmp_path):
                              "pnl_usdt": -6.3, "entries": ents}))
     b = SoftStartBudget(str(p), 5.0)
     assert abs(b.futures_pnl - (-0.3)) < 1e-9, "фʼючерсний PnL знову з'їв спот"
+    # Файл без `spot_positions` -> монети лягають у legacy-відро за вартістю
+    # кеш-фло (10 куплено, 4 повернуто = 6 лишилось).
     assert abs(b.held_spot_value - 6.0) < 1e-9
 
 
@@ -659,3 +669,73 @@ def test_seeding_tolerates_accumulated_rounding(tmp_path, caplog):
         "точні записи відкинуто через накопичене округлення")
     fut = sum(e["usdt"] for e in ents if e["reason"].startswith("PnL futures"))
     assert abs(b.futures_pnl - fut) < 1e-6
+
+
+# ---- спотовий PnL більше не скорочується сам із собою (2026-08-29) ---------
+
+def test_spot_loss_is_actually_counted():
+    """ДІРА, ЯКУ ЦЕ ЛІКУЄ, і вона була структурною.
+
+    Стара формула `spent - pnl - held_value` СКОРОЧУВАЛА спотовий результат
+    сама із собою: `held_value` вважав увесь дефіцит кеш-фло грошима «в
+    монетах», навіть коли монети вже продані в збиток.
+    Перевірено: купили на 10, продали ВСЕ за 8 (втрата 2), комісії 0.05 —
+    звіт казав «у монетах 2.0, разом 0.05» замість 2.05.
+    """
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.charge(0.05, "fees")
+    b.record_spot_buy("MX", 10.0, 5.0)
+    pnl = b.record_spot_sell("MX", 8.0, 5.0)
+    assert abs(pnl - (-2.0)) < 1e-9
+    assert abs(b.spot_pnl - (-2.0)) < 1e-9
+    assert b.held_spot_value == 0.0, "монет немає, а облік каже що є"
+    assert abs((b.spent - b.futures_pnl - b.spot_pnl) - 2.05) < 1e-9
+
+
+def test_partial_sell_realises_against_average_cost():
+    """Продали половину — реалізується половина собівартості, решта лишається
+    позицією, а не «прибутком»."""
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.record_spot_buy("MX", 10.0, 10.0)      # 10 монет по 1.0
+    pnl = b.record_spot_sell("MX", 6.0, 5.0)  # 5 монет за 6.0 -> +1.0
+    assert abs(pnl - 1.0) < 1e-9
+    assert abs(b.held_spot_value - 5.0) < 1e-9, "залишок не за собівартістю"
+
+
+def test_two_buys_average_the_cost():
+    import tempfile, os
+    from src.execution.soft_start_budget import SoftStartBudget
+    b = SoftStartBudget(os.path.join(tempfile.mkdtemp(), "b.json"), 5.0)
+    b.record_spot_buy("MX", 10.0, 10.0)   # по 1.0
+    b.record_spot_buy("MX", 30.0, 10.0)   # по 3.0 -> середня 2.0
+    pnl = b.record_spot_sell("MX", 40.0, 20.0)
+    assert abs(pnl - 0.0) < 1e-9, f"середня собівартість порахована неправильно: {pnl}"
+
+
+def test_selling_untracked_coins_invents_no_profit(tmp_path):
+    """Монети з докоштовної епохи: ціни купівлі ми не знаємо, тож PnL по них
+    НУЛЬ. Вигаданий прибуток був би гіршим за чесний нуль."""
+    import json
+    from src.execution.soft_start_budget import SoftStartBudget
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"max_usdt": 5.0, "spent_usdt": 0.0,
+                             "pnl_usdt": -12.0, "spot_flow_usdt": -12.0,
+                             "entries": []}))
+    b = SoftStartBudget(str(p), 5.0)
+    assert abs(b.held_spot_value - 12.0) < 1e-9, "legacy-монети загубились"
+    pnl = b.record_spot_sell("MX", 9.0, 3.0)
+    assert pnl == 0.0, "вигаданий PnL по монетах невідомої собівартості"
+    assert abs(b.held_spot_value - 3.0) < 1e-9, "legacy-відро не зменшилось"
+
+
+def test_status_line_shows_both_pnls():
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 1, dry_run=False)
+    out = r.render(day=3, days=3, spent=0.534, pnl=-4.36, futures_pnl=-0.375,
+                   spot_pnl=-0.21, held_value=4.36, position=None)
+    assert "фʼючерси -0.375" in out and "спот -0.210" in out
+    assert "разом +1.119" in out

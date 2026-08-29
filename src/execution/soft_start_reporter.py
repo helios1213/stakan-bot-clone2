@@ -136,7 +136,7 @@ class SoftStartReporter:
     def render_final(self, reason: str, *, spent: float = 0.0,
                      ceiling: float = 0.0, position_left: bool = False,
                      pnl: float = 0.0, held_value: float = 0.0,
-                     futures_pnl: float = 0.0,
+                     futures_pnl: float = 0.0, spot_pnl: float = 0.0,
                      stats: dict | None = None,
                      elapsed_h: float | None = None) -> str:
         # ПІДСУМКИ КАМПАНІЇ, а не процесу. `self.stats` і `self.started_at`
@@ -175,7 +175,8 @@ class SoftStartReporter:
         # ГРОШІ ПОКАЗУЮТЬСЯ ЗАВЖДИ. Було `if ceiling:` — а стелю прибрано, тож
         # підсумковий звіт про кампанію лишився б БЕЗ ЖОДНОЇ цифри про гроші,
         # тобто без головного, заради чого його читають.
-        net = spent - pnl - held_value
+        # Та сама формула, що й у живому статусі: витрати мінус обидва PnL.
+        net = spent - futures_pnl - spot_pnl
         lines += [
             "",
             "<b>Скільки коштувало</b>",
@@ -184,6 +185,7 @@ class SoftStartReporter:
             # окремо як «у монетах»: змішавши їх, звіт друкував «-4.358» при
             # реальному результаті -0.34 і читався як катастрофа.
             f"<code>фʼючерси (PnL)  : {futures_pnl:+.4f} USDT</code>",
+            f"<code>спот (PnL)      : {spot_pnl:+.4f} USDT</code>",
         ]
         if held_value:
             # ЗА ЦІНОЮ КУПІВЛІ, не за ринком — і так і підписано. Ми знаємо,
@@ -257,7 +259,8 @@ class SoftStartReporter:
                spent: float | None = None, ceiling: float | None = None,
                position: str | None = None, pnl: float | None = None,
                held_value: float | None = None,
-               futures_pnl: float | None = None) -> str:
+               futures_pnl: float | None = None,
+               spot_pnl: float | None = None) -> str:
         head = f"🌱 <b>Soft-start — slot {self.slot_id}</b>"
         if self.dry_run:
             head += "  <i>(DRY-RUN — nothing is sent)</i>"
@@ -273,19 +276,23 @@ class SoftStartReporter:
             meta.append(f"комісії+спред {spent:.3f}"
                         + (f" (стеля {ceiling:.2f})" if ceiling else ""))
         if futures_pnl is not None:
-            # ОКРЕМИМ ЧИСЛОМ, бо це єдиний справжній прибуток/збиток тут.
             meta.append(f"фʼючерси {futures_pnl:+.3f}")
-        if spent is not None and pnl is not None:
-            # РАЗОМ = витрати - PnL - те, що ЩЕ ЛЕЖИТЬ У МОНЕТАХ.
+        if spot_pnl is not None:
+            meta.append(f"спот {spot_pnl:+.3f}")
+        if spent is not None and (futures_pnl is not None
+                                  or spot_pnl is not None):
+            # РАЗОМ = витрати - фʼючерсний PnL - спотовий PnL.
             #
-            # Без останнього доданка число бреше в наш бік навпаки: спотова
-            # купівля йде в PnL мінусом, тож USDT, перетворені на монету,
-            # виглядають як збиток. На першому ж живому дні це давало «разом
-            # +5.93», хоча реальна вартість прогріву була 0.49 (комісії 0.12 +
-            # фʼючерсний мінус 0.37) — решта просто змінила форму.
+            # Прямо, без кеш-фло. Стара формула `spent - pnl - held_value`
+            # СКОРОЧУВАЛА спотовий результат сама із собою: купили на 10,
+            # продали все за 8 (втрата 2) — і вона давала «у монетах 2.0,
+            # разом 0.05» замість 2.05, бо весь дефіцит кеш-фло вважала
+            # грошима, що ще лежать у монетах.
             #
-            # Додатне = прогрів у мінус.
-            net = spent - pnl - (held_value or 0.0)
+            # Тепер спотовий PnL реалізується проти СОБІВАРТОСТІ на кожному
+            # продажі, а «у монетах» — це собівартість того, що справді
+            # лишилось. Додатне = прогрів у мінус.
+            net = spent - (futures_pnl or 0.0) - (spot_pnl or 0.0)
             meta.append(f"разом {net:+.3f} USDT")
         if held_value:
             # Спотова частина НЕ показується як «PnL» узагалі: це кеш-фло,

@@ -80,6 +80,20 @@ class BudgetState:
     # відʼємною, обрізалась у нуль, і «разом» показувало +46.57 замість 0.26.
     # Тут обидва боки з одного джерела й одного періоду.
     spot_flow_usdt: float = 0.0
+    # ОБЛІК ЗА СОБІВАРТІСТЮ, по токенах: {тікер: {"qty": …, "cost": …}}.
+    #
+    # Без нього спотовий PnL НЕ РАХУВАВСЯ ЗОВСІМ. `held_spot_value` вважав
+    # увесь дефіцит кеш-фло грошима «в монетах» — навіть коли монети вже
+    # продані в збиток. Перевірено: купили на 10, продали все за 8 (втрата 2),
+    # звіт казав «у монетах 2.0, разом 0.05» замість 2.05. Спотова частина
+    # скорочувалась у формулі рівно на розмір власного результату.
+    spot_positions: dict = field(default_factory=dict)
+    # Реалізований спотовий результат: proceeds - собівартість проданого.
+    spot_pnl_usdt: float = 0.0
+    # Собівартість монет, куплених ДО появи цього обліку. Продаж із цього
+    # відра дає нульовий PnL — не тому що його не було, а тому що ми чесно
+    # не знаємо ціни купівлі. Краще нуль, ніж вигаданий прибуток.
+    legacy_spot_cost: float = 0.0
 
     def remaining(self) -> float:
         return max(0.0, self.max_usdt - self.spent_usdt)
@@ -148,6 +162,22 @@ class SoftStartBudget:
                             "розділення — спотовий потік %.4f виведено з формули, "
                             "фʼючерсний PnL може бути занижений",
                             st.spot_flow_usdt)
+
+                # LEGACY-ВІДРО — ОСТАННІМ, а не першим. Монети, куплені до
+                # появи обліку за собівартістю, беруться за ВЖЕ РОЗДІЛЕНИМ
+                # `spot_flow_usdt`. Якщо порахувати їх раніше, у відро піде
+                # `pnl_usdt` разом із фʼючерсним результатом: на тесті це
+                # давало 6.3 замість 6.0 — рівно на розмір фʼючерсного PnL.
+                # Їхньої ціни купівлі ми не знаємо, тож PnL по них не
+                # вигадуємо, але й «у монетах» не втрачаємо.
+                if "spot_positions" not in raw:
+                    st.legacy_spot_cost = max(0.0, -float(
+                        st.spot_flow_usdt or 0.0))
+                    if st.legacy_spot_cost:
+                        logger.info("soft-start budget: %.4f USDT монет із "
+                                    "докоштовної епохи — PnL по них не "
+                                    "рахується, лише вартість",
+                                    st.legacy_spot_cost)
                 return st
             except Exception as e:
                 logger.warning("soft-start budget unreadable (%s) — starting fresh", e)
@@ -208,6 +238,70 @@ class SoftStartBudget:
     def pnl(self) -> float:
         return self.state.pnl_usdt
 
+    def record_spot_buy(self, token: str, usdt: float, qty: float) -> None:
+        """Купівля: збільшує позицію і її собівартість. НЕ витрата — USDT
+        просто змінили форму."""
+        try:
+            usdt = float(usdt); qty = float(qty)
+        except (TypeError, ValueError):
+            return
+        if qty <= 0 or usdt <= 0:
+            return
+        pos = self.state.spot_positions.setdefault(token, {"qty": 0.0,
+                                                           "cost": 0.0})
+        pos["qty"] = float(pos.get("qty", 0.0)) + qty
+        pos["cost"] = float(pos.get("cost", 0.0)) + usdt
+        self.state.spot_flow_usdt -= usdt
+        self._save()
+
+    def record_spot_sell(self, token: str, proceeds: float, qty: float) -> float:
+        """Продаж: реалізує PnL проти СЕРЕДНЬОЇ собівартості. Повертає PnL.
+
+        Продаж токена, якого ми не відстежували (куплений до появи обліку),
+        дає PnL = 0 і зменшує legacy-відро на суму виручки: вигадувати
+        прибуток там, де ціни купівлі ми не знаємо, було б гірше за нуль.
+        """
+        try:
+            proceeds = float(proceeds); qty = float(qty)
+        except (TypeError, ValueError):
+            return 0.0
+        if qty <= 0:
+            return 0.0
+        pos = self.state.spot_positions.get(token)
+        have = float((pos or {}).get("qty", 0.0))
+        pnl = 0.0
+        if pos and have > 0:
+            take = min(qty, have)
+            avg = float(pos.get("cost", 0.0)) / have
+            basis = avg * take
+            # Частка виручки, що припадає на відстежену кількість.
+            share = proceeds * (take / qty)
+            pnl = share - basis
+            pos["qty"] = have - take
+            pos["cost"] = max(0.0, float(pos.get("cost", 0.0)) - basis)
+            if pos["qty"] <= 1e-12:
+                self.state.spot_positions.pop(token, None)
+            rest = proceeds - share
+        else:
+            rest = proceeds
+        if rest > 0:
+            # Невідстежена частина — гасимо legacy-відро без PnL.
+            self.state.legacy_spot_cost = max(
+                0.0, self.state.legacy_spot_cost - rest)
+        self.state.spot_pnl_usdt += pnl
+        self.state.spot_flow_usdt += proceeds
+        self.state.entries.append(
+            {"ts": int(time.time()), "usdt": round(pnl, 6),
+             "reason": f"PnL spot realised {token}"})
+        if len(self.state.entries) > 200:
+            self.state.entries = self.state.entries[-200:]
+        self._save()
+        return pnl
+
+    @property
+    def spot_pnl(self) -> float:
+        return self.state.spot_pnl_usdt
+
     @property
     def held_spot_value(self) -> float:
         """Скільки USDT зараз лежить у куплених монетах, ЗА ЦІНОЮ КУПІВЛІ.
@@ -216,7 +310,9 @@ class SoftStartBudget:
         але не переоцінюємо залишок за курсом — інакше число мінялось би
         щохвилини, а підсумок здавався б точнішим, ніж він є.
         """
-        return max(0.0, -self.state.spot_flow_usdt)
+        tracked = sum(float(p.get("cost", 0.0)) or 0.0
+                      for p in (self.state.spot_positions or {}).values())
+        return max(0.0, tracked + float(self.state.legacy_spot_cost or 0.0))
 
     @property
     def futures_pnl(self) -> float:

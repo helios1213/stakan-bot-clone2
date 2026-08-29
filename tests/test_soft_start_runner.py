@@ -545,7 +545,7 @@ async def test_runner_reports_the_real_order_size_not_the_config_ceiling():
         "day_index": lambda self: 0, "days": 3})()})()
     # Фейк бюджету мусить дзеркалити реальний: додався pnl (рух ринку) і
     # entries (з них рахується, скільки лежить у монетах).
-    w.budget = type("B", (), {"spent": 0.1, "pnl": 0.0, "futures_pnl": 0.0,
+    w.budget = type("B", (), {"spent": 0.1, "pnl": 0.0, "futures_pnl": 0.0, "spot_pnl": 0.0,
                               "state": type("S3", (), {"max_usdt": 5.0,
                                                        "entries": []})()})()
 
@@ -581,7 +581,7 @@ async def test_runner_reports_futures_open_with_its_size():
         "day_index": lambda self: 0, "days": 3})()})()
     # Фейк бюджету мусить дзеркалити реальний: додався pnl (рух ринку) і
     # entries (з них рахується, скільки лежить у монетах).
-    w.budget = type("B", (), {"spent": 0.1, "pnl": 0.0, "futures_pnl": 0.0,
+    w.budget = type("B", (), {"spent": 0.1, "pnl": 0.0, "futures_pnl": 0.0, "spot_pnl": 0.0,
                               "state": type("S3", (), {"max_usdt": 5.0,
                                                        "entries": []})()})()
 

@@ -285,8 +285,16 @@ class SpotSoftStart:
                 "kind": "buy", "symbol": symbol, "usdt": usdt,
                 "qty": res.quantity, "price": res.price,
             }
+            # ОБЛІК ЗА СОБІВАРТІСТЮ. Без кількості спотовий PnL порахувати
+            # неможливо — саме через це він раніше мовчки скорочувався у
+            # підсумку. `res.quantity` віддає біржа; якщо його немає, беремо
+            # usdt/ціну як наближення.
             if self.budget is not None and not res.dry_run:
-                self.budget.record_pnl(-usdt, f"spot buy {symbol}")
+                try:
+                    _q = float(res.quantity or 0) or (usdt / px)
+                    self.budget.record_spot_buy(token, usdt, _q)
+                except Exception:
+                    logger.debug("spot buy: облік не оновлено", exc_info=True)
             save_plan(cfg, p)
             if self.budget is not None and not res.dry_run:
                 self.budget.charge(cost, f"spot buy {symbol}"
@@ -398,7 +406,10 @@ class SpotSoftStart:
             logger.info("[wind-down] %s продано ~%.2f USDT, лишається ~%.2f",
                         symbol, proceeds, value - proceeds)
             if self.budget is not None and not res.dry_run:
-                self.budget.record_pnl(proceeds, f"spot sell {symbol}")
+                try:
+                    self.budget.record_spot_sell(token, proceeds, qty)
+                except Exception:
+                    logger.debug("wind-down: облік не оновлено", exc_info=True)
                 self.budget.charge(cost, f"spot wind-down {symbol}")
         return sent
 
@@ -452,12 +463,14 @@ class SpotSoftStart:
             }
             # СПОТОВИЙ КЕШ-ФЛО у той самий облік, що й фʼючерсний PnL.
             # Покупка — це не витрата: USDT перетворились на монету, і вартість
-            # нікуди не зникла. Витратою є РІЗНИЦЯ між тим, що вклали, і тим,
-            # що повернули, і вона стає відомою лише на продажі. Тому продаж
-            # записується як +proceeds, а купівля як -usdt — сума по кампанії
-            # і є реалізованим спотовим результатом (решта лишається в монетах).
+            # РЕАЛІЗАЦІЯ ПРОТИ СОБІВАРТОСТІ. Раніше тут був чистий кеш-фло
+            # (+proceeds), і спотовий результат у підсумку скорочувався сам із
+            # собою: продаж у збиток виглядав як «гроші лежать у монетах».
             if self.budget is not None and not res.dry_run:
-                self.budget.record_pnl(proceeds, f"spot sell {symbol}")
+                try:
+                    self.budget.record_spot_sell(token, proceeds, qty)
+                except Exception:
+                    logger.debug("spot sell: облік не оновлено", exc_info=True)
             save_plan(cfg, p)
             if self.budget is not None and not res.dry_run:
                 self.budget.charge(cost, f"spot sell {symbol}"

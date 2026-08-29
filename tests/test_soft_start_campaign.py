@@ -212,7 +212,7 @@ async def test_finished_campaign_switches_the_slot_off(monkeypatch):
             # що лишилось у монетах. Фейк мусить це вміти, інакше звіт падає
             # у своєму ж try/except і тест бачить лише «звіту не було».
             self.budget = type("B", (), {"exhausted": lambda self: False,
-                                         "spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0,
+                                         "spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0, "spot_pnl": 0.0,
                                          "state": type("S", (), {
                                              "max_usdt": 5.0,
                                              "entries": []})()})()
@@ -739,7 +739,7 @@ async def test_runner_bumps_campaign_counters_on_every_action():
     w.slot_id = 1
     w.reporter = _Rep()
     w.campaign = _Camp()
-    w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0,
+    w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0, "spot_pnl": 0.0,
                               "held_spot_value": 0.0,
                               "state": type("S2", (), {"max_usdt": 0.0,
                                                        "entries": []})()})()
@@ -778,7 +778,7 @@ async def test_counter_failure_does_not_stop_the_telegram_report():
     w.slot_id = 1
     w.reporter = _Rep()
     w.campaign = _Camp()
-    w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0,
+    w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0, "spot_pnl": 0.0,
                               "held_spot_value": 0.0,
                               "state": type("S2", (), {"max_usdt": 0.0,
                                                        "entries": []})()})()

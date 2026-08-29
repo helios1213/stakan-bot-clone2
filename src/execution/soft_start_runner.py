@@ -310,6 +310,7 @@ class SlotWarmer:
             # Окремо: єдиний справжній прибуток/збиток. Спотова частина `pnl`
             # це кеш-фло і в звіті як «PnL» більше не показується.
             "futures_pnl": self.budget.futures_pnl,
+            "spot_pnl": self.budget.spot_pnl,
             "held_value": self._held_spot_value(),
             "position": pos,
         }
@@ -514,6 +515,7 @@ async def _final_report(w, slot_id: int, reason: str, *, position_left: bool) ->
             ceiling=0.0,
             pnl=w.budget.pnl,
             futures_pnl=w.budget.futures_pnl,
+            spot_pnl=w.budget.spot_pnl,
             held_value=w._held_spot_value(),
             position_left=position_left)
     except Exception:
