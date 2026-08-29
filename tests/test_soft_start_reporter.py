@@ -466,6 +466,7 @@ def test_runner_reads_held_value_from_the_budget_not_the_day_plan():
     випадок такої діри за сесію, тож перевіряємо саме виклик."""
     from src.execution.soft_start_runner import SlotWarmer
     w = SlotWarmer.__new__(SlotWarmer)
+    w._held_market = None          # виміру ще немає -> береться облік
     w.budget = type("B", (), {"held_spot_value": 42.0})()
     # Денний план навмисно суперечить бюджету: якщо раннер читає його —
     # побачимо 0 замість 42.
@@ -739,3 +740,109 @@ def test_status_line_shows_both_pnls():
                    spot_pnl=-0.21, held_value=4.36, position=None)
     assert "фʼючерси -0.375" in out and "спот -0.210" in out
     assert "разом +1.119" in out
+
+
+# ---- «у монетах» має бути ВИМІРЯНИМ (2026-08-29) ---------------------------
+
+def test_migration_marker_survives_the_first_save(tmp_path):
+    """МАРКЕР МІГРАЦІЇ БУВ НЕДОВГОВІЧНИЙ.
+
+    Міграція вмикалась через `"spot_positions" not in raw`, але це поле
+    зʼявляється у файлі при ПЕРШОМУ Ж збереженні — ще до того, як там буде
+    хоч одна позиція. Наступне завантаження вважало файл мігрованим і губило
+    legacy-вартість: на primary так зникли 79.53 USDT.
+    """
+    import json
+    from src.execution.soft_start_budget import SoftStartBudget
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({
+        "max_usdt": 5.0, "spent_usdt": 0.6, "pnl_usdt": -79.53,
+        "spot_flow_usdt": -79.53, "spot_positions": {},
+        "legacy_spot_cost": 0.0, "entries": [],
+    }))
+    first = SoftStartBudget(str(p), 5.0)
+    assert abs(first.state.legacy_spot_cost - 79.53) < 1e-6, (
+        "порожній spot_positions знову вимкнув міграцію")
+    second = SoftStartBudget(str(p), 5.0)
+    assert abs(second.state.legacy_spot_cost - 79.53) < 1e-6, "подвоїлось"
+
+
+@pytest.mark.asyncio
+async def test_measured_holdings_beat_the_accounting():
+    """ОБЛІК НЕ МОЖЕ ЗНАТИ ДІЙСНОСТІ, і на primary розрив був майже вдвічі:
+    звіт казав «у монетах 79.53», а на біржі лежало 43.96.
+
+    Три причини одразу: монети куплені до появи обліку, оператор докладає
+    кошти, ціни рухаються. Тому число має бути ВИМІРЯНИМ.
+    """
+    from src.execution.soft_start_runner import SlotWarmer
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.budget = type("B", (), {"held_spot_value": 79.53})()
+    w._held_market = None
+    assert SlotWarmer._held_spot_value(w) == 79.53, "без виміру — облік"
+    w._held_market = 43.96
+    assert SlotWarmer._held_spot_value(w) == 43.96, "вимір не має пріоритету"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_measurement_keeps_the_previous_value():
+    """Збій читання не має обнуляти показник — «нічого немає» це не те саме,
+    що «не прочитали»."""
+    from src.execution.soft_start_runner import SlotWarmer
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w._held_market = 43.96
+    w._held_market_at = 0.0
+    w.campaign = type("C", (), {"state": type("S", (), {"tokens": []})()})()
+
+    class _Spot:
+        plan = type("P", (), {"tokens": []})()
+        async def market_value_of_coins(self, pool):
+            raise RuntimeError("біржа мовчить")
+
+    w.spot = _Spot()
+    await SlotWarmer._refresh_held_market(w)
+    assert w._held_market == 43.96
+
+
+@pytest.mark.asyncio
+async def test_measurement_is_throttled():
+    """17 запитів раз на пів години — дрібниця; щохвилини — шум."""
+    import time
+    from src.execution.soft_start_runner import SlotWarmer
+    calls = []
+
+    class _Spot:
+        plan = type("P", (), {"tokens": []})()
+        async def market_value_of_coins(self, pool):
+            calls.append(1)
+            return 10.0
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 1
+    w._held_market = None
+    w._held_market_at = time.time()      # щойно міряли
+    w.campaign = type("C", (), {"state": type("S", (), {"tokens": []})()})()
+    w.spot = _Spot()
+    await SlotWarmer._refresh_held_market(w)
+    assert not calls, "міряємо частіше, ніж треба"
+
+    w._held_market_at = 0.0
+    await SlotWarmer._refresh_held_market(w)
+    assert calls and w._held_market == 10.0
+
+
+@pytest.mark.asyncio
+async def test_unreadable_balances_return_none_not_zero(tmp_path):
+    """None, а не нуль: «не прочитали» це не «нічого немає»."""
+    from src.execution.spot_soft_start import SpotSoftStart, SoftStartConfig
+    import random
+    e = SpotSoftStart.__new__(SpotSoftStart)
+    e.cfg = SoftStartConfig(state_path=str(tmp_path / "s.json"))
+    e.rng = random.Random(1)
+
+    class _Cl:
+        async def currency(self, t):
+            raise RuntimeError("нема")
+    e.client = _Cl()
+    assert await SpotSoftStart.market_value_of_coins(e, ["MX"]) is None

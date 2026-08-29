@@ -95,6 +95,9 @@ class SlotWarmer:
         # Розпродаж наприкінці кампанії робиться один раз; прапорець не дає
         # крутити його вічно, якщо продавати вже нічого.
         self._wound_down = False
+        # Виміряна вартість монет на біржі + коли міряли. None = ще не міряли.
+        self._held_market: float | None = None
+        self._held_market_at: float = 0.0
         self._stop_attempts = 0
         self._final_sent = False
         self.fee_gate = FeeGate(client)
@@ -315,6 +318,29 @@ class SlotWarmer:
             "position": pos,
         }
 
+    async def _refresh_held_market(self) -> None:
+        """Оновити ВИМІРЯНУ вартість монет. Раз на ~30 хв, не щотіку.
+
+        17 запитів на оновлення — дрібниця раз на пів години і зайвий шум
+        щохвилини. Збій лишає попереднє значення, а не обнуляє його.
+        """
+        import time as _t
+        if _t.time() - self._held_market_at < 1800:
+            return
+        try:
+            pool = list(dict.fromkeys(
+                list(self.spot.plan.tokens)
+                + list(self.campaign.state.tokens or [])
+                + list(SPOT_CANDIDATES)))
+            v = await self.spot.market_value_of_coins(pool)
+        except Exception:
+            logger.debug("soft-start slot %d: ринкова вартість монет не "
+                         "оновлена", self.slot_id, exc_info=True)
+            return
+        if v is not None:
+            self._held_market = v
+            self._held_market_at = _t.time()
+
     def _held_spot_value(self) -> float:
         """Скільки лежить у монетах — з БЮДЖЕТУ, а не з денного плану.
 
@@ -324,6 +350,12 @@ class SlotWarmer:
         показувало +46.57 замість 0.26 — тобто звіт стверджував, що прогрів
         зʼїв 46 USDT, яких ніхто не витрачав.
         """
+        # ВИМІРЯНЕ ЗНАЧЕННЯ МАЄ ПРІОРИТЕТ. Облік не може знати дійсності:
+        # монети куплені до його появи, оператор докладає кошти, ціни
+        # рухаються. На primary облік казав 79.53, а на біржі було 43.96.
+        # Облік лишається запасним шляхом, поки біржу не прочитали.
+        if self._held_market is not None:
+            return float(self._held_market)
         try:
             return self.budget.held_spot_value
         except Exception:
@@ -418,6 +450,8 @@ class SlotWarmer:
             return                                  # ceiling reached; stay quiet
 
         self._apply_day_weight()
+        if self._spot_viable:
+            await self._refresh_held_market()
         before = self._snapshot()
         if self._spot_viable:
             await self.spot.tick()

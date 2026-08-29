@@ -737,6 +737,8 @@ async def test_runner_bumps_campaign_counters_on_every_action():
 
     w = SlotWarmer.__new__(SlotWarmer)
     w.slot_id = 1
+    w._held_market = None
+    w._held_market_at = 0.0
     w.reporter = _Rep()
     w.campaign = _Camp()
     w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0, "spot_pnl": 0.0,
@@ -776,6 +778,8 @@ async def test_counter_failure_does_not_stop_the_telegram_report():
 
     w = SlotWarmer.__new__(SlotWarmer)
     w.slot_id = 1
+    w._held_market = None
+    w._held_market_at = 0.0
     w.reporter = _Rep()
     w.campaign = _Camp()
     w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0, "spot_pnl": 0.0,

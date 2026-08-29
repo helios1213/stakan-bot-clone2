@@ -304,6 +304,34 @@ class SpotSoftStart:
         logger.warning("[buy] %s rejected: %s", symbol, res.error)
         return False
 
+    async def market_value_of_coins(self, tokens: list) -> float | None:
+        """Скільки USDT ЗАРАЗ коштують монети на балансі. None = не прочитали.
+
+        ЧОМУ ЦЕ ПОТРІБНО ОКРЕМО ВІД ОБЛІКУ. «У монетах» виводилось із
+        кеш-фло кампанії, і воно НЕ ДОРІВНЮЄ дійсності за трьома причинами
+        одразу: монети куплені до появи обліку, оператор докладає й знімає
+        кошти, і ціни рухаються. На primary звіт показував 79.53, а на біржі
+        лежало 43.96 — розрив майже вдвічі.
+
+        None, а не нуль: не прочитали — це не «нічого немає».
+        """
+        total = 0.0
+        seen = 0
+        for token in list(dict.fromkeys(tokens or [])):
+            try:
+                cur = await self.client.currency(token)
+                bals = await self.client.balances([cur.currency_id])
+                held = float(bals.get(token, {}).get("available", 0) or 0)
+            except Exception:
+                continue
+            seen += 1
+            if held <= 0:
+                continue
+            px = public_last_price(f"{token}{self.cfg.quote}")
+            if px:
+                total += held * px
+        return total if seen else None
+
     async def wind_down(self, keep_frac: float = 0.20,
                         tokens: list | None = None) -> int:
         """Розпродати монети наприкінці кампанії, лишивши ~`keep_frac` вартості.

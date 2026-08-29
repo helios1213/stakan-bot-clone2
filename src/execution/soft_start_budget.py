@@ -94,6 +94,12 @@ class BudgetState:
     # відра дає нульовий PnL — не тому що його не було, а тому що ми чесно
     # не знаємо ціни купівлі. Краще нуль, ніж вигаданий прибуток.
     legacy_spot_cost: float = 0.0
+    # Версія схеми обліку. МАРКЕР МІГРАЦІЇ МУСИТЬ БУТИ ЯВНИЙ.
+    # Спершу міграція вмикалась через `"spot_positions" not in raw` — але це
+    # поле зʼявляється у файлі при ПЕРШОМУ Ж збереженні, ще до того, як там
+    # буде хоч одна позиція. Тобто наступне завантаження вважало файл
+    # мігрованим і губило legacy-вартість: на primary так зникли 79.53 USDT.
+    accounting_version: int = 0
 
     def remaining(self) -> float:
         return max(0.0, self.max_usdt - self.spent_usdt)
@@ -170,7 +176,8 @@ class SoftStartBudget:
                 # давало 6.3 замість 6.0 — рівно на розмір фʼючерсного PnL.
                 # Їхньої ціни купівлі ми не знаємо, тож PnL по них не
                 # вигадуємо, але й «у монетах» не втрачаємо.
-                if "spot_positions" not in raw:
+                if int(raw.get("accounting_version", 0) or 0) < 2:
+                    st.accounting_version = 2
                     st.legacy_spot_cost = max(0.0, -float(
                         st.spot_flow_usdt or 0.0))
                     if st.legacy_spot_cost:

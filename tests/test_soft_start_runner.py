@@ -518,6 +518,8 @@ async def test_runner_reports_the_real_order_size_not_the_config_ceiling():
     # фейком, і `from ... import SlotWarmer` віддав би саме його.
     w = RealSlotWarmer.__new__(RealSlotWarmer)
     w.slot_id = 1
+    w._held_market = None
+    w._held_market_at = 0.0
     seen = []
 
     class _Rep:
@@ -563,6 +565,8 @@ async def test_runner_reports_the_real_order_size_not_the_config_ceiling():
 async def test_runner_reports_futures_open_with_its_size():
     w = RealSlotWarmer.__new__(RealSlotWarmer)
     w.slot_id = 1
+    w._held_market = None
+    w._held_market_at = 0.0
     seen = {}
 
     class _Rep:
