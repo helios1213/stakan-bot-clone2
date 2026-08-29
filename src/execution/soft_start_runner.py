@@ -62,9 +62,9 @@ SPOT_CANDIDATES = ("MX", "DOGE", "XRP", "SOL", "TRX", "ADA", "LTC", "SHIB",
                    "PEPE", "LINK", "SUI", "ONDO", "ENA", "WLD", "PENGU",
                    "XLM", "AVAX")
 
-# USDT on MEXC spot. Known constant — the balances endpoint is addressed by
-# currencyId, not by ticker.
-USDT_CURRENCY_ID = "128f589271cb4951b03e71e6323eb7be"
+# Джерело — spot_soft_start: там її використовує розпродаж, і дві копії
+# однієї константи рано чи пізно розійшлись би.
+from .spot_soft_start import USDT_CURRENCY_ID  # noqa: E402  (re-export)
 
 
 class SlotWarmer:

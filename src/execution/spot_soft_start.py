@@ -96,6 +96,13 @@ class SoftStartConfig:
             raise ValueError("active hours invalid")
 
 
+# USDT на споті MEXC. Ендпоінт балансів адресується currencyId, не тікером.
+# Живе ТУТ, а не в раннері: розпродаж рахує ціль від усього спотового балансу
+# разом із вільним USDT, а імпорт із раннера був би циклічним (він імпортує
+# цей модуль). Раннер бере константу звідси.
+USDT_CURRENCY_ID = "128f589271cb4951b03e71e6323eb7be"
+
+
 def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -309,6 +316,57 @@ class SpotSoftStart:
         """
         cfg = self.cfg
         sent = 0
+
+        # 20% ВІД СПОТОВОГО БАЛАНСУ РАЗОМ, а не від кожного токена окремо.
+        #
+        # Перша версія рахувала `keep_frac` для КОЖНОЇ монети: на слоті 1 це
+        # лишало 3.46 USDT, тобто 14% балансу, а не 20 — бо USDT у знаменник
+        # не входив узагалі. Формулювання оператора було «20% від спотового
+        # балансу», і це інше число: 5.09.
+        #
+        # Спершу рахуємо ЗАГАЛЬНУ ціль, потім ріжемо всі монети однією
+        # часткою. Пропорційно, а не по черзі: розпродавати монети одну за
+        # одною до нуля виглядало б як зачистка, а рівномірне зменшення — як
+        # звичайне скорочення позицій.
+        holdings: list = []          # (token, symbol, held, px, value)
+        pool0 = tokens if tokens is not None else list(self.plan.tokens)
+        for token in list(dict.fromkeys(pool0)):
+            symbol = f"{token}{cfg.quote}"
+            try:
+                cur = await self.client.currency(token)
+                bals = await self.client.balances([cur.currency_id])
+                held = float(bals.get(token, {}).get("available", 0) or 0)
+            except Exception as e:
+                logger.warning("[wind-down] %s: баланс не прочитано (%s)",
+                               symbol, e)
+                continue
+            px = public_last_price(symbol)
+            if not px or held <= 0:
+                continue
+            holdings.append((token, symbol, held, px, held * px))
+
+        coins_value = sum(h[4] for h in holdings)
+        usdt_free = 0.0
+        try:
+            b = await self.client.balances([USDT_CURRENCY_ID])
+            usdt_free = float(b.get("USDT", {}).get("available", 0) or 0)
+        except Exception as e:
+            # Без USDT знаменник менший -> ціль нижча -> продамо БІЛЬШЕ, ніж
+            # треба. Кажемо про це, а не мовчки міняємо правило.
+            logger.warning("[wind-down] вільний USDT не прочитано (%s) — "
+                           "ціль рахується лише від монет", e)
+        spot_total = coins_value + usdt_free
+        target_coins = spot_total * max(0.0, min(1.0, keep_frac))
+        if coins_value <= target_coins:
+            logger.info("[wind-down] у монетах %.2f із %.2f спотового балансу "
+                        "— це вже <= %.0f%%, продавати нічого",
+                        coins_value, spot_total, keep_frac * 100)
+            return 0
+        sell_frac = (coins_value - target_coins) / coins_value
+        logger.info("[wind-down] монети %.2f + USDT %.2f = %.2f; лишаємо %.2f "
+                    "(%.0f%%), продаємо %.2f (%.0f%% кожної монети)",
+                    coins_value, usdt_free, spot_total, target_coins,
+                    keep_frac * 100, coins_value - target_coins, sell_frac * 100)
         # НЕ `plan.tokens`, А ВСЕ, ЩО МОЖЕ ЛЕЖАТИ НА БАЛАНСІ.
         #
         # Денний план містить лише сьогоднішні токени, а монети накопичуються
@@ -319,30 +377,11 @@ class SpotSoftStart:
         #
         # Порожній баланс токена коштує один запит і нічого не ламає, тож
         # дешевше перевірити зайве, ніж лишити гроші замкненими.
-        pool = tokens if tokens is not None else list(self.plan.tokens)
-        for token in list(dict.fromkeys(pool)):
-            symbol = f"{token}{cfg.quote}"
-            try:
-                cur = await self.client.currency(token)
-                # ПО ОДНОМУ coinId. Виміряно 2026-08-29: запит із кількома
-                # id одразу віддає ПОРОЖНІЙ словник, без помилки — тобто
-                # «нічого не тримаємо» замість реального балансу. Тиха
-                # неправда, на якій я сам спіймався, роблячи цю перевірку.
-                bals = await self.client.balances([cur.currency_id])
-                held = float(bals.get(token, {}).get("available", 0) or 0)
-            except Exception as e:
-                logger.warning("[wind-down] %s: баланс не прочитано (%s)",
-                               symbol, e)
-                continue
-            px = public_last_price(symbol)
-            if not px or held <= 0:
-                continue
-            value = held * px
-            target_value = value * max(0.0, min(1.0, keep_frac))
-            sell_value = value - target_value
+        for token, symbol, held, px, value in holdings:
+            sell_value = value * sell_frac
             if sell_value < cfg.order_usdt_min:
-                logger.info("[wind-down] %s: лишок ~%.2f USDT — продавати нічого",
-                            symbol, value)
+                logger.info("[wind-down] %s: частка ~%.2f USDT нижча за "
+                            "мінімальний ноціонал — пропускаю", symbol, sell_value)
                 continue
             qty = min(held, sell_value / px)
             cost = _order_cost(qty * px, cfg.marketable_buffer, cfg.spot_fee_frac)
@@ -357,7 +396,7 @@ class SpotSoftStart:
                                 "usdt": proceeds, "qty": res.quantity,
                                 "price": res.price}
             logger.info("[wind-down] %s продано ~%.2f USDT, лишається ~%.2f",
-                        symbol, proceeds, target_value)
+                        symbol, proceeds, value - proceeds)
             if self.budget is not None and not res.dry_run:
                 self.budget.record_pnl(proceeds, f"spot sell {symbol}")
                 self.budget.charge(cost, f"spot wind-down {symbol}")

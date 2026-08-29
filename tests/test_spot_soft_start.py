@@ -377,3 +377,104 @@ async def test_wind_down_asks_for_one_coin_at_a_time(tmp_path, monkeypatch):
     await e.wind_down(0.20, tokens=["MX", "LINK", "TRX"])
     assert sizes and all(n == 1 for n in sizes), (
         f"баланси питаються пачкою — вона віддає порожньо: {sizes}")
+
+
+@pytest.mark.asyncio
+async def test_wind_down_keeps_a_share_of_the_WHOLE_spot_balance(
+        tmp_path, monkeypatch):
+    """ФОРМУЛЮВАННЯ ОПЕРАТОРА: «20% від спотового балансу».
+
+    Перша версія рахувала 20% для КОЖНОЇ монети окремо, і USDT у знаменник не
+    входив узагалі. На живих числах слота 1 (монети 17.31 + USDT 8.12) це
+    лишало 3.46 — тобто 14% балансу, а не 20. Правильна ціль: 5.09.
+    """
+    from src.execution.spot_soft_start import (DayPlan, SpotSoftStart,
+                                               USDT_CURRENCY_ID)
+    prices = {"MXUSDT": 1.0, "TRXUSDT": 1.0}
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: prices.get(s))
+    held = {"MX": 16.0, "TRX": 4.0}          # монет на 20.0
+    sold = {}
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            if ids[0] == USDT_CURRENCY_ID:
+                return {"USDT": {"available": 5.0}}   # спот разом = 25.0
+            t = ids[0].replace("id-", "")
+            return {t: {"available": held.get(t, 0.0)}}
+        async def sell(self, ticker, *, quantity, price):
+            sold[ticker] = quantity
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=0.5),
+                      rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+
+    await e.wind_down(0.20, tokens=["MX", "TRX"])
+    left = sum(held[t] - sold.get(t, 0.0) for t in held)
+    # ціль: 20% від 25.0 = 5.0 у монетах
+    assert abs(left - 5.0) < 1e-6, f"лишилось {left}, а мало 5.0"
+    # і ріжеться ПРОПОРЦІЙНО, а не одна монета в нуль
+    assert sold["MX"] > 0 and sold["TRX"] > 0, sold
+    assert abs(sold["MX"] / 16.0 - sold["TRX"] / 4.0) < 1e-6, "непропорційно"
+
+
+@pytest.mark.asyncio
+async def test_wind_down_does_nothing_when_already_below_target(
+        tmp_path, monkeypatch):
+    """Монет уже менше за ціль — продавати нічого, а не «продати ще трохи»."""
+    from src.execution.spot_soft_start import (DayPlan, SpotSoftStart,
+                                               USDT_CURRENCY_ID)
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            if ids[0] == USDT_CURRENCY_ID:
+                return {"USDT": {"available": 90.0}}
+            return {"MX": {"available": 2.0}}      # 2 з 92 = 2.2%
+        async def sell(self, *a, **k):
+            raise AssertionError("продавати не мало")
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=0.5),
+                      rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+    assert await e.wind_down(0.20, tokens=["MX"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_unreadable_usdt_is_flagged_not_silently_ignored(
+        tmp_path, monkeypatch, caplog):
+    """Без вільного USDT знаменник менший -> ціль нижча -> продамо БІЛЬШЕ, ніж
+    треба. Це має бути видно, а не мовчки змінене правило."""
+    import logging
+    from src.execution.spot_soft_start import (DayPlan, SpotSoftStart,
+                                               USDT_CURRENCY_ID)
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            if ids[0] == USDT_CURRENCY_ID:
+                raise RuntimeError("нема звʼязку")
+            return {"MX": {"available": 10.0}}
+        async def sell(self, ticker, *, quantity, price):
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=0.5),
+                      rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+    with caplog.at_level(logging.WARNING):
+        await e.wind_down(0.20, tokens=["MX"])
+    assert any("вільний USDT не прочитано" in r.getMessage()
+               for r in caplog.records)
