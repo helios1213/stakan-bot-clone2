@@ -114,10 +114,40 @@ class SoftStartBudget:
                 # фіксу. Відновлення ТОЧНЕ і не залежить від обрізаного списку
                 # записів: pnl = фʼючерси + спот, отже спот = pnl - фʼючерси.
                 if "spot_flow_usdt" not in raw and st.pnl_usdt:
-                    st.spot_flow_usdt = st.pnl_usdt - st.futures_pnl_usdt
-                    logger.info("soft-start budget: спотовий потік відновлено "
-                                "зі старого файла — %.4f USDT",
-                                st.spot_flow_usdt)
+                    # СПЕРШУ ПРОБУЄМО ЗАПИСИ. Формула `спот = pnl - фʼючерси`
+                    # правильна ЛИШЕ якщо `futures_pnl_usdt` уже накопичений.
+                    # Коли поле додали посеред кампанії, воно було нулем, і
+                    # ВЕСЬ історичний фʼючерсний PnL приписався споту: у звіті
+                    # слота 1 «фʼючерси -0.3748» виявились останніми 4 з 8
+                    # позицій, а правда була -0.0981.
+                    fut = spot = None
+                    ents = st.entries or []
+                    if ents:
+                        fut = sum(float(e.get("usdt") or 0.0) for e in ents
+                                  if str(e.get("reason", "")).startswith("PnL futures"))
+                        spot = sum(float(e.get("usdt") or 0.0) for e in ents
+                                   if str(e.get("reason", "")).startswith("PnL spot"))
+                    # ДОПУСК МАСШТАБУЄТЬСЯ З КІЛЬКІСТЮ ЗАПИСІВ. Кожен запис
+                    # зберігається як `round(x, 6)`, тобто до 5e-7 похибки; на
+                    # 117 записах вона накопичилась до 1.03e-6 і прибитий поріг
+                    # 1e-6 відкидав ТОЧНІ дані як неповні. Тест на чотирьох
+                    # чистих записах цього не показав би ніколи.
+                    _tol = 1e-6 * max(1, len(ents))
+                    if fut is not None and abs(fut + spot - st.pnl_usdt) <= _tol:
+                        # Записи покривають усе — беремо їх, вони точні.
+                        st.futures_pnl_usdt = fut
+                        st.spot_flow_usdt = spot
+                        logger.info("soft-start budget: розділено із записів — "
+                                    "фʼючерси %.4f, спот %.4f", fut, spot)
+                    else:
+                        # Список обрізаний (стеля 200) або записів немає:
+                        # падаємо на формулу і кажемо про це.
+                        st.spot_flow_usdt = st.pnl_usdt - st.futures_pnl_usdt
+                        logger.warning(
+                            "soft-start budget: записів не вистачає для точного "
+                            "розділення — спотовий потік %.4f виведено з формули, "
+                            "фʼючерсний PnL може бути занижений",
+                            st.spot_flow_usdt)
                 return st
             except Exception as e:
                 logger.warning("soft-start budget unreadable (%s) — starting fresh", e)

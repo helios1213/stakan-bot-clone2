@@ -586,3 +586,76 @@ def test_bump_never_raises(tmp_path, monkeypatch):
     c = SoftStartCampaign(str(tmp_path / "c.json"), 3, rng=random.Random(1))
     monkeypatch.setattr(c, "_save", lambda: (_ for _ in ()).throw(OSError("ro")))
     c.bump("spot_buys")          # не має кинути
+
+
+def test_seeding_splits_from_entries_not_just_the_formula(tmp_path):
+    """ПОМИЛКА В МОЄМУ Ж ЗАСІВІ, знайдена при звірці з біржею 29.08.
+
+    Формула `спот = pnl - фʼючерси` правильна ЛИШЕ коли `futures_pnl_usdt`
+    уже накопичений. Поле додали посеред кампанії, воно було нулем — і ВЕСЬ
+    історичний фʼючерсний PnL приписався споту. У звіті слота 1 «фʼючерси
+    -0.3748» виявились сумою ОСТАННІХ 4 з 8 позицій; правда (рух ринку за
+    всі 8) була -0.0981.
+    """
+    import json
+    from src.execution.soft_start_budget import SoftStartBudget
+    ents = [
+        {"ts": 1, "usdt": -10.0, "reason": "PnL spot buy X"},
+        {"ts": 2, "usdt": 4.0, "reason": "PnL spot sell X"},
+        {"ts": 3, "usdt": -0.5, "reason": "PnL futures A"},
+        {"ts": 4, "usdt": 0.2, "reason": "PnL futures B"},
+    ]
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"max_usdt": 5.0, "spent_usdt": 0.3,
+                             "pnl_usdt": -6.3, "entries": ents}))
+    b = SoftStartBudget(str(p), 5.0)
+    assert abs(b.futures_pnl - (-0.3)) < 1e-9, "фʼючерсний PnL знову з'їв спот"
+    assert abs(b.held_spot_value - 6.0) < 1e-9
+
+
+def test_seeding_falls_back_when_entries_are_incomplete(tmp_path, caplog):
+    """Список записів обрізається на 200. Якщо він не покриває весь pnl —
+    беремо формулу, але КАЖЕМО про це: інакше занижений фʼючерсний PnL
+    виглядав би як точний."""
+    import json, logging
+    from src.execution.soft_start_budget import SoftStartBudget
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"max_usdt": 5.0, "spent_usdt": 0.3,
+                             "pnl_usdt": -20.0,
+                             "entries": [{"ts": 1, "usdt": -1.0,
+                                          "reason": "PnL spot buy X"}]}))
+    with caplog.at_level(logging.WARNING):
+        b = SoftStartBudget(str(p), 5.0)
+    assert abs(b.held_spot_value - 20.0) < 1e-9
+    assert any("не вистачає для точного" in r.getMessage()
+               for r in caplog.records), "тихе наближення замість попередження"
+
+
+def test_seeding_tolerates_accumulated_rounding(tmp_path, caplog):
+    """ПОРІГ, ЯКИЙ БУВ НАДТО ТІСНИЙ — і фікс мовчки не працював би.
+
+    Кожен запис зберігається як `round(x, 6)`, тобто до 5e-7 похибки. На
+    живому файлі слота 2 зі 117 записів вона накопичилась до 1.03e-6, і
+    прибитий поріг 1e-6 ВІДКИДАВ точні дані як неповні — падаючи у запасну
+    формулу, яка й дає занижений фʼючерсний PnL. Тест на чотирьох чистих
+    записах цього не показав би ніколи.
+    """
+    import json, logging
+    from src.execution.soft_start_budget import SoftStartBudget
+    ents, tot = [], 0.0
+    for i in range(120):
+        v = round(-0.0100001 if i % 2 else 0.0300007, 6)
+        kind = "PnL futures A" if i % 3 == 0 else "PnL spot buy X"
+        ents.append({"ts": i, "usdt": v, "reason": kind})
+        tot += v
+    # pnl зберігся БЕЗ округлення — саме звідси розбіжність
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"max_usdt": 5.0, "spent_usdt": 0.0,
+                             "pnl_usdt": tot + 9e-7, "entries": ents}))
+    with caplog.at_level(logging.WARNING):
+        b = SoftStartBudget(str(p), 5.0)
+    assert not any("не вистачає для точного" in r.getMessage()
+                   for r in caplog.records), (
+        "точні записи відкинуто через накопичене округлення")
+    fut = sum(e["usdt"] for e in ents if e["reason"].startswith("PnL futures"))
+    assert abs(b.futures_pnl - fut) < 1e-6
