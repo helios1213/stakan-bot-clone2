@@ -284,8 +284,8 @@ def test_net_cost_is_fees_minus_both_pnls():
     r = SoftStartReporter(None, 1, dry_run=True)
     out = r.render(day=1, days=3, spent=0.117, pnl=-5.81, futures_pnl=0.648,
                    spot_pnl=-0.02, held_value=5.44, position=None)
-    # 0.117 - 0.648 - (-0.02) = -0.511
-    assert "разом -0.511 USDT" in out, out
+    # 0.117 - 0.648 - (-0.02) = -0.511 -> тобто вийшли В ПЛЮС на 0.511
+    assert "у плюс 0.511 USDT" in out, out
     assert "у монетах ~5.44" in out
 
 
@@ -330,9 +330,9 @@ def test_final_report_shows_money_even_without_a_ceiling():
     """
     out = _final(spent=0.9134, pnl=-4.21, futures_pnl=-0.61, held_value=3.60,
                  ceiling=0.0)
-    assert "0.9134" in out and "-0.6100" in out
-    assert "3.6000" in out
-    assert "РАЗОМ" in out and "+1.5234" in out
+    assert "-0.9134" in out and "-0.6100" in out
+    assert "3.60" in out
+    assert "Прогрів обійшовся: 1.52" in out
 
 
 def test_final_verdict_is_not_a_coin_flip_near_zero():
@@ -340,9 +340,11 @@ def test_final_verdict_is_not_a_coin_flip_near_zero():
     «в мінус» там однаково неправдиві."""
     # Параметри змінені 29.08: підсумок рахується з ОБОХ PnL напряму, а не з
     # кеш-фло, яке скорочувалось саме із собою.
+    # Формулювання змінено 30.08: підсумок називається тим, чим є, а знак не
+    # треба розшифровувати. «РАЗОМ +4.8056» читалось як заробіток.
     assert "приблизно в нуль" in _final(spent=0.10, futures_pnl=0.09)
-    assert "коштував грошей" in _final(spent=1.00, futures_pnl=0.00)
-    assert "у плюс" in _final(spent=0.10, futures_pnl=1.00)
+    assert "Прогрів обійшовся: 1.00" in _final(spent=1.00, futures_pnl=0.00)
+    assert "Прогрів вийшов у плюс: 0.90" in _final(spent=0.10, futures_pnl=1.00)
 
 
 def test_final_report_says_the_held_value_is_at_cost():
@@ -350,8 +352,8 @@ def test_final_report_says_the_held_value_is_at_cost():
     прочитають як поточну вартість монет, і підсумок здаватиметься точнішим,
     ніж він є."""
     out = _final(spent=0.5, pnl=-3.0, held_value=2.5)
-    assert "за купівлею" in out
-    assert "ринковий рух у підсумок не входить" in out
+    assert "за ціною купівлі" in out
+    assert "це не витрата" in out
 
 
 def test_final_report_still_flags_a_stuck_position():
@@ -381,7 +383,7 @@ def test_report_does_not_call_spot_cash_flow_a_loss():
                    futures_pnl=0.6477, held_value=5.0056, position=None)
     assert "фʼючерси +0.648" in out
     assert "-4.358" not in out, "спотове кеш-фло знову показане як PnL"
-    assert "разом -0.342" in out
+    assert "у плюс 0.342" in out
     assert "у монетах ~5.01" in out
 
 
@@ -391,7 +393,7 @@ def test_final_report_splits_futures_pnl_from_the_spot_flow():
     out = r.render_final("done", spent=0.3059, pnl=-4.3579,
                          futures_pnl=0.6477, held_value=5.0056)
     assert "+0.6477" in out and "-4.3579" not in out
-    assert "-0.3418" in out
+    assert "Прогрів вийшов у плюс: 0.34" in out
 
 
 def test_budget_splits_futures_pnl_from_spot():
@@ -739,7 +741,7 @@ def test_status_line_shows_both_pnls():
     out = r.render(day=3, days=3, spent=0.534, pnl=-4.36, futures_pnl=-0.375,
                    spot_pnl=-0.21, held_value=4.36, position=None)
     assert "фʼючерси -0.375" in out and "спот -0.210" in out
-    assert "разом +1.119" in out
+    assert "коштувало 1.119" in out
 
 
 # ---- «у монетах» має бути ВИМІРЯНИМ (2026-08-29) ---------------------------
@@ -846,3 +848,67 @@ async def test_unreadable_balances_return_none_not_zero(tmp_path):
             raise RuntimeError("нема")
     e.client = _Cl()
     assert await SpotSoftStart.market_value_of_coins(e, ["MX"]) is None
+
+
+# ---- підсумок не має читатись навпаки (2026-08-30) -------------------------
+
+def test_cost_is_never_shown_with_a_misleading_plus():
+    """ЩО ЦЕ ЛІКУЄ. Звіт слота 2 писав «РАЗОМ +4.8056», і плюс читався як
+    заробіток — хоча це ВИТРАТА (комісії 0.81 + фʼючерсний мінус 4.00).
+    Оператор так і спитав: «як вийшло +4.8, якщо на фʼючах мінус».
+
+    Тепер підсумок називається тим, чим є, і знак не треба розшифровувати.
+    """
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 2, dry_run=False)
+    out = r.render_final("campaign finished", spent=0.8102,
+                         futures_pnl=-3.9954, spot_pnl=0.0, held_value=6.0210)
+    assert "Прогрів обійшовся: 4.81 USDT" in out
+    assert "РАЗОМ" not in out
+    assert "+4.80" not in out, "витрата знову показана з плюсом"
+
+
+def test_all_components_share_one_sign_convention():
+    """Комісії йшли з «+», а PnL з «−» — дві конвенції в сусідніх рядках.
+    Тепер усюди мінус = гроші пішли з гаманця."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 2, dry_run=False)
+    out = r.render_final("x", spent=0.8102, futures_pnl=-3.9954, spot_pnl=0.0)
+    assert "-0.8102" in out, "комісії показані як надходження"
+    assert "+0.8102" not in out
+
+
+def test_held_coins_are_stated_as_not_a_cost():
+    """Монети на балансі — це гроші, що змінили форму, а не витрата. Їх треба
+    показувати окремо і підписувати, інакше читач додає їх до вартості."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 2, dry_run=False)
+    out = r.render_final("x", spent=0.81, futures_pnl=-4.0, spot_pnl=0.0,
+                         held_value=6.02)
+    assert "На споті лишилось монет: 6.02 USDT" in out
+    assert "це не витрата" in out
+
+
+def test_a_zero_spot_pnl_says_whether_it_was_measured():
+    """«спот +0.0000» при непроданих монетах означає НЕ «без результату», а
+    «не виміряно»: монети з докоштовної епохи не мають відомої собівартості.
+    Без підпису це читається як «спот нічого не коштував»."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 2, dry_run=False)
+    out = r.render_final("x", spent=0.81, futures_pnl=-4.0, spot_pnl=0.0,
+                         held_value=6.02)
+    assert "не виміряно" in out
+
+    # А коли спотовий PnL є — застереження зайве.
+    out2 = r.render_final("x", spent=0.81, futures_pnl=-4.0, spot_pnl=-0.3,
+                          held_value=6.02)
+    assert "не виміряно" not in out2
+
+
+def test_live_status_line_also_says_it_in_words():
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 2, dry_run=False)
+    out = r.render(day=3, days=3, spent=0.8102, pnl=-6.0, futures_pnl=-3.9954,
+                   spot_pnl=0.0, held_value=6.021, position=None)
+    assert "коштувало 4.806 USDT" in out
+    assert "разом +" not in out
