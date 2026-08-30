@@ -478,3 +478,105 @@ async def test_unreadable_usdt_is_flagged_not_silently_ignored(
         await e.wind_down(0.20, tokens=["MX"])
     assert any("вільний USDT не прочитано" in r.getMessage()
                for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_wind_down_uses_the_exchange_minimum_not_the_order_size(
+        tmp_path, monkeypatch):
+    """ЖИВИЙ БАГ 30.08: розпродаж порахував правильно і НЕ ПРОДАВ НІЧОГО.
+
+        монети 58.58 + USDT 146.87 = 205.45; лишаємо 41.09, продаємо 17.49
+        XRPUSDT: частка ~5.45 нижча за мінімальний ноціонал — пропускаю
+        MXUSDT / PENGUUSDT / AVAXUSDT — так само
+        -> «розпродаж завершено, лишили ~20%», а на балансі 58.56
+
+    Причина: як «межу пилу» брався `cfg.order_usdt_min`, який МАСШТАБУЄТЬСЯ
+    від балансу (4% від 146.87 = 5.87). Одна змінна виконувала дві різні
+    ролі — мінімальний розмір ордера ПРОГРІВУ і мінімальний ноціонал БІРЖІ.
+    Що більший гаманець, то сильніше вона блокувала розпродаж — тобто саме
+    там, де продати треба найбільше.
+    """
+    from src.execution.spot_soft_start import (DayPlan, SpotSoftStart,
+                                               USDT_CURRENCY_ID)
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    held = {"MX": 20.0, "XRP": 20.0, "PENGU": 18.58}
+    sold = []
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            if ids[0] == USDT_CURRENCY_ID:
+                return {"USDT": {"available": 146.87}}
+            t = ids[0].replace("id-", "")
+            return {t: {"available": held.get(t, 0.0)}}
+        async def sell(self, ticker, *, quantity, price):
+            sold.append((ticker, quantity))
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    # order_usdt_min як на живому гаманці — 5.87, вище за кожну з часток
+    c = cfg(tmp_path, universe=("MX",), order_usdt_min=5.87)
+    e = SpotSoftStart(_Cl(), c, rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+
+    sent = await e.wind_down(0.20, tokens=["MX", "XRP", "PENGU"])
+    assert sent == 3, f"розпродаж знову впав у межу розміру ордера: {sold}"
+    # ціль: 20% від (58.58 монет + 146.87 USDT) = 41.09 -> продати 17.49
+    total_sold = sum(q for _, q in sold)
+    assert abs(total_sold - 17.49) < 0.05, total_sold
+
+
+@pytest.mark.asyncio
+async def test_real_dust_is_still_skipped(tmp_path, monkeypatch):
+    """Біржовий мінімум лишається: ордер на 0.3 USDT це відмова біржі."""
+    from src.execution.spot_soft_start import (DayPlan, SpotSoftStart,
+                                               USDT_CURRENCY_ID)
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            if ids[0] == USDT_CURRENCY_ID:
+                return {"USDT": {"available": 0.0}}
+            return {"MX": {"available": 1.0}}
+        async def sell(self, *a, **k):
+            raise AssertionError("пил не має відправлятись")
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=0.1),
+                      rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+    # монет на 1.0, лишаємо 20% -> продати 0.8, це нижче біржового мінімуму
+    assert await e.wind_down(0.20, tokens=["MX"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_wind_down_that_sold_nothing_says_so(tmp_path, monkeypatch,
+                                                     caplog):
+    """Лог рапортував «лишили ~20%» навіть коли не пішов ЖОДЕН ордер."""
+    import logging
+    from src.execution.spot_soft_start import (DayPlan, SpotSoftStart,
+                                               USDT_CURRENCY_ID)
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            if ids[0] == USDT_CURRENCY_ID:
+                return {"USDT": {"available": 0.0}}
+            return {"MX": {"available": 1.2}}
+        async def sell(self, *a, **k):
+            raise AssertionError("не мало")
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=0.1),
+                      rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+    with caplog.at_level(logging.WARNING):
+        assert await e.wind_down(0.20, tokens=["MX"]) == 0
+    assert any("жодного ордера" in r.getMessage() for r in caplog.records)

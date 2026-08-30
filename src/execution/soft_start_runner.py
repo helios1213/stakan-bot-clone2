@@ -483,9 +483,13 @@ class SlotWarmer:
                                     self.slot_id, sent)
                         return          # ще один тік на решту
                     self._wound_down = True
-                    logger.info("soft-start slot %d: розпродаж завершено, "
-                                "лишили ~%.0f%% у монетах",
-                                self.slot_id, SPOT_WIND_DOWN_KEEP * 100)
+                    # Без обіцянок: скільки саме лишилось — окремим рядком і
+                    # з ВИМІРЯНОГО значення, а не з цілі. Раніше тут стояло
+                    # «лишили ~20%» навіть тоді, коли не продалось нічого.
+                    logger.info("soft-start slot %d: розпродаж завершено "
+                                "(ціль %.0f%%), у монетах зараз ~%.2f USDT",
+                                self.slot_id, SPOT_WIND_DOWN_KEEP * 100,
+                                self._held_spot_value())
                 except Exception:
                     logger.exception("soft-start slot %d: розпродаж упав — "
                                      "вимикаюсь, монети лишаються",

@@ -102,6 +102,18 @@ class SoftStartConfig:
 # цей модуль). Раннер бере константу звідси.
 USDT_CURRENCY_ID = "128f589271cb4951b03e71e6323eb7be"
 
+# МІНІМАЛЬНИЙ НОЦІОНАЛ БІРЖІ — це НЕ те саме, що мінімальний розмір ордера
+# прогріву, і плутати їх коштувало цілого розпродажу.
+#
+# `cfg.order_usdt_min` масштабується від балансу (4%), тобто на гаманці зі
+# 147 USDT він дорівнює 5.87. Розпродаж використовував саме його як «межу
+# пилу» — і 30.08 пропустив УСІ чотири токени (частки 3.48-5.45), написавши
+# при цьому «лишили ~20%». Продано не було нічого, на балансі лишилось 58.56
+# замість цільових 41.09.
+#
+# Тут — саме біржовий мінімум (~1 USDT на споті MEXC) із невеликим запасом.
+MIN_EXCHANGE_NOTIONAL_USDT = 1.1
+
 
 def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -364,6 +376,7 @@ class SpotSoftStart:
         # часткою. Пропорційно, а не по черзі: розпродавати монети одну за
         # одною до нуля виглядало б як зачистка, а рівномірне зменшення — як
         # звичайне скорочення позицій.
+        skipped = 0
         holdings: list = []          # (token, symbol, held, px, value)
         pool0 = tokens if tokens is not None else list(self.plan.tokens)
         for token in list(dict.fromkeys(pool0)):
@@ -415,9 +428,14 @@ class SpotSoftStart:
         # дешевше перевірити зайве, ніж лишити гроші замкненими.
         for token, symbol, held, px, value in holdings:
             sell_value = value * sell_frac
-            if sell_value < cfg.order_usdt_min:
+            # БІРЖОВИЙ мінімум, а не розмір ордера прогріву: другий росте з
+            # балансом і блокував би розпродаж тим сильніше, чим більший
+            # гаманець — тобто саме там, де продати треба найбільше.
+            if sell_value < MIN_EXCHANGE_NOTIONAL_USDT:
                 logger.info("[wind-down] %s: частка ~%.2f USDT нижча за "
-                            "мінімальний ноціонал — пропускаю", symbol, sell_value)
+                            "мінімальний ноціонал біржі %.2f — пропускаю",
+                            symbol, sell_value, MIN_EXCHANGE_NOTIONAL_USDT)
+                skipped += 1
                 continue
             qty = min(held, sell_value / px)
             cost = _order_cost(qty * px, cfg.marketable_buffer, cfg.spot_fee_frac)
@@ -439,6 +457,13 @@ class SpotSoftStart:
                 except Exception:
                     logger.debug("wind-down: облік не оновлено", exc_info=True)
                 self.budget.charge(cost, f"spot wind-down {symbol}")
+        # ПІДСУМОК КАЖЕ ПРАВДУ. Раніше раннер писав «лишили ~20%» незалежно
+        # від того, чи пішов хоч один ордер — 30.08 усі чотири токени
+        # пропустились через хибну межу пилу, а лог рапортував успіх.
+        if sent == 0 and skipped:
+            logger.warning("[wind-down] жодного ордера: усі %d часток нижчі за "
+                           "біржовий мінімум %.2f — монети лишаються як є",
+                           skipped, MIN_EXCHANGE_NOTIONAL_USDT)
         return sent
 
     async def maybe_sell(self) -> bool:
