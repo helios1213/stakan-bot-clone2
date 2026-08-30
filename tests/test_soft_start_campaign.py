@@ -793,3 +793,70 @@ async def test_counter_failure_does_not_stop_the_telegram_report():
 
     await SlotWarmer._report_diff(w, (0, 0, 0, None), (1, 0, 0, None))
     assert sent == ["buy"], "звіт заглушено падінням лічильника"
+
+
+# ---- повторний прогрів і заміна акаунта (2026-08-30) -----------------------
+
+def _camp(tmp_path, name="c.json", days=3, seed=1):
+    import random
+    from src.execution.soft_start_campaign import SoftStartCampaign
+    return SoftStartCampaign(str(tmp_path / name), days, rng=random.Random(seed))
+
+
+def test_a_finished_campaign_can_be_started_again(tmp_path):
+    """ЖИВА ПРОБЛЕМА. Прогрів можна було запустити рівно ОДИН раз на слот,
+    назавжди: `start_if_new` дивився лише на `started_at`, а завершена
+    кампанія його має. Повторне натискання 🌱 мовчки нічого не робило, і
+    `expired()` одразу гасив слот назад.
+    """
+    import time
+    c = _camp(tmp_path)
+    assert c.start_if_new("acc1") is True
+    assert c.start_if_new("acc1") is False, "кампанія що ТРИВАЄ не має рестартувати"
+
+    # доводимо її до кінця
+    c.state.started_at = time.time() - 4 * 86400
+    assert c.expired()
+    assert c.start_if_new("acc1") is True, "завершену кампанію не можна почати знову"
+    assert not c.state.finished and not c.expired()
+
+
+def test_a_new_account_in_the_same_slot_starts_fresh(tmp_path):
+    """Стан прогріву лежить per-SLOT. Оператор замінив вебкеї на клоні — новий
+    акаунт успадкував би чужу кампанію разом із її лічильниками і монетами в
+    legacy-відрі, тобто ми б рахували «у монетах» те, чого на цьому акаунті
+    немає."""
+    c = _camp(tmp_path)
+    c.start_if_new("acc-OLD")
+    c.bump("spot_buys", 28)
+    c.token_pool(["MX", "DOGE", "XRP", "SOL", "TRX"])
+    assert c.state.stats and c.state.tokens
+
+    assert c.start_if_new("acc-NEW") is True, "заміна акаунта не почала нову кампанію"
+    assert c.state.stats == {}, "лічильники старого акаунта перейшли на новий"
+    assert c.state.tokens == [], "набір токенів старого акаунта перейшов"
+    assert c.state.account_key == "acc-NEW"
+
+
+def test_the_same_account_does_not_restart_the_campaign(tmp_path):
+    """Рестарт бота не має перекидати кампанію: той самий ключ — та сама
+    кампанія."""
+    c = _camp(tmp_path)
+    c.start_if_new("acc1")
+    started = c.state.started_at
+    c.bump("spot_buys", 5)
+    assert c.start_if_new("acc1") is False
+    assert c.state.started_at == started
+    assert c.state.stats["spot_buys"] == 5
+
+
+def test_a_file_from_before_the_account_key_gets_it_written(tmp_path):
+    """Старі файли не мають `account_key`. Вони НЕ повинні виглядати як
+    «інший акаунт» — інакше перший же старт після деплою скинув би живу
+    кампанію."""
+    c = _camp(tmp_path)
+    c.start_if_new("")            # без ключа, як у старому коді
+    c.bump("spot_buys", 3)
+    assert c.start_if_new("acc1") is False, "порожній ключ прочитано як зміну акаунта"
+    assert c.state.account_key == "acc1", "ключ не дописано"
+    assert c.state.stats["spot_buys"] == 3, "лічильники втрачено на рівному місці"

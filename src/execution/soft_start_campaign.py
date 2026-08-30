@@ -59,6 +59,14 @@ class CampaignState:
     # реальних 17/9 і 8/7 за три доби. Він міряв час від останнього рестарту,
     # а не кампанію. Тут вони переживають рестарт разом зі станом кампанії.
     stats: dict = field(default_factory=dict)
+    # Відбиток АКАУНТА, для якого йшла ця кампанія. НЕ сам вебкей — лише
+    # sha256-префікс: у стані на диску секретам не місце.
+    #
+    # НАВІЩО. Стан прогріву лежить per-SLOT, а не per-account. Оператор
+    # замінив вебкеї на клоні — і новий акаунт успадкував би чужу кампанію
+    # разом із її бюджетом, монетами в legacy-відрі та лічильниками. Тепер
+    # зміна ключа = нова кампанія з чистого аркуша.
+    account_key: str = ""
 
     def elapsed_days(self, now: float | None = None) -> float:
         if not self.started_at:
@@ -103,15 +111,44 @@ class SoftStartCampaign:
 
     # ---- lifecycle ------------------------------------------------------
 
-    def start_if_new(self) -> bool:
-        """Begin the campaign if it has not begun. True if this call started it."""
-        if self.state.started_at:
+    def start_if_new(self, account_key: str = "") -> bool:
+        """Почати кампанію, якщо її ще нема, вона ВЖЕ ЗАВЕРШЕНА або змінився
+        акаунт. True, якщо цей виклик її почав.
+
+        ТРИ ПРИЧИНИ ПОЧАТИ, і раніше працювала лише перша:
+        1. кампанії ще не було (`started_at == 0`);
+        2. **попередня завершилась** — до 30.08 повторне натискання 🌱 нічого
+           не давало: `started_at` уже стояв, тож `start_if_new` мовчки
+           повертав False, а `expired()` одразу гасив слот назад. Прогрів
+           можна було запустити рівно один раз на слот, назавжди;
+        3. **змінився акаунт** — стан лежить per-SLOT, тож новий вебкей
+           успадкував би чужу кампанію: її бюджет, лічильники і монети в
+           legacy-відрі. Останнє особливо погано: ми б рахували «у монетах»
+           те, чого на цьому акаунті немає.
+        """
+        prev_key = self.state.account_key or ""
+        key_changed = bool(account_key) and bool(prev_key) and account_key != prev_key
+        fresh = (not self.state.started_at) or self.state.expired() or key_changed
+
+        if not fresh:
+            # Кампанія триває — лише дописуємо ключ, якщо його ще не було
+            # (файл із часів до появи поля).
+            if account_key and not prev_key:
+                self.state.account_key = account_key
+                self._save()
             return False
-        self.state.started_at = time.time()
-        self.state.finished = False
-        self.state.day_weights = {}
+
+        why = ("новий акаунт у слоті" if key_changed
+               else ("попередня завершилась" if self.state.started_at
+                     else "перший запуск"))
+        days = self.state.days
+        # ПОВНИЙ СКИД, а не часткове оновлення: лічильники, ваги днів, набір
+        # токенів і прапорець finished належали ТІЙ кампанії. Часткове
+        # оновлення лишило б, наприклад, чужі підсумки у фінальному звіті.
+        self.state = CampaignState(days=days, started_at=time.time(),
+                                   account_key=account_key or prev_key)
         self._save()
-        logger.info("soft-start campaign: started, %d day(s)", self.state.days)
+        logger.info("soft-start campaign: старт (%s), %d доби", why, days)
         return True
 
     def expired(self) -> bool:

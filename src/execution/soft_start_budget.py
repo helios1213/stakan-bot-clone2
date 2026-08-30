@@ -352,8 +352,17 @@ class SoftStartBudget:
                     amount, reason, self.state.spent_usdt)
 
     def reset(self) -> None:
-        self.state = BudgetState(max_usdt=self.state.max_usdt)
+        """Чистий облік під нову кампанію.
+
+        `accounting_version` одразу актуальна: свіжий стан не потребує
+        міграції, а з нулем наступне завантаження ганяло б засів legacy на
+        порожньому файлі — нешкідливо, але збиває з пантелику при читанні
+        логів.
+        """
+        self.state = BudgetState(max_usdt=self.state.max_usdt,
+                                 accounting_version=2)
         self._save()
+        logger.info("soft-start budget: обнулено")
 
 
 # ---- cost estimation ----------------------------------------------------

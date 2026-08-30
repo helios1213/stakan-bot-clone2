@@ -111,6 +111,12 @@ class SlotWarmer:
         # slot_id -> той самий профіль пристрою, що й на фʼючерсному шляху
         # цього слота. Без нього спот ходив під ІНШИМ відбитком з тієї ж
         # IP і того ж акаунта.
+        # Відбиток АКАУНТА — не сам ключ. Потрібен, щоб помітити заміну
+        # вебкея: стан прогріву лежить per-slot, і новий акаунт успадкував би
+        # чужу кампанію разом із її грошима в обліку.
+        import hashlib
+        self._account_key = hashlib.sha256(
+            (webkey or "").encode("utf-8")).hexdigest()[:16]
         self.spot_client = SpotWebClient(webkey, dry_run=dry_run,
                                          slot_id=slot_id)
         self.spot: SpotSoftStart | None = None
@@ -218,7 +224,14 @@ class SlotWarmer:
                                "— that half stays idle", self.slot_id, name, bal,
                                MIN_VIABLE_BALANCE_USDT)
 
-        if self.campaign.start_if_new() and self.reporter is not None:
+        started = self.campaign.start_if_new(self._account_key)
+        if started:
+            # НОВА КАМПАНІЯ -> ЧИСТИЙ ОБЛІК. Бюджет і денний план належали
+            # ПОПЕРЕДНІЙ кампанії (а при заміні вебкея — взагалі іншому
+            # акаунту): його витрати, його позиції за собівартістю, його
+            # legacy-монети. Лишити їх означало б рахувати чужі гроші як свої.
+            self._reset_accounting()
+        if started and self.reporter is not None:
             try:
                 await self.reporter.campaign_started(self.campaign.state.days,
                                                      **self._status())
@@ -228,6 +241,43 @@ class SlotWarmer:
                     self.slot_id, self.campaign.state.day_index() + 1,
                     self.campaign.state.days, self.campaign.state.remaining_days())
         await self.futures.recover()
+
+    def _reset_accounting(self) -> None:
+        """Скинути бюджет і денний план під нову кампанію.
+
+        ФʼЮЧЕРСНИЙ СТАН НЕ ЧІПАЄМО — і це не забудькуватість. Там може лежати
+        ВІДКРИТА позиція; стерши запис, ми осиротили б її на біржі назавжди.
+        Він і так перекидається за датою. Якщо позиція лишилась від ІНШОГО
+        акаунта (замінили вебкей із відкритою позицією) — закрити її новим
+        ключем неможливо в принципі, тому про це кричимо, а не приховуємо.
+        """
+        try:
+            pos = (self.futures.state.position if self.futures else None)
+            pend = (self.futures.state.pending if self.futures else None)
+            if pos or pend:
+                logger.critical(
+                    "🚨 [SLOT %d] нова кампанія, але у фʼючерсному стані "
+                    "лишилась позиція/запит (%s). Якщо вебкей міняли — ця "
+                    "позиція належить СТАРОМУ акаунту і новим ключем не "
+                    "закриється: перевір біржу руками.",
+                    self.slot_id, (pos or pend))
+        except Exception:
+            pass
+        try:
+            self.budget.reset()
+            logger.info("soft-start slot %d: облік обнулено під нову кампанію",
+                        self.slot_id)
+        except Exception:
+            logger.exception("soft-start slot %d: бюджет не обнулено",
+                             self.slot_id)
+        try:
+            import os
+            p = f"{self.data_dir}/spot_soft_start_slot{self.slot_id}.json"
+            if os.path.exists(p):
+                os.remove(p)          # денний план перерозіграється з нуля
+        except Exception:
+            logger.debug("soft-start slot %d: денний план не прибрано",
+                         self.slot_id, exc_info=True)
 
     def _snapshot(self) -> tuple:
         """The counters that tell us an action happened, for diffing a tick."""

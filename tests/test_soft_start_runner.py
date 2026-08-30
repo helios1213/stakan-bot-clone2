@@ -593,3 +593,99 @@ async def test_runner_reports_futures_open_with_its_size():
     assert seen.get("symbol") == "1000PEPEUSDT"
     assert seen.get("lev") == 9 and seen.get("hold") == 53
     assert seen.get("vol") == 1, "розмір позиції не передано у звіт"
+
+
+# ---- нова кампанія = чистий облік (2026-08-30) -----------------------------
+
+@pytest.mark.asyncio
+async def test_new_campaign_resets_the_accounting():
+    """ПРОВОДКА. Бюджет і денний план належали ПОПЕРЕДНІЙ кампанії, а при
+    заміні вебкея — взагалі іншому акаунту: його витрати, його позиції за
+    собівартістю, його legacy-монети. Лишити їх означало б рахувати чужі
+    гроші як свої."""
+    reset_called = []
+
+    w = RealSlotWarmer.__new__(RealSlotWarmer)
+    w.slot_id = 1
+    w.data_dir = "/tmp/nonexistent-dir-for-test"
+    w.budget = type("B", (), {"reset": lambda self: reset_called.append(1)})()
+    w.futures = type("F", (), {
+        "state": type("S", (), {"position": None, "pending": None})()})()
+
+    RealSlotWarmer._reset_accounting(w)
+    assert reset_called, "бюджет не обнулено під нову кампанію"
+
+
+@pytest.mark.asyncio
+async def test_reset_never_wipes_an_open_futures_position(caplog):
+    """ФʼЮЧЕРСНИЙ СТАН НЕ ЧІПАЄМО. Там може лежати ВІДКРИТА позиція; стерши
+    запис, ми осиротили б її на біржі назавжди. А якщо вебкей міняли — вона
+    належить старому акаунту і новим ключем не закриється взагалі, тож про це
+    треба кричати, а не приховувати."""
+    import logging
+    w = RealSlotWarmer.__new__(RealSlotWarmer)
+    w.slot_id = 1
+    w.data_dir = "/tmp/nonexistent-dir-for-test"
+    w.budget = type("B", (), {"reset": lambda self: None})()
+    pos = {"symbol": "ZECUSDT", "vol": 1}
+    w.futures = type("F", (), {
+        "state": type("S", (), {"position": pos, "pending": None})()})()
+
+    with caplog.at_level(logging.CRITICAL):
+        RealSlotWarmer._reset_accounting(w)
+
+    assert w.futures.state.position is pos, "позицію стерто — вона осиротіла б"
+    assert any("належить СТАРОМУ акаунту" in r.getMessage()
+               for r in caplog.records), "мовчазне перезапускання з позицією"
+
+
+@pytest.mark.asyncio
+async def test_start_resets_accounting_only_for_a_new_campaign(monkeypatch,
+                                                               tmp_path):
+    """ПРОВОДКА В `start()` — десятий за сесію випадок цієї діри.
+
+    Попередній тест кличе `_reset_accounting` НАПРЯМУ, тож мутант, що прибирає
+    виклик зі `start()`, проходив зеленим: метод правильний і невживаний.
+    Тут перевіряється саме звʼязка «нова кампанія -> чистий облік», і навпаки —
+    що кампанія, яка ТРИВАЄ, обліку не чіпає.
+    """
+    import src.execution.soft_start_runner as ssr
+
+    for new_campaign, expect_reset in ((True, True), (False, False)):
+        resets = []
+        w = RealSlotWarmer.__new__(RealSlotWarmer)
+        w.slot_id = 1
+        w.data_dir = str(tmp_path)
+        w.dry_run = True
+        w.universe = ["HYPEUSDT"]
+        w.client = object()
+        w.spot_client = object()
+        w.fee_gate = object()
+        w.futures_allowed = True
+        w.reporter = None
+        w._account_key = "acc1"
+        w.budget = type("B", (), {"reset": lambda self: None})()
+        w.campaign = type("C", (), {
+            "start_if_new": lambda self, k: new_campaign,
+            "token_pool": lambda self, c: ["MX"],
+            "state": type("S", (), {"days": 3, "tokens": ["MX"],
+                                    "day_index": lambda self: 0,
+                                    "remaining_days": lambda self: 3.0})(),
+        })()
+        w._reset_accounting = lambda: resets.append(1)
+
+        async def _bal(): return (50.0, 50.0)
+        async def _uni(): return ["MX"]
+        w._read_balances = _bal
+        w._spot_universe = _uni
+
+        class _Fut:
+            state = type("S", (), {"position": None, "pending": None})()
+            async def recover(self): pass
+        monkeypatch.setattr(ssr, "FuturesSoftStart", lambda *a, **k: _Fut())
+        monkeypatch.setattr(ssr, "SpotSoftStart", lambda *a, **k: object())
+
+        await RealSlotWarmer.start(w)
+        assert bool(resets) is expect_reset, (
+            f"нова кампанія={new_campaign}: облік "
+            f"{'НЕ ' if expect_reset else ''}скинуто, а мало бути навпаки")
