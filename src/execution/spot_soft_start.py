@@ -279,6 +279,29 @@ class SpotSoftStart:
                         symbol, usdt, cfg.daily_buy_usdt_ceiling, p.spent_usdt)
             return False
 
+        # ВІЛЬНИЙ USDT ПЕРЕЧИТУЄТЬСЯ ПЕРЕД КОЖНОЮ КУПІВЛЕЮ.
+        #
+        # Розмір виводиться з балансу, ЗНЯТОГО НА СТАРТІ, а він за добу
+        # витрачається на монети. Поки половина вимикалась за порогом, це не
+        # проявлялось; тепер вона лишається живою при малому USDT (щоб могти
+        # ПРОДАВАТИ), і без цієї перевірки кожна купівля йшла б у гарантовану
+        # відмову біржі — серія «insufficient funds» замість тиші.
+        try:
+            cur_q = await self.client.currency(cfg.quote) if cfg.quote != "USDT" else None
+            free = float((await self.client.balances(
+                [USDT_CURRENCY_ID if cur_q is None else cur_q.currency_id]
+            )).get(cfg.quote, {}).get("available", 0) or 0)
+        except Exception as e:
+            # Не прочитали — НЕ вважаємо, що коштів немає: це зупинило б
+            # прогрів через блимання мережі. Пропускаємо перевірку.
+            logger.debug("[buy] вільний %s не прочитано (%s) — не гейтимо",
+                         cfg.quote, e)
+            free = None
+        if free is not None and usdt > free * 0.98:
+            logger.info("[buy] skip %s %.2f — вільного %s лише %.2f",
+                        symbol, usdt, cfg.quote, free)
+            return False
+
         # The buffer we cross to get filled IS the cost of this order, and it is
         # known before sending — so an order that would breach the ceiling is
         # never placed rather than being noticed afterwards.

@@ -209,7 +209,29 @@ class SlotWarmer:
             dry_run=self.dry_run, rng=random.Random(),
             budget=self.budget, balance_usdt=fut_bal,
         )
-        self._spot_viable = spot_bal >= MIN_VIABLE_BALANCE_USDT
+        # ВІД УСЬОГО СПОТА, а не від вільного USDT — інакше глухий кут.
+        #
+        # Було: `spot_bal` це ВІЛЬНИЙ USDT. Спот купував монети, доки USDT не
+        # закінчувався, після чого половина вимикалась за порогом — і, будучи
+        # вимкненою, не могла ПРОДАТИ, щоб повернути USDT. Живий випадок
+        # 31.08, primary слот 2: вільних 3.24, у монетах 22.53, спот 0/9
+        # купівель і 0/19 продажів за добу. Гроші є, а половина стоїть.
+        #
+        # USDT потрібен лише для КУПІВЛІ; для продажу потрібні монети, і їх
+        # вистачає. Тому поріг рахується від повної спотової вартості, а
+        # неможливість купити гейтиться окремо, у `maybe_buy`.
+        coins_val = 0.0
+        try:
+            coins_val = await self.spot_client_coins_value(tokens)
+        except Exception:
+            logger.debug("soft-start slot %d: вартість монет не прочитана",
+                         self.slot_id, exc_info=True)
+        spot_total = spot_bal + coins_val
+        self._spot_viable = spot_total >= MIN_VIABLE_BALANCE_USDT
+        if coins_val:
+            logger.info("soft-start slot %d: спот — вільних %.2f + монет %.2f "
+                        "= %.2f USDT", self.slot_id, spot_bal, coins_val,
+                        spot_total)
         self._fut_viable = (fut_bal >= MIN_VIABLE_BALANCE_USDT
                             and self.futures_allowed)
         if not self.futures_allowed:
@@ -367,6 +389,17 @@ class SlotWarmer:
             "held_value": self._held_spot_value(),
             "position": pos,
         }
+
+    async def spot_client_coins_value(self, tokens) -> float:
+        """Вартість монет на споті — тонка обгортка, щоб `start()` не тягнув
+        логіку читання балансів у себе. Порожньо/збій -> 0.0."""
+        from .spot_soft_start import SpotSoftStart
+        probe = SpotSoftStart.__new__(SpotSoftStart)
+        probe.client = self.spot_client
+        probe.cfg = SoftStartConfig(state_path="/dev/null",
+                                    universe=tuple(tokens or ("MX",)))
+        v = await SpotSoftStart.market_value_of_coins(probe, list(tokens or []))
+        return float(v or 0.0)
 
     async def _refresh_held_market(self) -> None:
         """Оновити ВИМІРЯНУ вартість монет. Раз на ~30 хв, не щотіку.

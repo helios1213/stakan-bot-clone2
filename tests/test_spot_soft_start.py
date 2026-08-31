@@ -38,15 +38,23 @@ PENGU = SpotCurrency(
 class FakeClient:
     """Records what would be ordered; never touches the network."""
 
-    def __init__(self, held=0.0, ok=True):
+    def __init__(self, held=0.0, ok=True, usdt=1000.0):
         self.orders = []
         self.held = held
         self.ok = ok
+        # Вільний USDT: рушій перечитує його ПЕРЕД кожною купівлею (розмір
+        # виводиться з балансу на старті, а той за добу витрачається). Фейк
+        # без цього поля давав free=0 і всі купівлі мовчки скіпались.
+        self.usdt = usdt
 
     async def currency(self, ticker):
         return PENGU
 
     async def balances(self, ids):
+        from src.execution.spot_soft_start import USDT_CURRENCY_ID
+        if ids and ids[0] == USDT_CURRENCY_ID:
+            return {"USDT": {"available": self.usdt,
+                             "currency_id": USDT_CURRENCY_ID}}
         return {"PENGU": {"available": self.held, "currency_id": PENGU.currency_id}}
 
     async def buy(self, ticker, *, usdt, price):
@@ -580,3 +588,45 @@ async def test_a_wind_down_that_sold_nothing_says_so(tmp_path, monkeypatch,
     with caplog.at_level(logging.WARNING):
         assert await e.wind_down(0.20, tokens=["MX"]) == 0
     assert any("жодного ордера" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_buy_is_skipped_when_free_usdt_ran_out(tmp_path, monkeypatch):
+    """Розмір виводиться з балансу, ЗНЯТОГО НА СТАРТІ, а він за добу
+    витрачається на монети. Поки спотова половина вимикалась за порогом, це
+    не проявлялось; тепер вона лишається живою при малому USDT (щоб МОГТИ
+    ПРОДАВАТИ), і без цієї перевірки кожна купівля йшла б у гарантовану
+    відмову біржі — серія «insufficient funds» замість тиші.
+    """
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    c = FakeClient(usdt=0.50)          # вільного майже немає
+    e = SpotSoftStart(c, cfg(tmp_path, universe=("PENGU",), order_usdt_min=1.5,
+                             order_usdt_max=2.0), rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["PENGU"], buys_target=5,
+                     sells_target=0)
+    assert await e.maybe_buy() is False
+    assert not [o for o in c.orders if o[0] == "BUY"], c.orders
+
+
+@pytest.mark.asyncio
+async def test_unreadable_free_balance_does_not_stop_buying(tmp_path,
+                                                            monkeypatch):
+    """Не прочитали — це НЕ «коштів немає»: інакше блимання мережі зупиняло б
+    прогрів. Гейт пропускається, а не спрацьовує."""
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+
+    class _Cl(FakeClient):
+        async def balances(self, ids):
+            raise RuntimeError("мережа")
+
+    c = _Cl()
+    e = SpotSoftStart(c, cfg(tmp_path, universe=("PENGU",), order_usdt_min=1.5,
+                             order_usdt_max=2.0), rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["PENGU"], buys_target=5,
+                     sells_target=0)
+    assert await e.maybe_buy() is True
+    assert [o for o in c.orders if o[0] == "BUY"]

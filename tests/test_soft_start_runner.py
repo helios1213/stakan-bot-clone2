@@ -689,3 +689,100 @@ async def test_start_resets_accounting_only_for_a_new_campaign(monkeypatch,
         assert bool(resets) is expect_reset, (
             f"нова кампанія={new_campaign}: облік "
             f"{'НЕ ' if expect_reset else ''}скинуто, а мало бути навпаки")
+
+
+@pytest.mark.asyncio
+async def test_spot_stays_alive_when_usdt_is_spent_but_coins_remain(monkeypatch,
+                                                                   tmp_path):
+    """ГЛУХИЙ КУТ, знайдений на живому боті 31.08 (primary, слот 2).
+
+        вільний USDT 3.24 · монети 22.53 (ADA 10.94 · MX 4.49 · TRX 7.10)
+        спот 0/9 купівель і 0/19 продажів за добу
+
+    Поріг viability міряв ВІЛЬНИЙ USDT. Спот купував монети, доки USDT не
+    закінчувався, після чого половина вимикалась — і, будучи вимкненою, не
+    могла ПРОДАТИ, щоб повернути USDT. Гроші є, а половина стоїть назавжди.
+
+    USDT потрібен лише для КУПІВЛІ; для продажу потрібні монети, і їх удосталь.
+    """
+    import src.execution.soft_start_runner as ssr
+
+    w = RealSlotWarmer.__new__(RealSlotWarmer)
+    w.slot_id = 2
+    w.data_dir = str(tmp_path)
+    w.dry_run = True
+    w.universe = ["HYPEUSDT"]
+    w.client = object()
+    w.spot_client = object()
+    w.fee_gate = object()
+    w.futures_allowed = True
+    w.reporter = None
+    w._account_key = "acc"
+    w.budget = type("B", (), {"reset": lambda self: None})()
+    w.campaign = type("C", (), {
+        "start_if_new": lambda self, k: False,
+        "token_pool": lambda self, c: ["ADA", "MX", "TRX"],
+        "state": type("S", (), {"days": 3, "tokens": ["ADA"],
+                                "day_index": lambda self: 0,
+                                "remaining_days": lambda self: 1.0})(),
+    })()
+
+    async def _bal():
+        return (3.24, 50.0)             # вільного USDT майже немає
+    async def _uni():
+        return ["ADA", "MX", "TRX"]
+    async def _coins(tokens):
+        return 22.53                    # ...але монет на 22.53
+
+    w._read_balances = _bal
+    w._spot_universe = _uni
+    w.spot_client_coins_value = _coins
+
+    class _Fut:
+        state = type("S", (), {"position": None, "pending": None})()
+        async def recover(self): pass
+    monkeypatch.setattr(ssr, "FuturesSoftStart", lambda *a, **k: _Fut())
+    monkeypatch.setattr(ssr, "SpotSoftStart", lambda *a, **k: object())
+
+    await RealSlotWarmer.start(w)
+    assert w._spot_viable is True, (
+        "спотова половина вимкнена при 25.77 USDT на споті — вона не зможе "
+        "навіть продати, щоб повернути USDT")
+
+
+@pytest.mark.asyncio
+async def test_spot_half_still_idles_when_there_is_truly_nothing(monkeypatch,
+                                                                 tmp_path):
+    """Поріг не скасовано: коли й монет немає, гріти нема чим."""
+    import src.execution.soft_start_runner as ssr
+
+    w = RealSlotWarmer.__new__(RealSlotWarmer)
+    w.slot_id = 2
+    w.data_dir = str(tmp_path)
+    w.dry_run = True
+    w.universe = ["HYPEUSDT"]
+    w.client = object(); w.spot_client = object(); w.fee_gate = object()
+    w.futures_allowed = True; w.reporter = None; w._account_key = "acc"
+    w.budget = type("B", (), {"reset": lambda self: None})()
+    w.campaign = type("C", (), {
+        "start_if_new": lambda self, k: False,
+        "token_pool": lambda self, c: ["MX"],
+        "state": type("S", (), {"days": 3, "tokens": ["MX"],
+                                "day_index": lambda self: 0,
+                                "remaining_days": lambda self: 1.0})(),
+    })()
+
+    async def _bal(): return (2.0, 50.0)
+    async def _uni(): return ["MX"]
+    async def _coins(tokens): return 1.0
+    w._read_balances = _bal; w._spot_universe = _uni
+    w.spot_client_coins_value = _coins
+
+    class _Fut:
+        state = type("S", (), {"position": None, "pending": None})()
+        async def recover(self): pass
+    monkeypatch.setattr(ssr, "FuturesSoftStart", lambda *a, **k: _Fut())
+    monkeypatch.setattr(ssr, "SpotSoftStart", lambda *a, **k: object())
+
+    await RealSlotWarmer.start(w)
+    assert w._spot_viable is False
