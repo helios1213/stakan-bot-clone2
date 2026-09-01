@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import time
 from dataclasses import asdict, dataclass, field
@@ -37,6 +38,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CAMPAIGN_DAYS = 3
 DAY_SEC = 86400
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    """tmp + os.replace: читач бачить або старий файл, або новий, ніколи обрізаний.
+
+    `open(..., "w")` обрізає файл ДО запису (виміряно: розмір 0 одразу після
+    open). Тобто ENOSPC або краш у цьому вікні лишає порожній файл, який
+    читається як «стану немає». Правильний зразок уже лежав у сусідньому
+    модулі — `futures_soft_start.save_state`.
+    """
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, p)
 
 
 @dataclass
@@ -90,21 +105,44 @@ class SoftStartCampaign:
                  rng: random.Random | None = None) -> None:
         self.path = path
         self.rng = rng or random.Random()
+        # Битий стан НЕ означає «нова кампанія» — див. `_load`.
+        self._unreadable = False
         self.state = self._load(path, days)
 
-    @staticmethod
-    def _load(path: str, days: int) -> CampaignState:
+    def _load(self, path: str, days: int) -> CampaignState:
+        """Прочитати стан. Нечитабельний файл — це FAIL-CLOSED.
+
+        Раніше тут стояло «starting fresh», і ланцюг був такий: битий файл ->
+        `started_at=0` -> `start_if_new()` True -> `_reset_accounting()` ->
+        **ще 3 доби ЖИВОЇ торгівлі** на акаунті, який оператор вважав
+        завершеним, плюс обнулений облік. Тригер реальний: диск на primary
+        96%, а `open(..., "w")` обрізає файл ДО запису.
+
+        Ми не знаємо, чи кампанія тривала і скільки лишалось, тож єдина
+        безпечна відповідь — НЕ починати нову. Стан позначається як
+        нечитабельний: `expired()` віддає True (слот чисто вимкнеться), а
+        `start_if_new()` відмовляє. Оператор може натиснути 🌱 ще раз —
+        свідомо, а не через збій файлової системи.
+        """
         p = Path(path)
         if p.exists():
             try:
                 return CampaignState(**json.loads(p.read_text()))
             except Exception as e:
-                logger.warning("campaign state unreadable (%s) — starting fresh", e)
+                logger.critical("СТАН КАМПАНІЇ НЕЧИТАБЕЛЬНИЙ (%s) — НЕ починаю "
+                                "нову кампанію: це були б ще 3 доби живої "
+                                "торгівлі через збій файлу. Натисни 🌱 ще раз, "
+                                "якщо прогрів справді потрібен", e)
+                try:
+                    p.rename(p.with_suffix(p.suffix + f".corrupt.{int(time.time())}"))
+                except Exception as e2:              # pragma: no cover - fs edge
+                    logger.warning("битий файл кампанії не збережено: %s", e2)
+                self._unreadable = True
         return CampaignState(days=days)
 
     def _save(self) -> None:
         try:
-            Path(self.path).write_text(json.dumps(asdict(self.state), indent=2))
+            _atomic_write_json(self.path, asdict(self.state))
         except Exception as e:
             logger.error("campaign state SAVE FAILED (%s) — a restart may "
                          "restart the campaign", e)
@@ -126,6 +164,9 @@ class SoftStartCampaign:
            legacy-відрі. Останнє особливо погано: ми б рахували «у монетах»
            те, чого на цьому акаунті немає.
         """
+        if self._unreadable:
+            # FAIL-CLOSED: див. `_load`. Не починаємо кампанію через збій файлу.
+            return False
         prev_key = self.state.account_key or ""
         key_changed = bool(account_key) and bool(prev_key) and account_key != prev_key
         fresh = (not self.state.started_at) or self.state.expired() or key_changed
@@ -152,6 +193,8 @@ class SoftStartCampaign:
         return True
 
     def expired(self) -> bool:
+        if self._unreadable:
+            return True           # fail-closed: див. `_load`
         return self.state.expired()
 
     def finish(self) -> None:

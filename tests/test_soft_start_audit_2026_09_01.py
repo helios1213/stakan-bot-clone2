@@ -605,3 +605,377 @@ async def test_sizing_comes_from_the_whole_spot_wallet_not_free_usdt(monkeypatch
     assert rich.daily_buy_usdt_ceiling > poor.daily_buy_usdt_ceiling, (
         "монети не враховані — стеля й далі виводиться з вільного USDT")
     assert rich.baseline_usdt_per_token > poor.baseline_usdt_per_token
+
+
+# --------------------------------------------------------------------------
+# §2.2 — спред рахувався ДВІЧІ
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_flat_market_round_trip_shows_zero_spot_pnl(tmp_path,
+                                                            monkeypatch):
+    """ДЕФЕКТ §2.2 — фантомний спотовий збиток.
+
+    Купівля йде за `px*(1+buffer)`, тож біржа віддає `qty = usdt/(px*(1+b))`.
+    Собівартість писалась як `usdt` на цю кількість, тобто по ціні
+    `px*(1+b)`; продаж же записує виручку по МІДУ (`qty*px`). При геть
+    нерухомому ринку це давало `spot_pnl = -usdt*b` — а той самий буфер уже
+    сидить у `spent` через `_order_cost`. Спред рахувався двічі.
+
+    Живі дані слота 1: всі 8 продажів відʼємні і центровані рівно на ставці
+    буфера (зважено -0.001926 проти передбаченого -0.001996), тобто ~96%
+    рядка «спот» у звіті — це подвійний облік, а не рух ринку.
+    """
+    from src.execution import spot_soft_start as sss
+    from src.execution.soft_start_budget import SoftStartBudget
+
+    PX = 2.0
+    BUF = 0.002
+
+    class _Cur:
+        currency_id = "cid"
+        market_currency_id = "mid"
+        price_decimals = 6
+        quantity_decimals = 6
+
+    class _Res:
+        def __init__(self, qty, price):
+            self.ok = True
+            self.dry_run = False
+            self.quantity = qty
+            self.price = price
+            self.code = 200
+            self.raw = {}
+
+    class _Client:
+        async def currency(self, t):
+            return _Cur()
+
+        async def balances(self, ids):
+            return {"USDT": {"available": 1000.0}, "MX": {"available": 100.0}}
+
+        async def buy(self, token, *, usdt, price):
+            return _Res(usdt / price, price)      # біржа наливає ЗА ЦІНОЮ ЛІМІТА
+
+        async def sell(self, token, *, quantity, price):
+            return _Res(quantity, price)
+
+    monkeypatch.setattr(sss, "_price_async",
+                        lambda symbol: asyncio.sleep(0, result=PX))
+
+    budget = SoftStartBudget(str(tmp_path / "b.json"), 1e9)
+    cfg = sss.SoftStartConfig(universe=("MX",),
+                              state_path=str(tmp_path / "s.json"),
+                              order_usdt_min=10.0, order_usdt_max=10.0,
+                              baseline_usdt_per_token=0.0,
+                              marketable_buffer=BUF)
+    e = sss.SpotSoftStart(_Client(), cfg, budget=budget)
+    e.plan.tokens = ["MX"]
+    e.plan.buys_done = 0
+    e.plan.buys_target = 5
+    e.plan.sells_done = 0
+    e.plan.sells_target = 5
+
+    assert await e.maybe_buy() is True
+    qty = budget.state.spot_positions["MX"]["qty"]
+    assert qty == pytest.approx(10.0 / (PX * (1 + BUF)), rel=1e-9)
+
+    sold = await e.maybe_sell()
+
+    assert sold is True, "продаж не пройшов — тест нічого не міряє"
+    assert budget.spot_pnl == pytest.approx(0.0, abs=1e-6), (
+        f"нерухомий ринок дав spot_pnl={budget.spot_pnl:.6f} — спред "
+        "рахується двічі")
+    assert budget.spent > 0, "спред мусить лишитись у витратах, і рівно раз"
+
+
+# --------------------------------------------------------------------------
+# §2.1 — синхронний urllib у event loop
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_prices_are_fetched_off_the_event_loop():
+    """Виміряно в контейнері: 17 цін поспіль тримали loop 1387 мс (фон 5.9).
+    17 підряд — це рівно те, що робить `wind_down` по своєму пулу."""
+    import threading
+    from src.execution import spot_soft_start as sss
+
+    where = {}
+
+    def _slow(symbol):
+        where["thread"] = threading.current_thread().name
+        return 1.0
+
+    orig = sss.public_last_price
+    sss.public_last_price = _slow
+    try:
+        beats = []
+
+        async def heartbeat():
+            for _ in range(60):
+                beats.append(1)
+                await asyncio.sleep(0.001)
+
+        hb = asyncio.create_task(heartbeat())
+        await sss._price_async("MXUSDT")
+        hb.cancel()
+    finally:
+        sss.public_last_price = orig
+
+    assert where["thread"] != threading.main_thread().name, (
+        "ціну тягнуть у головному потоці — це морозить event loop арбітражу")
+
+
+# --------------------------------------------------------------------------
+# §1.5 / §2.5 — атомарність і fail-closed
+# --------------------------------------------------------------------------
+
+def test_an_unreadable_campaign_does_not_start_three_more_live_days(tmp_path):
+    """ДЕФЕКТ §1.5, найдорожчий за наслідком.
+
+    Було: битий файл -> `started_at=0` -> `start_if_new()` True ->
+    `_reset_accounting()` -> ЩЕ 3 ДОБИ ЖИВОЇ ТОРГІВЛІ на акаунті, який
+    оператор вважав завершеним, плюс обнулений облік. Тригер реальний: диск
+    на primary 96%, а `open(...,"w")` обрізає файл ДО запису.
+    """
+    from src.execution.soft_start_campaign import SoftStartCampaign
+
+    p = tmp_path / "c.json"
+    p.write_text('{"started_at": 1, "days": 3')      # обрізаний JSON
+    c = SoftStartCampaign(str(p))
+
+    assert c._unreadable is True
+    assert c.start_if_new("acct") is False, "битий файл почав нову кампанію"
+    assert c.expired() is True, "слот мусить чисто вимкнутись, а не гріти далі"
+    assert list(tmp_path.glob("c.json.corrupt.*")), "битий файл не збережено"
+
+
+def test_campaign_and_budget_are_written_atomically(tmp_path):
+    """`open(...,"w")` обрізає файл ДО запису — саме так стан і зникає."""
+    from src.execution.soft_start_budget import SoftStartBudget
+    from src.execution.soft_start_campaign import SoftStartCampaign
+
+    c = SoftStartCampaign(str(tmp_path / "c.json"))
+    c.start_if_new("k")
+    b = SoftStartBudget(str(tmp_path / "b.json"), 5.0)
+    b.charge(0.1, "x")
+
+    for mod, path in ((SoftStartCampaign, tmp_path / "c.json"),
+                      (SoftStartBudget, tmp_path / "b.json")):
+        src = __import__("inspect").getsource(mod._save)
+        assert "_atomic_write_json" in src, f"{mod.__name__}._save не атомарний"
+    assert (tmp_path / "c.json").read_text().strip().endswith("}")
+    assert (tmp_path / "b.json").read_text().strip().endswith("}")
+
+
+def test_a_torn_budget_does_not_double_count_the_coins(tmp_path):
+    """ДЕФЕКТ §2.5, другого порядку.
+
+    Свіжий стан мав `accounting_version=0`, який зберігався на диск; наступне
+    завантаження ловило `< 2` і сіяло `legacy_spot_cost = max(0, -spot_flow)`,
+    тоді як ті самі купівлі вже лежать у `spot_positions`. Виміряно: після
+    битого читання одна купівля ADA на 5.0 давала legacy 5.0 І позицію 5.0 —
+    `held_spot_value` 10.0 замість 5.0. Не самолікується.
+    """
+    from src.execution.soft_start_budget import SoftStartBudget
+
+    p = tmp_path / "b.json"
+    p.write_text("{ обрізано")
+    b = SoftStartBudget(str(p), 5.0)
+    assert b.state.accounting_version == 2
+
+    b.record_spot_buy("ADA", 5.0, 10.0)
+    again = SoftStartBudget(str(p), 5.0)
+    assert again.state.legacy_spot_cost == 0.0, "монети пораховано двічі"
+    assert again.held_spot_value == pytest.approx(5.0)
+
+
+# --------------------------------------------------------------------------
+# §2.4 — порожні баланси != «монет немає»
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_http_error_on_balances_is_not_read_as_zero_funds():
+    """ДЕФЕКТ §2.4.
+
+    `balances()` віддавав `{}` на будь-який не-200, і споживач мовчки читав
+    це як `free = 0.00`, друкуючи в лог СТВЕРДЖЕННЯ «вільного USDT лише
+    0.00». Гілка «не прочитали — не гейтимо» ловила лише мережеві винятки.
+    """
+    from src.execution.webkey.spot_client import (SpotBalancesUnavailable,
+                                                  SpotWebClient)
+
+    c = SpotWebClient.__new__(SpotWebClient)
+    c._timeout = 1
+    c.quote = "USDT"
+
+    class _R:
+        status_code = 429
+
+        def json(self):
+            return {}
+
+    class _S:
+        async def get(self, *a, **kw):
+            return _R()
+
+    c._ensure_session = lambda: _S()
+    c._headers = lambda: {}
+
+    with pytest.raises(SpotBalancesUnavailable):
+        await c.balances(["cid"])
+
+
+# --------------------------------------------------------------------------
+# §1.2 — рішення про реальну позицію з одного семпла
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_pending_open_is_rechecked_before_being_written_off(tmp_path):
+    """ДЕФЕКТ, ЩО ЛАМАЄ ГРОШІ (§1.2).
+
+    `reconcile_pending` робив ОДНЕ читання з нульовою затримкою, і порожня
+    відповідь НЕЗВОРОТНО стирала pending. Але цей самий проєкт уже виміряв
+    затримку видимості філу («MEXC's fill-visibility lag is ~50-200ms after
+    submit», `live_executor.py`), і схему «одна перевірка» там уже відкидали
+    після реальної ліквідації (-$25.82, 49 хв голого шорта). Ризикова саме
+    ШВИДКА мережева відмова при RTT ~150мс — рівно в ту смугу.
+
+    Наслідок: наступний тік відкриває ДРУГУ позицію, а перша не закриється
+    ніколи (`close_position` символо-широкий і бачить лише відстежувану).
+    """
+    from src.execution import futures_soft_start as fss
+
+    reads = {"n": 0}
+
+    class _Client:
+        async def get_open_positions(self):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return {"code": "0", "data": []}      # біржа ще не показує
+            return {"code": "0", "data": [
+                {"symbol": "HYPE_USDT", "holdVol": "1", "positionType": 1,
+                 "leverage": 9, "openAvgPrice": "10"}]}
+
+    e = fss.FuturesSoftStart.__new__(fss.FuturesSoftStart)
+    e.client = _Client()
+    e.cfg = fss.FuturesSoftStartConfig(state_path=str(tmp_path / "f.json"))
+    e.state = fss.FuturesState(pending={"symbol": "HYPEUSDT", "vol": 1,
+                                        "leverage": 9, "hold_min": 10,
+                                        "sent_at": 0.0})
+    e.budget = None
+    e.dry_run = True
+    e.on_action = None
+    e._last_fee_estimate = 0.0
+    e.rng = __import__("random").Random(0)
+    e.last_closed = None
+
+    adopted = await e.reconcile_pending()
+
+    assert reads["n"] >= 2, (
+        f"біржу спитали лише {reads['n']} раз(и) — позицію списали з одного "
+        "порожнього семпла")
+    assert adopted is True, "позицію не адоптовано, хоча біржа її показала"
+    assert e.state.pending is None
+    assert e.state.position is not None
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_unopened_order_is_still_cleared(tmp_path):
+    """Ретрай не має перетворювати «не відкрилось» на вічний pending —
+    інакше слот більше ніколи не відкриє позицію."""
+    from src.execution import futures_soft_start as fss
+
+    class _Client:
+        async def get_open_positions(self):
+            return {"code": "0", "data": []}
+
+    e = fss.FuturesSoftStart.__new__(fss.FuturesSoftStart)
+    e.client = _Client()
+    e.cfg = fss.FuturesSoftStartConfig(state_path=str(tmp_path / "f.json"))
+    e.state = fss.FuturesState(pending={"symbol": "HYPEUSDT", "vol": 1,
+                                        "leverage": 9, "hold_min": 10,
+                                        "sent_at": 0.0})
+    e.budget = None
+    e.dry_run = True
+    e.on_action = None
+    e._last_fee_estimate = 0.0
+    e.rng = __import__("random").Random(0)
+    e.last_closed = None
+
+    assert await e.reconcile_pending() is False
+    assert e.state.pending is None, "pending завис назавжди"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_exchange_keeps_the_question_open(tmp_path):
+    """Нечитабельна біржа — це НЕ «нічого не відкрилось»."""
+    from src.execution import futures_soft_start as fss
+
+    class _Client:
+        async def get_open_positions(self):
+            return {"code": "500", "data": None}
+
+    e = fss.FuturesSoftStart.__new__(fss.FuturesSoftStart)
+    e.client = _Client()
+    e.cfg = fss.FuturesSoftStartConfig(state_path=str(tmp_path / "f.json"))
+    e.state = fss.FuturesState(pending={"symbol": "HYPEUSDT", "vol": 1,
+                                        "leverage": 9, "hold_min": 10,
+                                        "sent_at": 0.0})
+    e.budget = None
+    e.dry_run = True
+    e.on_action = None
+    e._last_fee_estimate = 0.0
+    e.rng = __import__("random").Random(0)
+    e.last_closed = None
+
+    assert await e.reconcile_pending() is False
+    assert e.state.pending is not None, "питання закрили без відповіді"
+
+
+# --------------------------------------------------------------------------
+# §3 — діри, через які мутанти виживали в УСІЙ сюїті
+# --------------------------------------------------------------------------
+
+def test_the_final_report_actually_subtracts_the_spot_pnl():
+    """ДІРА §3.1, виміряна мутантом.
+
+    Прибирання `- spot_pnl` із `render_final` лишало ВСІ 1447 тестів
+    зеленими: з 11 викликів `render_final` десять подавали `spot_pnl=0.0`, а
+    єдиний із `-0.3` перевіряв лише відсутність фрази «не виміряно».
+    Контроль: та сама правка в живому статусі валила 2 тести — тобто діра
+    була саме у ФІНАЛЬНОМУ звіті, який оператор і читає.
+    """
+    import re
+
+    from src.execution.soft_start_reporter import SoftStartReporter
+
+    r = SoftStartReporter(None, 1, dry_run=False)
+    txt = re.sub(r"</?[a-z]+>", "", r.render_final(
+        "x", spent=0.30, futures_pnl=0.0, spot_pnl=-2.0,
+        held_value=0.0, held_measured=True))
+    assert "2.30" in txt, (
+        f"спотовий PnL не увійшов у підсумок: {txt!r}")
+
+
+def test_the_futures_window_really_gates_the_open():
+    """ДІРА §3.2, виміряна мутантом.
+
+    `active_now → True` лишало всю сюїту зеленою: чотири тести вікна роблять
+    `monkeypatch.setattr(ss, "active_now", ...)`, тобто підміняють саме те,
+    що мали б перевіряти. Спотовий аналог покритий по-справжньому — цей ні.
+    Вікно існує не для краси: без нього фʼючерси відкривали позицію о 01:35,
+    поки спот законно спав.
+    """
+    from datetime import datetime, timezone
+
+    from src.execution.futures_soft_start import (FuturesSoftStart,
+                                                  FuturesSoftStartConfig)
+
+    e = FuturesSoftStart.__new__(FuturesSoftStart)
+    e.cfg = FuturesSoftStartConfig()
+    at = lambda h: datetime(2026, 9, 1, h, 0, tzinfo=timezone.utc)
+
+    assert e.active_now(at(12)) is True
+    assert e.active_now(at(1)) is False, "нічне вікно не гейтиться"
+    assert e.active_now(at(23)) is False

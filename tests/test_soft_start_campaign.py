@@ -90,11 +90,17 @@ def test_reset_starts_over(tmp_path):
     assert c.state.started_at == 0.0 and not c.state.finished
 
 
-def test_corrupt_state_starts_fresh(tmp_path):
+def test_corrupt_state_does_NOT_start_a_fresh_campaign(tmp_path):
+    """Раніше називалось `..._starts_fresh` і пінило саме те, що виявилось
+    дефектом: битий файл давав `started_at=0` -> `start_if_new()` True ->
+    ще 3 доби ЖИВОЇ торгівлі через збій файлової системи. Тепер fail-closed."""
     p = tmp_path / "c.json"
     p.write_text("{broken")
     c = SoftStartCampaign(str(p))
     assert c.state.started_at == 0.0
+    assert c._unreadable is True
+    assert c.start_if_new("acct") is False
+    assert c.expired() is True
 
 
 # ---- randomisation --------------------------------------------------------

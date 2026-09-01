@@ -31,6 +31,7 @@ would silently reset the budget and spend forever.
 from __future__ import annotations
 
 import json
+import os
 import logging
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -52,6 +53,20 @@ logger = logging.getLogger(__name__)
 MIN_VIABLE_BALANCE_USDT = 10.0
 
 DEFAULT_MAX_COST_USDT = 5.0
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    """tmp + os.replace: читач бачить або старий файл, або новий, ніколи обрізаний.
+
+    `open(..., "w")` обрізає файл ДО запису (виміряно: розмір 0 одразу після
+    open). Тобто ENOSPC або краш у цьому вікні лишає порожній файл, який
+    читається як «стану немає». Правильний зразок уже лежав у сусідньому
+    модулі — `futures_soft_start.save_state`.
+    """
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, p)
 
 
 @dataclass
@@ -187,12 +202,28 @@ class SoftStartBudget:
                                     st.legacy_spot_cost)
                 return st
             except Exception as e:
-                logger.warning("soft-start budget unreadable (%s) — starting fresh", e)
-        return BudgetState(max_usdt=max_usdt)
+                # Битий файл зберігаємо для розбору — як робить
+                # `futures_soft_start.load_state`. Мовчазне «починаємо з нуля»
+                # ховає єдиний слід того, що облік кампанії загублено.
+                logger.error("soft-start budget UNREADABLE (%s) — облік цієї "
+                             "кампанії втрачено, починаю з нуля", e)
+                try:
+                    p.rename(p.with_suffix(p.suffix + f".corrupt.{int(time.time())}"))
+                except Exception as e2:              # pragma: no cover - fs edge
+                    logger.warning("битий файл бюджету не збережено: %s", e2)
+        # `accounting_version=2` НА СВІЖОМУ СТАНІ.
+        #
+        # З нулем наступне завантаження ловило б `< 2` і сіяло
+        # `legacy_spot_cost = max(0, -spot_flow)`, тоді як ті самі купівлі вже
+        # лежать у `spot_positions`. Виміряно: після битого читання одна
+        # купівля ADA на 5.0 давала legacy 5.0 І позицію на 5.0, тобто
+        # `held_spot_value` 10.0 замість 5.0. Не самолікується: наступний
+        # `_save` заморожує фантом версією 2.
+        return BudgetState(max_usdt=max_usdt, accounting_version=2)
 
     def _save(self) -> None:
         try:
-            Path(self.path).write_text(json.dumps(asdict(self.state), indent=2))
+            _atomic_write_json(self.path, asdict(self.state))
         except Exception as e:
             # Losing this file means losing the ceiling — say so loudly.
             logger.error("soft-start budget SAVE FAILED (%s) — ceiling may reset "

@@ -143,6 +143,28 @@ def public_last_price(symbol: str) -> float | None:
         return None
 
 
+async def _price_async(symbol: str) -> float | None:
+    """`public_last_price` у ПОТОЦІ, а не в event loop.
+
+    ЧОМУ ЦЕ ВАЖЛИВО. `public_last_price` — синхронний `urlopen(timeout=10)`,
+    а всі чотири викликачі — корутини в тому самому процесі й тому самому
+    loop, що й арбітраж (`main.py` тримає soft-start задачу поруч із
+    `binance_ws`/`mexc_ws`). Виміряно в контейнері heartbeat-задачею:
+
+        фон (2с):            найдовша пауза loop = 5.9 мс
+        17 цін поспіль:      1386 мс | найдовша пауза loop = 1387 мс
+
+    17 підряд — це рівно те, що робить `wind_down` по своєму пулу. За кривою
+    Gate 0 секунда сліпоти коштує філів; вона ж накручує `[BOOKLAG]` і псує
+    `shadow_twin`, тобто саме ті дані, що зараз набираються.
+
+    У цій кодовій базі норма — не блокувати: `spot_currency.py` кличе ту саму
+    urllib-функцію через `asyncio.to_thread`, `shadow_engine.py` — через
+    `run_in_executor`. Тобто це був недогляд, а не рішення.
+    """
+    return await asyncio.to_thread(public_last_price, symbol)
+
+
 @dataclass
 class DayPlan:
     date: str
@@ -275,7 +297,7 @@ class SpotSoftStart:
         # долари, а КІЛЬКІСТЬ монет, тож щоб частину ордерів зробити «рівними»
         # (1, 5, 10 монет — як у людини), сайзер має знати ціну. Раніше сума
         # рахувалась до запиту ціни, і прив'язатись до кількості було нічим.
-        px = public_last_price(symbol)
+        px = await _price_async(symbol)
         if not px:
             return False
 
@@ -337,7 +359,25 @@ class SpotSoftStart:
             if self.budget is not None and not res.dry_run:
                 try:
                     _q = float(res.quantity or 0) or (usdt / px)
-                    self.budget.record_spot_buy(token, usdt, _q)
+                    # СОБІВАРТІСТЬ ЗА МІДОМ, а не за сплаченим.
+                    #
+                    # Купівля йде за `px*(1+buffer)`, тож біржа віддає
+                    # `qty = usdt/(px*(1+buffer))`. Записавши сюди `usdt`, ми
+                    # клали собівартість `px*(1+buffer)` за монету, тоді як
+                    # продаж записує виручку по МІДУ (`qty*px`). При геть
+                    # нерухомому ринку це давало `spot_pnl = -usdt*buffer` —
+                    # фантомний збиток. А той самий буфер УЖЕ порахований у
+                    # `spent` через `_order_cost`, тобто спред рахувався ДВІЧІ.
+                    #
+                    # Виміряно на слоті 1: усі 8 продажів відʼємні і центровані
+                    # рівно на ставці буфера (зважено -0.001926 проти
+                    # передбаченого -0.001996), тобто ~96% рядка «спот» — це
+                    # подвійний облік, а не рух ринку.
+                    #
+                    # ПАСТКА ДЛЯ НАСТУПНОГО: «симетрична» правка продажу на
+                    # `qty*px*(1-buffer)` фантом ПОДВОЇТЬ. Обидві ноги мусять
+                    # міряти PnL по міду, а спред жити тільки у `spent`.
+                    self.budget.record_spot_buy(token, _q * px, _q)
                 except Exception:
                     logger.debug("spot buy: облік не оновлено", exc_info=True)
             save_plan(cfg, p)
@@ -381,7 +421,7 @@ class SpotSoftStart:
             seen += 1
             if held <= 0:
                 continue
-            px = public_last_price(f"{token}{self.cfg.quote}")
+            px = await _price_async(f"{token}{self.cfg.quote}")
             if px:
                 total += held * px
         return total if seen else None
@@ -431,7 +471,7 @@ class SpotSoftStart:
                 logger.warning("[wind-down] %s: баланс не прочитано (%s)",
                                symbol, e)
                 continue
-            px = public_last_price(symbol)
+            px = await _price_async(symbol)
             if not px or held <= 0:
                 continue
             holdings.append((token, symbol, held, px, held * px))
@@ -524,7 +564,7 @@ class SpotSoftStart:
             return False
 
         held = float(bals.get(token, {}).get("available", 0) or 0)
-        px = public_last_price(symbol)
+        px = await _price_async(symbol)
         if held <= 0 or not px:
             logger.info("[sell] skip %s — nothing held / no price", symbol)
             return False

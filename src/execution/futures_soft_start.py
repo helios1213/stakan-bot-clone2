@@ -66,6 +66,13 @@ ORDER_TYPE_MARKET = "5"
 # чесно спить секундами (файл виріс з 1.6с до 15.5с на першому ж прогоні).
 HISTORY_RETRY_DELAY_SEC = 1.5
 
+# Скільки разів перепитати біржу, чи відкрилась позиція, коли відповідь на
+# ордер загубилась. Видимість філу на MEXC відстає на ~50-200мс, а швидка
+# мережева відмова повертається за ~150мс — тобто перше читання цілком може
+# застати «нічого немає» там, де позиція вже є.
+PENDING_RECHECKS = 4
+PENDING_RECHECK_DELAY_SEC = 1.5
+
 
 @dataclass
 class FuturesSoftStartConfig:
@@ -465,6 +472,17 @@ class FuturesSoftStart:
         # Size from the WALLET, not from a hardcoded 1 contract. Previously
         # `margin_usdt_*` was computed and then ignored while vol was pinned to
         # 1 — the config looked like it controlled size but did not.
+        # ПРОГРІТИ КЕШ У ПОТОЦІ. `contract_meta` робить два синхронні
+        # `urlopen(timeout=15)`, а ми в тому самому event loop, що й арбітраж.
+        # Кеш per-process, тож мережа тут буває один раз на символ — але цей
+        # один раз коштував би до 30с замороженого loop, якби публічний API
+        # підвис. Після прогріву `_size_position` бере з кеша, без мережі.
+        try:
+            from src.exchanges.mexc_rest import to_mexc as _to_mexc
+            await asyncio.to_thread(self.contract_meta, _to_mexc(sym))
+        except Exception:
+            logger.debug("futures soft-start: прогрів мети не вдався",
+                         exc_info=True)
         vol, margin, notional = self._size_position(sym, leverage, fee_frac)
         if vol is None:
             return False
@@ -725,14 +743,39 @@ class FuturesSoftStart:
         from src.exchanges.mexc_rest import to_mexc
         contract = to_mexc(sym)
 
-        rows = await self._exchange_positions()
-        if rows is None:
-            logger.error("futures soft-start: %s is UNRESOLVED — keeping the "
-                         "pending record and re-checking next tick", sym)
-            return False
+        # РІШЕННЯ ПРО РЕАЛЬНУ ПОЗИЦІЮ НЕ МОЖНА БРАТИ З ОДНОГО СЕМПЛА.
+        #
+        # Тут стояло рівно одне читання з нульовою затримкою, і порожня
+        # відповідь НЕЗВОРОТНО стирала pending. А цей самий проєкт уже виміряв
+        # затримку видимості філу: `live_executor.py` — «MEXC's fill-visibility
+        # lag is ~50-200ms after submit», і схему «одна перевірка» там уже
+        # відкидали після реальної ліквідації (-$25.82, 49 хв голого шорта).
+        # Ризикова саме ШВИДКА відмова (reset / не-JSON при RTT ~150мс) —
+        # рівно в ту смугу.
+        #
+        # Поруч, у цьому ж файлі, `_realised_pnl` ретраїть 4 рази заради суто
+        # ЗВІТНОГО числа. Шлях, що вирішує, чи є експозиція, мусить бути не
+        # менш обережним.
+        rows = None
+        for attempt in range(1, PENDING_RECHECKS + 1):
+            rows = await self._exchange_positions()
+            if rows is None:
+                logger.error("futures soft-start: %s is UNRESOLVED — keeping the "
+                             "pending record and re-checking next tick", sym)
+                return False
+            match = next((r for r in rows
+                          if str(r.get("symbol")) == contract
+                          and self._held(r)), None)
+            if match is not None:
+                break
+            if attempt < PENDING_RECHECKS:
+                logger.info("futures soft-start: %s ще не видно на біржі "
+                            "(спроба %d/%d) — перепитую", sym, attempt,
+                            PENDING_RECHECKS)
+                await asyncio.sleep(PENDING_RECHECK_DELAY_SEC * attempt)
+        else:
+            match = None
 
-        match = next((r for r in rows
-                      if str(r.get("symbol")) == contract and self._held(r)), None)
         if match is None:
             logger.info("futures soft-start: %s did not open after all — "
                         "clearing the pending record", sym)

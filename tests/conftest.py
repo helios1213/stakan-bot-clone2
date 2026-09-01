@@ -93,6 +93,7 @@ def _fast_waits(request, monkeypatch):
     try:
         from src.execution import futures_soft_start as _fss
         monkeypatch.setattr(_fss, "HISTORY_RETRY_DELAY_SEC", 0.001)
+        monkeypatch.setattr(_fss, "PENDING_RECHECK_DELAY_SEC", 0.001)
     except Exception:
         pass
 

@@ -61,6 +61,10 @@ def is_ok(resp: dict | None) -> bool:
     return bool(resp) and str(resp.get("code")) in _OK_CODES
 
 
+class SpotBalancesUnavailable(RuntimeError):
+    """Баланси не прочитані. Це НЕ «монет немає» — розрізняти обовʼязково."""
+
+
 @dataclass
 class OrderResult:
     ok: bool
@@ -191,8 +195,13 @@ class SpotWebClient:
         url = f"{BALANCES_URL}?coinId={','.join(currency_ids)}"
         r = await s.get(url, headers=self._headers(), timeout=self._timeout)
         if r.status_code != 200:
+            # НЕ `{}`: порожній словник неможливо відрізнити від «монет немає»,
+            # і споживач мовчки читав його як `free = 0.00`, друкуючи в лог
+            # СТВЕРДЖЕННЯ «вільного USDT лише 0.00». Виняток вмикає гілку
+            # `free = None` («не прочитали — не гейтимо»), яка для цього й
+            # написана, але ловила лише мережеві збої.
             logger.warning("spot balances HTTP %s", r.status_code)
-            return {}
+            raise SpotBalancesUnavailable(f"spot balances HTTP {r.status_code}")
         out: dict[str, dict] = {}
         for row in (r.json().get("data") or []):
             cur = row.get("currency")
