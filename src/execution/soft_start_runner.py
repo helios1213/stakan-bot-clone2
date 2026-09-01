@@ -25,6 +25,7 @@ Safety:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -89,6 +90,9 @@ class SlotWarmer:
         # Set once OFF has been requested: the slot may still have to be
         # drained, but it must never trade again.
         self.draining = False
+        self._wind_passes = 0
+        self._fut_bal_ok = False
+        self._spot_total = 0.0
         # Останній надрукований зважений план — щоб рядок не повторювався
         # щотіку (тік іде раз на POLL_SEC, а план змінюється раз на добу).
         self._weighted_logged: tuple | None = None
@@ -187,10 +191,46 @@ class SlotWarmer:
         logger.info("soft-start slot %d: balances spot=%.2f futures=%.2f USDT",
                     self.slot_id, spot_bal, fut_bal)
 
-        # Sizing scales with the balance: 25 USDT warms gently, 50 warms harder,
-        # same config object either way.
-        sizing = scale_spot_config(spot_bal)
+        # КАМПАНІЮ ВИРІШУЄМО ПЕРШОЮ, і лише потім розігруємо набір токенів.
+        #
+        # Було навпаки: `_spot_universe()` кликав `campaign.token_pool()`, той
+        # запамʼятовував набір у стані кампанії, а `start_if_new()` через
+        # чверть секунди створював НОВИЙ стан і набір стирав. Живий лог слота 2
+        # 01.09: `12:47:17.797 спотовий набір ['ADA','MX','TRX']` ->
+        # `12:47:18.041 старт (новий акаунт)` -> у файлі кампанії tokens=[].
+        # Наслідок не косметичний: `maybe_sell` бере токен лише з денного
+        # плану, тож монети старого набору неможливо продати до самого
+        # розпродажу (ADA на 1.66 USDT саме так і зависла).
+        started = self.campaign.start_if_new(self._account_key)
+        if started:
+            # НОВА КАМПАНІЯ -> ЧИСТИЙ ОБЛІК. Бюджет і денний план належали
+            # ПОПЕРЕДНІЙ кампанії (а при заміні вебкея — взагалі іншому
+            # акаунту): його витрати, його позиції за собівартістю, його
+            # legacy-монети. Лишити їх означало б рахувати чужі гроші як свої.
+            self._reset_accounting()
+
         tokens = await self._spot_universe()
+        # ВАРТІСТЬ МОНЕТ — ПО ВСІХ КАНДИДАТАХ, не лише по набору цієї кампанії.
+        # Монети накопичуються за всю історію слота; міряючи лише поточні 3-5
+        # токенів, ми занижуємо спотову вартість і можемо вимкнути половину за
+        # порогом, маючи гроші (та сама природа, що й дедлок 31.08).
+        coins_val = 0.0
+        try:
+            coins_val = await self.spot_client_coins_value(
+                list(dict.fromkeys(list(tokens) + list(SPOT_CANDIDATES))))
+        except Exception:
+            logger.debug("soft-start slot %d: вартість монет не прочитана",
+                         self.slot_id, exc_info=True)
+        self._spot_total = spot_bal + coins_val
+
+        # САЙЗИНГ ВІД ПОВНОЇ СПОТОВОЇ ВАРТОСТІ, не від вільного USDT.
+        #
+        # `scale_spot_config(3.24)` дає денну стелю 3.24 — тобто ДВІ покупки на
+        # добу замість 21 із плану. Живий лог слота 2 31.08: `спот — вільних
+        # 3.24 + монет 22.51 = 25.76`, а далі 8 поспіль
+        # `skip MXUSDT — daily ceiling 3 (spent 2.54)`. Гроші на місці, план
+        # мертвий: USDT просто перетворився на монети, які план не бачить.
+        sizing = scale_spot_config(self._spot_total)
         spot_cfg = SoftStartConfig(
             universe=tuple(tokens),
             state_path=f"{self.data_dir}/spot_soft_start_slot{self.slot_id}.json",
@@ -222,20 +262,14 @@ class SlotWarmer:
         # USDT потрібен лише для КУПІВЛІ; для продажу потрібні монети, і їх
         # вистачає. Тому поріг рахується від повної спотової вартості, а
         # неможливість купити гейтиться окремо, у `maybe_buy`.
-        coins_val = 0.0
-        try:
-            coins_val = await self.spot_client_coins_value(tokens)
-        except Exception:
-            logger.debug("soft-start slot %d: вартість монет не прочитана",
-                         self.slot_id, exc_info=True)
-        spot_total = spot_bal + coins_val
+        spot_total = self._spot_total
         self._spot_viable = spot_total >= MIN_VIABLE_BALANCE_USDT
         if coins_val:
             logger.info("soft-start slot %d: спот — вільних %.2f + монет %.2f "
                         "= %.2f USDT", self.slot_id, spot_bal, coins_val,
                         spot_total)
-        self._fut_viable = (fut_bal >= MIN_VIABLE_BALANCE_USDT
-                            and self.futures_allowed)
+        self._fut_bal_ok = fut_bal >= MIN_VIABLE_BALANCE_USDT
+        self._fut_viable = self._fut_bal_ok and self.futures_allowed
         if not self.futures_allowed:
             logger.warning("soft-start slot %d: the arb strategy is LIVE on this "
                            "slot — the futures half stays idle (two systems on "
@@ -248,13 +282,6 @@ class SlotWarmer:
                                "— that half stays idle", self.slot_id, name, bal,
                                MIN_VIABLE_BALANCE_USDT)
 
-        started = self.campaign.start_if_new(self._account_key)
-        if started:
-            # НОВА КАМПАНІЯ -> ЧИСТИЙ ОБЛІК. Бюджет і денний план належали
-            # ПОПЕРЕДНІЙ кампанії (а при заміні вебкея — взагалі іншому
-            # акаунту): його витрати, його позиції за собівартістю, його
-            # legacy-монети. Лишити їх означало б рахувати чужі гроші як свої.
-            self._reset_accounting()
         if started and self.reporter is not None:
             try:
                 await self.reporter.campaign_started(self.campaign.state.days,
@@ -512,10 +539,21 @@ class SlotWarmer:
                         + list(SPOT_CANDIDATES)))
                     sent = await self.spot.wind_down(SPOT_WIND_DOWN_KEEP,
                                                      tokens=_pool)
-                    if sent:
-                        logger.info("soft-start slot %d: розпродаж — %d ордер(ів)",
-                                    self.slot_id, sent)
+                    self._wind_passes += 1
+                    if sent and self._wind_passes < MAX_WIND_DOWN_PASSES:
+                        logger.info("soft-start slot %d: розпродаж — %d ордер(ів)"
+                                    " (прохід %d/%d)", self.slot_id, sent,
+                                    self._wind_passes, MAX_WIND_DOWN_PASSES)
                         return          # ще один тік на решту
+                    if sent:
+                        # Стеля потрібна саме тому, що `finished()` тепер чекає
+                        # на `_wound_down`: розпродаж, який відправляє ордери
+                        # без збіжності (біржа їх відхиляє), інакше тримав би
+                        # кампанію відкритою назавжди.
+                        logger.warning("soft-start slot %d: розпродаж не збігся "
+                                       "за %d проходів — зупиняюсь, монети "
+                                       "лишаються", self.slot_id,
+                                       MAX_WIND_DOWN_PASSES)
                     self._wound_down = True
                     # ПЕРЕМІРЯТИ ПІСЛЯ РОЗПРОДАЖУ, ігноруючи тротл.
                     #
@@ -564,7 +602,17 @@ class SlotWarmer:
         """True when this slot has nothing left to do: campaign over or budget spent."""
         # Кампанія закінчується ЛИШЕ за часом (3 дні). Стелю витрат прибрано
         # свідомо: прогрів має гріти, а не впиратись у ліміт.
-        return self.campaign.expired()
+        if not self.campaign.expired():
+            return False
+        # РОЗПРОДАЖ МУСИТЬ ЗАВЕРШИТИСЬ ПЕРШИМ. `tick()` виходить після кожної
+        # пачки ордерів із коментарем «ще один тік на решту» — але того тіку
+        # не було НІКОЛИ: цикл питає `finished()` у ТІЙ САМІЙ ітерації,
+        # отримує True і одразу друкує фінальний звіт. Тому у звіт ішла
+        # вартість монет, знята ДО продажу (виміряно: 30.0 у звіті проти 6.0
+        # на біржі), а `campaign.finish()` не виконувався взагалі.
+        if self._spot_viable and not self._wound_down:
+            return False
+        return True
 
     async def _drain_futures(self) -> bool:
         """Resolve any open question, close any open position. True when clean."""
@@ -582,6 +630,25 @@ class SlotWarmer:
             logger.exception("soft-start slot %d: draining futures failed",
                              self.slot_id)
         return not f.has_exposure()
+
+    def set_futures_allowed(self, allowed: bool) -> None:
+        """Перечитати гард C4 на живому warmer-і.
+
+        `futures_allowed` читався РІВНО ОДИН РАЗ — у конструкторі, з
+        `not slot.live_enabled`. Цикл warmer не перестворює, тож вмикання
+        живого арбітражу на слоті, який уже гріється, гард не помічало:
+        фʼючерсна половина продовжувала відкривати позиції поруч із арбом.
+        Далі реконсайлер бачить прогрівну позицію як сироту, закриває її по
+        ринку і пише її PnL у кіл просадки арбітражного слота.
+        """
+        if bool(allowed) == bool(self.futures_allowed):
+            return
+        self.futures_allowed = bool(allowed)
+        self._fut_viable = bool(allowed) and getattr(self, "_fut_bal_ok", False)
+        logger.warning("soft-start slot %d: живий арбітраж %s — фʼючерсна "
+                       "половина %s", self.slot_id,
+                       "УВІМКНЕНО" if not allowed else "вимкнено",
+                       "зупиняється" if not allowed else "може працювати")
 
     async def stop(self) -> bool:
         """Close anything still open before this slot stops being warmed.
@@ -611,6 +678,11 @@ class SlotWarmer:
 # How many failed OFF-closes between operator alerts. The retry itself runs
 # every poll; the alert is throttled so a stuck slot does not spam Telegram.
 STUCK_ALERT_EVERY = 30
+
+# Скільки проходів розпродажу максимум. Кожен прохід — одна пачка ордерів;
+# збіжний розпродаж укладається у 1-2. Стеля існує лише щоб відхилені біржею
+# ордери не тримали кампанію відкритою нескінченно.
+MAX_WIND_DOWN_PASSES = 6
 
 
 async def _alert_stuck(w, slot_id: int) -> None:
@@ -654,6 +726,72 @@ async def _final_report(w, slot_id: int, reason: str, *, position_left: bool) ->
         logger.exception("soft-start slot %d: final report failed", slot_id)
 
 
+async def _sweep_orphan_futures(store, client_pool, slots, warmers,
+                                universe_provider, dry_run, alerts,
+                                data_dir: str = "/app/data") -> None:
+    """Закрити прогрівну позицію на слоті, який БІЛЬШЕ НЕ ГРІЄТЬСЯ.
+
+    `recover()` має рівно одного викликача — `SlotWarmer.start()`, а той
+    виконується лише для слотів у `wanted` (кнопка ON і вебкей на місці).
+    Тобто позиція, залишена відкритою, ставала невидимою одразу, щойно
+    оператор гасив кнопку або міняв ключ — а обіцянка в лозі
+    («restart the bot to let recover() do it») ставала хибною. Реконсайлер
+    арбітражу її теж не бачить: він ходить тільки по live-екзекуторах, а
+    фʼючерсний прогрів працює рівно при `live_enabled=0`.
+
+    Тут ми ДИВИМОСЬ У ФАЙЛ СТАНУ (дешево, без мережі) і піднімаємо рушій лише
+    тоді, коли там справді щось відкрите.
+    """
+    for slot in slots:
+        sid = slot.slot_id
+        if sid in warmers or not getattr(slot, "webkey", None):
+            continue
+        if getattr(slot, "soft_start_enabled", False):
+            continue                       # ним займається звичайний шлях
+        path = f"{data_dir}/futures_soft_start_slot{sid}.json"
+        try:
+            if not os.path.exists(path):
+                continue
+            raw = json.loads(open(path).read())
+        except Exception:
+            # Нечитабельний файл — це НЕ «позиції немає». Далі рушій сам
+            # спитає біржу (`needs_exchange_check`).
+            raw = {"needs_exchange_check": True}
+        if not (raw.get("position") or raw.get("pending")
+                or raw.get("needs_exchange_check")):
+            continue
+
+        if getattr(slot, "live_enabled", False):
+            # НЕ закриваємо самі: `close_all_positions` символо-широкий і зніс
+            # би арбітражну позицію, якби символи збіглись.
+            logger.critical("soft-start slot %d: лишилась ВІДКРИТА прогрівна "
+                            "позиція, але на слоті увімкнено живий арбітраж — "
+                            "закрий її вручну", sid)
+            if alerts is not None:
+                try:
+                    await alerts.send(
+                        f"⚠️ SLOT {sid}: прогрівна позиція лишилась відкритою, "
+                        f"а на слоті живий арбітраж — закрий її вручну")
+                except Exception:
+                    logger.debug("alert failed", exc_info=True)
+            continue
+
+        logger.warning("soft-start slot %d: прогрів вимкнено, але позиція "
+                       "лишилась відкритою — закриваю", sid)
+        try:
+            client = await client_pool.get(sid)
+            fss = FuturesSoftStart(
+                client, FeeGate(client), universe_provider(),
+                FuturesSoftStartConfig(state_path=path),
+                dry_run=dry_run, rng=random.Random())
+            await fss.recover()
+            if fss.has_exposure():
+                logger.error("soft-start slot %d: позицію закрити НЕ вдалось — "
+                             "спробую на наступному полі", sid)
+        except Exception:
+            logger.exception("soft-start slot %d: дозакриття впало", sid)
+
+
 async def soft_start_loop(store, client_pool, universe_provider,
                           poll_sec: int = POLL_SEC, alerts=None) -> None:
     """Keep warming engines in sync with the per-slot button.
@@ -671,6 +809,9 @@ async def soft_start_loop(store, client_pool, universe_provider,
             slots = await store.list_all()
             wanted = {s.slot_id for s in slots
                       if getattr(s, "soft_start_enabled", False) and s.webkey}
+
+            await _sweep_orphan_futures(store, client_pool, slots, warmers,
+                                        universe_provider, dry_run, alerts)
 
             # Stop warmers whose button was switched off. A warmer is dropped
             # ONLY once it is clean — while a close keeps failing it stays here
@@ -711,10 +852,56 @@ async def soft_start_loop(store, client_pool, universe_provider,
                     if w is not None and getattr(w, "futures", None) is not None:
                         warmers[sid] = w        # it may already hold a position
 
+            by_slot = {s_.slot_id: s_ for s_ in slots}
+
             # Tick each independently — one bad slot must not stop the others.
             for sid, w in list(warmers.items()):
                 if w.draining:
-                    continue          # OFF requested; the stop path retries it
+                    # РЕТРАЙ ЗАКРИТТЯ ДЛЯ АВТОЗАВЕРШЕНОЇ КАМПАНІЇ.
+                    #
+                    # Тут стояв голий `continue`, і warmer, що потрапив у
+                    # дренаж через ЗАВЕРШЕННЯ КАМПАНІЇ (а не через кнопку),
+                    # більше не бачив жодного виклику `stop()`: кнопку свідомо
+                    # не гасять, поки позиція відкрита, тож гілка
+                    # `slot_id not in wanted` вище його не бере, гілка старту
+                    # пропускає (`sid in warmers`), а сюди він не доходив.
+                    # Виміряно: 8 полів -> 1 спроба закриття. Позиція з плечем
+                    # висіла на біржі без дедлайну (`tick()` заблоковано, тож
+                    # `close_after` ніхто не перевіряв), без ретраїв і без
+                    # повторних алертів (`_stop_attempts` замерзав на 1).
+                    #
+                    # Слот, знятий КНОПКОЮ, ретраїться гілкою вище — сюди він
+                    # заходити не має, інакше було б по дві спроби на полл.
+                    if sid not in wanted:
+                        continue
+                    try:
+                        clean = await w.stop()
+                    except Exception:
+                        logger.exception("soft-start slot %d: повторне закриття "
+                                         "впало", sid)
+                        clean = False
+                    if not clean:
+                        await _alert_stuck(w, sid)
+                        continue
+                    logger.info("soft-start slot %d: позицію закрито з ретраю "
+                                "— вимикаю слот", sid)
+                    try:
+                        await store.set_soft_start(sid, False)
+                    except Exception:
+                        logger.exception("soft-start slot %d: auto-off failed", sid)
+                    warmers.pop(sid, None)
+                    continue
+
+                # Гард C4 перечитується ЩОПОЛЛА: живий арбітраж могли увімкнути
+                # вже після того, як warmer створився.
+                _slot = by_slot.get(sid)
+                if _slot is not None:
+                    try:
+                        w.set_futures_allowed(
+                            not getattr(_slot, "live_enabled", False))
+                    except Exception:
+                        logger.exception("soft-start slot %d: гард C4 не "
+                                         "оновлено", sid)
                 try:
                     await w.tick()
                 except Exception:

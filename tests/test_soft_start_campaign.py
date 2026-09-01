@@ -605,6 +605,7 @@ async def test_expired_campaign_winds_down_before_switching_off():
     w.slot_id = 1
     w.draining = False
     w._wound_down = False
+    w._wind_passes = 0   # мусить дзеркалити __init__
     w._spot_viable = True
     w.campaign = _Camp()
     w.spot = _Spot()
@@ -638,6 +639,7 @@ async def test_wind_down_gets_another_tick_while_it_still_sells():
     w.slot_id = 1
     w.draining = False
     w._wound_down = False
+    w._wind_passes = 0   # мусить дзеркалити __init__
     w._spot_viable = True
     w.campaign = _Camp()
     w.spot = _Spot()
@@ -669,6 +671,7 @@ async def test_a_failing_wind_down_does_not_wedge_the_slot_forever():
     w.slot_id = 1
     w.draining = False
     w._wound_down = False
+    w._wind_passes = 0   # мусить дзеркалити __init__
     w._spot_viable = True
     w.campaign = _Camp()
     w.spot = _Spot()
@@ -702,6 +705,7 @@ async def test_runner_passes_the_full_token_pool_to_wind_down():
     w.slot_id = 1
     w.draining = False
     w._wound_down = False
+    w._wind_passes = 0   # мусить дзеркалити __init__
     w._spot_viable = True
     w.campaign = _Camp()
     w.spot = _Spot()

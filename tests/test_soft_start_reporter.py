@@ -943,6 +943,7 @@ async def test_held_value_is_remeasured_after_the_wind_down():
     w.slot_id = 2
     w.draining = False
     w._wound_down = False
+    w._wind_passes = 0   # мусить дзеркалити __init__
     w._spot_viable = True
     w._held_market = 9.49                # стале значення ДО продажу
     w._held_market_at = 10 ** 12         # «щойно міряли» -> тротл мав би блокувати

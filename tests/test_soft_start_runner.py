@@ -81,6 +81,11 @@ class FakeWarmer:
     """
     # сторож дрейфу: цикл читає це у SlotWarmer
     held_is_measured = False
+
+    def set_futures_allowed(self, allowed):
+        # Гард C4 перечитується щополла — фейк мусить це вміти.
+        self.futures_allowed = allowed
+
     made: list["FakeWarmer"] = []
     # What stop() reports on a freshly built warmer. The loop builds its own
     # warmers, so a test that needs a stuck slot sets this before the pass.
