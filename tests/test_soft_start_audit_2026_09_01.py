@@ -1059,3 +1059,55 @@ async def test_http_200_with_a_null_body_is_not_read_as_zero_funds():
 
     with pytest.raises(SpotBalancesUnavailable):
         await c.balances(["cid"])
+
+
+def test_the_final_report_is_fed_the_campaign_counters(monkeypatch):
+    """ДІРА §3.3.
+
+    `_final_report` бере підсумки з КАМПАНІЇ (`stats`, `elapsed_hours`), бо
+    лічильники репортера обнуляються на кожному рестарті — саме це давало
+    «spot 0 buys, Ran for 14.0h» після 3 діб (баг 29.08). Прибирання цих двох
+    аргументів лишало сюїту зеленою: єдиний тест, що їх торкався, пінив лише
+    ФАКТ виклику звіту, а не його вміст.
+    """
+    import inspect
+
+    from src.execution import soft_start_runner as ssr
+
+    src = inspect.getsource(ssr._final_report)
+    assert "stats=" in src and "elapsed_h=" in src, (
+        "фінальний звіт більше не отримує підсумків кампанії — він знову "
+        "друкуватиме лічильники репортера, обнулені рестартом")
+
+    captured = {}
+
+    class _Rep:
+        async def final_report(self, reason, **kw):
+            captured.update(kw)
+
+    class _W:
+        slot_id = 1
+        reporter = _Rep()
+        _final_sent = False
+        futures = None
+        held_is_measured = True
+        campaign = type("C", (), {
+            "elapsed_hours": lambda self: 72.0,
+            "expired": lambda self: True,
+            "state": type("S", (), {"stats": {"spot_buys": 13,
+                                              "futures_opens": 7}})(),
+        })()
+        budget = type("B", (), {"spent": 0.53, "futures_pnl": 0.43,
+                                "spot_pnl": -0.01, "pnl": 0.42,
+                                "state": type("S", (), {"max_usdt": 5.0,
+                                                        "entries": []})()})()
+
+        def _held_spot_value(self):
+            return 6.19
+
+    asyncio.run(ssr._final_report(_W(), 1, "campaign finished",
+                                  position_left=False))
+
+    assert captured.get("stats", {}).get("spot_buys") == 13, (
+        f"лічильники кампанії не дійшли до звіту: {captured.get('stats')}")
+    assert captured.get("elapsed_h") == pytest.approx(72.0)
