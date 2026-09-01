@@ -713,50 +713,104 @@ async def test_runner_passes_the_full_token_pool_to_wind_down():
 
 
 @pytest.mark.asyncio
-async def test_runner_bumps_campaign_counters_on_every_action():
-    """ПРОВОДКА — восьмий за сесію тест саме на виклик.
+async def test_engines_count_actions_without_a_reporter():
+    """ЛІЧИЛЬНИКИ ПЕРЕЇХАЛИ В РУШІЇ, і ось чому.
 
-    `bump()` може бути ідеальним і невживаним: тоді підсумковий звіт знову
-    покаже нулі, як 29.08. Тут перевіряється, що дифер реально рахує.
+    Раніше вони рахувались диференціюванням знімків у `_report_diff`, а той
+    починається з `if self.reporter is None: return` — тобто **без Telegram
+    не рахувалось нічого**. Плюс диф порівнює знімки між тіками і губить
+    дію, що почалась і скінчилась між ними.
+
+    Тепер рахує сам рушій, рівно один раз на успішний ордер.
     """
+    import random
+    from src.execution.spot_soft_start import (DayPlan, SoftStartConfig,
+                                               SpotSoftStart)
+    seen = []
+    e = SpotSoftStart.__new__(SpotSoftStart)
+    e.on_action = lambda kind, n=1: seen.append((kind, n))
+    e.cfg = SoftStartConfig()
+    e.rng = random.Random(1)
+    e._count("spot_buys")
+    e._count("spot_sells", 2)
+    assert seen == [("spot_buys", 1), ("spot_sells", 2)]
+
+
+def test_counting_never_breaks_trading():
+    """Облік не має ламати торгівлю: збій лічильника ковтається."""
+    import random
+    from src.execution.spot_soft_start import SoftStartConfig, SpotSoftStart
+    e = SpotSoftStart.__new__(SpotSoftStart)
+    e.cfg = SoftStartConfig()
+    e.rng = random.Random(1)
+    e.on_action = lambda kind, n=1: (_ for _ in ()).throw(OSError("диск"))
+    e._count("spot_buys")          # не має кинути
+    e.on_action = None
+    e._count("spot_buys")          # і без колбека теж
+
+
+@pytest.mark.asyncio
+async def test_runner_wires_the_counter_into_both_engines(monkeypatch,
+                                                          tmp_path):
+    """ПРОВОДКА, ВИКОНАННЯМ. Рушії мусять ОТРИМАТИ `campaign.bump` — інакше
+    вони рахують у порожнечу, і підсумок знову покаже занижені числа.
+
+    Перевіряємо не текст, а те, що прийшло в конструктори і що виклик
+    колбека справді доходить до кампанії.
+    """
+    from src.execution import soft_start_runner as ssr
     from src.execution.soft_start_runner import SlotWarmer
 
+    got = {}
     bumped = []
 
-    class _Camp:
-        state = type("S", (), {"stats": {}, "day_index": lambda self: 0,
-                               "days": 3})()
-        def bump(self, key, n=1): bumped.append((key, n))
-        def day_weight(self): return 1.0
+    def _spot(*a, **kw):
+        got["spot"] = kw.get("on_action")
+        return object()
 
-    class _Rep:
-        async def spot_buy(self, *a, **k): pass
-        async def spot_sell(self, *a, **k): pass
-        async def futures_open(self, *a, **k): pass
-        async def futures_close(self, *a, **k): pass
+    def _fut(*a, **kw):
+        got["fut"] = kw.get("on_action")
+        return type("F", (), {
+            "state": type("S", (), {"position": None, "pending": None})(),
+            "recover": lambda self: _noop()})()
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(ssr, "SpotSoftStart", _spot)
+    monkeypatch.setattr(ssr, "FuturesSoftStart", _fut)
 
     w = SlotWarmer.__new__(SlotWarmer)
     w.slot_id = 1
-    w._held_market = None
-    w._held_market_at = 0.0
-    w.reporter = _Rep()
-    w.campaign = _Camp()
-    w.budget = type("B", (), {"spent": 0.0, "pnl": 0.0, "futures_pnl": 0.0, "spot_pnl": 0.0,
-                              "held_spot_value": 0.0,
-                              "state": type("S2", (), {"max_usdt": 0.0,
-                                                       "entries": []})()})()
-    w.spot = type("S", (), {"cfg": type("C", (), {"order_usdt_max": 3.0})(),
-                            "last_action": {"symbol": "MXUSDT", "usdt": 1.5,
-                                            "qty": "1"}})()
-    w.futures = type("F", (), {"state": type("St", (), {"position": None})(),
-                               "last_closed": None})()
+    w.data_dir = str(tmp_path)
+    w.dry_run = True
+    w.universe = ["HYPEUSDT"]
+    w.client = object(); w.spot_client = object(); w.fee_gate = object()
+    w.futures_allowed = True; w.reporter = None; w._account_key = "acc"
+    w.budget = type("B", (), {"reset": lambda self: None})()
+    w.campaign = type("C", (), {
+        "start_if_new": lambda self, k: False,
+        "bump": lambda self, kind, n=1: bumped.append((kind, n)),
+        "token_pool": lambda self, c: ["MX"],
+        "state": type("S", (), {"days": 3, "tokens": ["MX"],
+                                "day_index": lambda self: 0,
+                                "remaining_days": lambda self: 1.0})(),
+    })()
 
-    # 2 купівлі + 1 продаж + відкриття
-    await SlotWarmer._report_diff(w, (0, 0, 0, None), (2, 1, 1, "PEPEUSDT"))
-    d = dict(bumped)
-    assert d.get("spot_buys") == 2, bumped
-    assert d.get("spot_sells") == 1, bumped
-    assert "futures_opens" in d, bumped
+    async def _bal(): return (50.0, 50.0)
+    async def _uni(): return ["MX"]
+    async def _coins(t): return 0.0
+    w._read_balances = _bal; w._spot_universe = _uni
+    w.spot_client_coins_value = _coins
+
+    await SlotWarmer.start(w)
+
+    assert got.get("spot") is not None, "спотовий рушій без лічильника"
+    assert got.get("fut") is not None, "фʼючерсний рушій без лічильника"
+    # і колбек справді веде до кампанії, а не в порожнечу
+    got["spot"]("spot_buys", 1)
+    got["fut"]("futures_opens", 1)
+    assert bumped == [("spot_buys", 1), ("futures_opens", 1)], bumped
 
 
 @pytest.mark.asyncio

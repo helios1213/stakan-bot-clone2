@@ -667,6 +667,7 @@ async def test_start_resets_accounting_only_for_a_new_campaign(monkeypatch,
         w.budget = type("B", (), {"reset": lambda self: None})()
         w.campaign = type("C", (), {
             "start_if_new": lambda self, k: new_campaign,
+        "bump": lambda self, kind, n=1: None,
             "token_pool": lambda self, c: ["MX"],
             "state": type("S", (), {"days": 3, "tokens": ["MX"],
                                     "day_index": lambda self: 0,
@@ -721,6 +722,7 @@ async def test_spot_stays_alive_when_usdt_is_spent_but_coins_remain(monkeypatch,
     w.budget = type("B", (), {"reset": lambda self: None})()
     w.campaign = type("C", (), {
         "start_if_new": lambda self, k: False,
+        "bump": lambda self, kind, n=1: None,
         "token_pool": lambda self, c: ["ADA", "MX", "TRX"],
         "state": type("S", (), {"days": 3, "tokens": ["ADA"],
                                 "day_index": lambda self: 0,
@@ -766,6 +768,7 @@ async def test_spot_half_still_idles_when_there_is_truly_nothing(monkeypatch,
     w.budget = type("B", (), {"reset": lambda self: None})()
     w.campaign = type("C", (), {
         "start_if_new": lambda self, k: False,
+        "bump": lambda self, kind, n=1: None,
         "token_pool": lambda self, c: ["MX"],
         "state": type("S", (), {"days": 3, "tokens": ["MX"],
                                 "day_index": lambda self: 0,

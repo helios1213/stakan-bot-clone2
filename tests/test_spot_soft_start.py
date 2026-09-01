@@ -630,3 +630,89 @@ async def test_unreadable_free_balance_does_not_stop_buying(tmp_path,
                      sells_target=0)
     assert await e.maybe_buy() is True
     assert [o for o in c.orders if o[0] == "BUY"]
+
+
+# ---- кожна успішна дія має бути порахована (2026-09-01) --------------------
+
+@pytest.mark.asyncio
+async def test_a_successful_buy_is_counted(tmp_path, monkeypatch):
+    """Одинадцятий за сесію тест ПРОВОДКИ: `_count` може бути правильним і
+    невживаним. Мутант, що прибирає виклик із `maybe_buy`, проходив зеленим,
+    поки тест перевіряв лише сам `_count`."""
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    seen = []
+    e = SpotSoftStart(FakeClient(), cfg(tmp_path, universe=("PENGU",),
+                                        order_usdt_min=1.5, order_usdt_max=2.0),
+                      rng=random.Random(1),
+                      on_action=lambda k, n=1: seen.append(k))
+    e.plan = DayPlan(date=e.plan.date, tokens=["PENGU"], buys_target=3,
+                     sells_target=0)
+    assert await e.maybe_buy() is True
+    assert seen == ["spot_buys"], seen
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_buy_is_not_counted(tmp_path, monkeypatch):
+    """Рахуємо ОРДЕРИ, що пройшли, а не спроби — інакше підсумок роздувався б
+    відмовами біржі."""
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    seen = []
+    e = SpotSoftStart(FakeClient(ok=False), cfg(tmp_path, universe=("PENGU",),
+                                                order_usdt_min=1.5,
+                                                order_usdt_max=2.0),
+                      rng=random.Random(1),
+                      on_action=lambda k, n=1: seen.append(k))
+    e.plan = DayPlan(date=e.plan.date, tokens=["PENGU"], buys_target=3,
+                     sells_target=0)
+    assert await e.maybe_buy() is False
+    assert seen == [], seen
+
+
+@pytest.mark.asyncio
+async def test_a_successful_sell_is_counted(tmp_path, monkeypatch):
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    seen = []
+    e = SpotSoftStart(FakeClient(held=50.0),
+                      cfg(tmp_path, universe=("PENGU",), order_usdt_min=1.0,
+                          baseline_usdt_per_token=1.0),
+                      rng=random.Random(1),
+                      on_action=lambda k, n=1: seen.append(k))
+    e.plan = DayPlan(date=e.plan.date, tokens=["PENGU"], buys_target=0,
+                     sells_target=3)
+    assert await e.maybe_sell() is True
+    assert seen == ["spot_sells"], seen
+
+
+@pytest.mark.asyncio
+async def test_wind_down_sells_are_counted_too(tmp_path, monkeypatch):
+    """Розпродаж — теж продажі, і у фінальному звіті вони мають бути видні."""
+    from src.execution.spot_soft_start import (DayPlan, SpotSoftStart,
+                                               USDT_CURRENCY_ID)
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
+                        lambda s: 1.0)
+    seen = []
+
+    class _Cl:
+        async def currency(self, t):
+            return type("C", (), {"currency_id": "id-" + t})()
+        async def balances(self, ids):
+            if ids[0] == USDT_CURRENCY_ID:
+                return {"USDT": {"available": 0.0}}
+            return {ids[0].replace("id-", ""): {"available": 20.0}}
+        async def sell(self, ticker, *, quantity, price):
+            from src.execution.webkey.spot_client import OrderResult
+            return OrderResult(True, False, ticker, "SELL", str(price),
+                               str(quantity), {"code": 200})
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("MX",), order_usdt_min=0.5),
+                      rng=random.Random(1),
+                      on_action=lambda k, n=1: seen.append(k))
+    e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
+    assert await e.wind_down(0.20, tokens=["MX"]) == 1
+    assert seen == ["spot_sells"], seen

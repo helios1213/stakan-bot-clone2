@@ -218,7 +218,7 @@ class FuturesSoftStart:
     def __init__(self, client, fee_gate, universe: list[str],
                  cfg: FuturesSoftStartConfig | None = None,
                  *, dry_run: bool = True, rng: random.Random | None = None,
-                 budget=None, balance_usdt: float | None = None) -> None:
+                 budget=None, balance_usdt: float | None = None, on_action=None) -> None:
         # `budget`: shared spend ceiling (None = uncapped). `balance_usdt`: the
         # futures wallet, used to size the position and to refuse one that would
         # tie up too much of the account. Both optional so existing callers and
@@ -233,6 +233,9 @@ class FuturesSoftStart:
         # Деталі останнього закриття — читає раннер для звіту (тримання, PnL).
         # Раніше звіт друкував «after 0min», бо тривалості не було звідки взяти.
         self.last_closed: dict | None = None
+        # Лічильник дій кампанії — див. коментар у spot_soft_start: диф у
+        # раннері стояв за перевіркою репортера і губив короткі цикли.
+        self.on_action = on_action
         # Наша ОЦІНКА комісії за round-trip останнього відкриття — щоб на
         # закритті звірити її з тим, що біржа взяла насправді.
         self._last_fee_estimate: float = 0.0
@@ -516,6 +519,7 @@ class FuturesSoftStart:
         self.state.position = asdict(pos)
         self.state.pending = None
         self.state.orders_done += 1
+        self._count("futures_opens")
         save_state(c.state_path, self.state)
         # Charge the round trip up front: both crossings and a possible funding
         # settlement are known now, and booking them at open means the ceiling
@@ -589,9 +593,19 @@ class FuturesSoftStart:
                 self.budget.record_pnl(realised, f"futures {pos.symbol}")
             except Exception:
                 logger.debug("futures soft-start: PnL не записано", exc_info=True)
+        self._count("futures_closes")
         self.state.position = None
         save_state(self.cfg.state_path, self.state)
         return True
+
+    def _count(self, kind: str, n: int = 1) -> None:
+        if not self.on_action:
+            return
+        try:
+            self.on_action(kind, n)
+        except Exception:
+            logger.debug("[futures] лічильник %s не оновлено", kind,
+                         exc_info=True)
 
     async def _realised_pnl(self, pos) -> float | None:
         """Реалізований PnL щойно закритої позиції, або None якщо не прочитали.

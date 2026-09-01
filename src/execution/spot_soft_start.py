@@ -188,7 +188,8 @@ def save_plan(cfg: SoftStartConfig, plan: DayPlan) -> None:
 
 class SpotSoftStart:
     def __init__(self, client: SpotWebClient, cfg: SoftStartConfig | None = None,
-                 rng: random.Random | None = None, budget=None) -> None:
+                 rng: random.Random | None = None, budget=None,
+                 on_action=None) -> None:
         self.cfg = cfg or SoftStartConfig()
         self.cfg.validate()
         self.client = client
@@ -196,6 +197,14 @@ class SpotSoftStart:
         # Optional hard spend ceiling shared with the futures warmer. None means
         # "no ceiling" — kept optional so existing callers and tests are unchanged.
         self.budget = budget
+        # Лічильник дій кампанії. РАХУЄМО ТУТ, а не диференціюванням у
+        # раннері, з двох причин, і обидві реальні:
+        #   * диф стояв ЗА `if self.reporter is None: return` — тобто без
+        #     Telegram лічильники не рахували б узагалі;
+        #   * диф порівнює знімки між тіками і губить дію, що почалась і
+        #     скінчилась між ними.
+        # Тут рахується РІВНО ОДИН раз на успішний ордер.
+        self.on_action = on_action
         # Слід останньої УСПІШНОЇ дії — читає раннер, щоб звіт показував
         # справжні суму й кількість, а не стелю конфігу.
         self.last_action: dict | None = None
@@ -310,6 +319,7 @@ class SpotSoftStart:
                                     price=px * (1 + cfg.marketable_buffer))
         if res.ok:
             p.buys_done += 1
+            self._count("spot_buys")
             p.spent_usdt += usdt
             # ФАКТИЧНІ числа для звіту оператору. Раніше репортер отримував
             # `order_usdt_max` і літерал "~" — тобто показував СТЕЛЮ розміру
@@ -338,6 +348,15 @@ class SpotSoftStart:
             return True
         logger.warning("[buy] %s rejected: %s", symbol, res.error)
         return False
+
+    def _count(self, kind: str, n: int = 1) -> None:
+        """Порахувати дію. Best-effort: облік не має ламати торгівлю."""
+        if not self.on_action:
+            return
+        try:
+            self.on_action(kind, n)
+        except Exception:
+            logger.debug("[spot] лічильник %s не оновлено", kind, exc_info=True)
 
     async def market_value_of_coins(self, tokens: list) -> float | None:
         """Скільки USDT ЗАРАЗ коштують монети на балансі. None = не прочитали.
@@ -468,6 +487,7 @@ class SpotSoftStart:
                 logger.warning("[wind-down] %s відхилено: %s", symbol, res.error)
                 continue
             sent += 1
+            self._count("spot_sells")     # розпродаж — теж продаж
             proceeds = qty * px
             self.last_action = {"kind": "sell", "symbol": symbol,
                                 "usdt": proceeds, "qty": res.quantity,
@@ -532,6 +552,7 @@ class SpotSoftStart:
                                      price=px * (1 - cfg.marketable_buffer))
         if res.ok:
             p.sells_done += 1
+            self._count("spot_sells")
             proceeds = qty * px
             self.last_action = {
                 "kind": "sell", "symbol": symbol, "usdt": proceeds,

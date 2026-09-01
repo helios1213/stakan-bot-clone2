@@ -884,3 +884,34 @@ async def test_realised_pnl_gives_up_and_says_unknown(tmp_path):
     ss.client = _Cl()
     pos = type("P", (), {"symbol": "LINKUSDT", "opened_at": 2_000_000_000.0})()
     assert await ss._realised_pnl(pos) is None
+
+
+@pytest.mark.asyncio
+async def test_open_and_close_are_counted(tmp_path, live):
+    """Фʼючерсні дії теж мусять рахуватись у самому рушії, а не диференціюванням
+    знімків у раннері: диф стояв за перевіркою репортера і губив короткі цикли."""
+    seen = []
+    ss, cl, _ = mk(tmp_path, {"HYPEUSDT": (0, 0)}, dry_run=False)
+    ss.on_action = lambda k, n=1: seen.append(k)
+
+    assert await ss.open_position() is True
+    assert seen == ["futures_opens"], seen
+
+    ss.state.position["close_after"] = 0.0
+    assert await ss.close_position() is True
+    assert seen == ["futures_opens", "futures_closes"], seen
+
+
+@pytest.mark.asyncio
+async def test_a_failed_open_is_not_counted(tmp_path, live):
+    """Рахуємо те, що біржа ПРИЙНЯЛА."""
+    seen = []
+
+    class _Bad(FakeClient):
+        async def submit_order(self, **kw):
+            return {"code": 9999, "msg": "no"}
+
+    ss, cl, _ = mk(tmp_path, {"HYPEUSDT": (0, 0)}, dry_run=False, client=_Bad())
+    ss.on_action = lambda k, n=1: seen.append(k)
+    await ss.open_position()
+    assert seen == [], seen

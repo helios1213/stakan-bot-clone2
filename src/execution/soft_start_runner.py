@@ -201,13 +201,15 @@ class SlotWarmer:
                                        sizing.order_usdt_max),
         )
         self.spot = SpotSoftStart(self.spot_client, spot_cfg,
-                                  rng=random.Random(), budget=self.budget)
+                                  rng=random.Random(), budget=self.budget,
+                                  on_action=self.campaign.bump)
         self.futures = FuturesSoftStart(
             self.client, self.fee_gate, self.universe,
             FuturesSoftStartConfig(
                 state_path=f"{self.data_dir}/futures_soft_start_slot{self.slot_id}.json"),
             dry_run=self.dry_run, rng=random.Random(),
             budget=self.budget, balance_usdt=fut_bal,
+            on_action=self.campaign.bump,
         )
         # ВІД УСЬОГО СПОТА, а не від вільного USDT — інакше глухий кут.
         #
@@ -328,22 +330,10 @@ class SlotWarmer:
         act = getattr(self.spot, "last_action", None) or {}
         sym = act.get("symbol") or "spot"
         qty = act.get("qty") or "?"
-        # Лічильники кампанії — ПОРУЧ із відправкою в Telegram, але окремо від
-        # неї: репортер живе в памʼяті процесу, кампанія — на диску. Раніше
-        # підсумок брався з репортера, тож кожен рестарт обнуляв статистику
-        # і фінальний звіт показував лише останній відрізок.
-        try:
-            if b1 > b0:
-                self.campaign.bump("spot_buys", b1 - b0)
-            if s1 > s0:
-                self.campaign.bump("spot_sells", s1 - s0)
-            if p1 and p1 != p0:
-                self.campaign.bump("futures_opens")
-            elif p0 and not p1:
-                self.campaign.bump("futures_closes")
-        except Exception:
-            logger.debug("soft-start slot %d: лічильники кампанії не оновлено",
-                         self.slot_id, exc_info=True)
+        # ЛІЧИЛЬНИКИ ТУТ БІЛЬШЕ НЕ РАХУЮТЬСЯ. Вони переїхали в самі рушії
+        # (`on_action`), бо тут стояли ЗА перевіркою `reporter is None` — тобто
+        # без Telegram не рахувались узагалі — і диференціювання знімків
+        # губило дію, що почалась і скінчилась між тіками.
 
         try:
             if b1 > b0:
