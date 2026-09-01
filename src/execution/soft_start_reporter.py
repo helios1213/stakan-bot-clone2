@@ -137,6 +137,7 @@ class SoftStartReporter:
                      ceiling: float = 0.0, position_left: bool = False,
                      pnl: float = 0.0, held_value: float = 0.0,
                      futures_pnl: float = 0.0, spot_pnl: float = 0.0,
+                     held_measured: bool = False,
                      stats: dict | None = None,
                      elapsed_h: float | None = None) -> str:
         # ПІДСУМКИ КАМПАНІЇ, а не процесу. `self.stats` і `self.started_at`
@@ -213,8 +214,11 @@ class SoftStartReporter:
             # ОКРЕМИМ РЯДКОМ І НЕ У ПІДСУМКУ: це не витрата, а гроші, що
             # змінили форму. За ціною КУПІВЛІ — ринкову переоцінку сюди не
             # тягнемо, бо тоді число мінялось би щохвилини від курсу.
+            # ПІДПИС ЗАЛЕЖИТЬ ВІД ДЖЕРЕЛА. «За ціною купівлі» на ринковому
+            # числі — просто неправда, а різниця буває в рази.
+            src = "за ринком" if held_measured else "за ціною купівлі"
             lines.append(f"<b>На споті лишилось монет: {held_value:.2f} USDT</b>"
-                         f" <i>(за ціною купівлі, це не витрата)</i>")
+                         f" <i>({src}, це не витрата)</i>")
         if ceiling:
             pct = (spent / ceiling * 100) if ceiling else 0
             lines.append(f"<code>стеля           : {spent:.4f} / {ceiling:.2f} "
@@ -268,7 +272,8 @@ class SoftStartReporter:
                position: str | None = None, pnl: float | None = None,
                held_value: float | None = None,
                futures_pnl: float | None = None,
-               spot_pnl: float | None = None) -> str:
+               spot_pnl: float | None = None,
+               held_measured: bool = False) -> str:
         head = f"🌱 <b>Soft-start — slot {self.slot_id}</b>"
         if self.dry_run:
             head += "  <i>(DRY-RUN — nothing is sent)</i>"

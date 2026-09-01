@@ -194,6 +194,9 @@ async def test_finished_campaign_switches_the_slot_off(monkeypatch):
         """Mirrors SlotWarmer's interface — including `futures` and `reporter`,
         which the loop reads when posting the closing report."""
 
+        # сторож дрейфу: цикл читає це у SlotWarmer
+        held_is_measured = False
+
         def __init__(self, slot_id, webkey, client, universe, *, dry_run, **kw):
             made.append(self)
             self.slot_id = slot_id

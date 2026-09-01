@@ -79,6 +79,8 @@ class FakeWarmer:
     Mirrors the real interface, including `finished()` — the loop calls it to
     decide whether a slot should switch ITSELF off.
     """
+    # сторож дрейфу: цикл читає це у SlotWarmer
+    held_is_measured = False
     made: list["FakeWarmer"] = []
     # What stop() reports on a freshly built warmer. The loop builds its own
     # warmers, so a test that needs a stuck slot sets this before the pass.

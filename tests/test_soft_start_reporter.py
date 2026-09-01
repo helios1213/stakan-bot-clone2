@@ -912,3 +912,73 @@ def test_live_status_line_also_says_it_in_words():
                    spot_pnl=0.0, held_value=6.021, position=None)
     assert "коштувало 4.806 USDT" in out
     assert "разом +" not in out
+
+
+# ---- «у монетах» у фінальному звіті мусить бути СВІЖИМ (2026-09-01) --------
+
+@pytest.mark.asyncio
+async def test_held_value_is_remeasured_after_the_wind_down():
+    """ЖИВИЙ ВИПАДОК: звіт слота 2 написав «у монетах 9.49», а на біржі
+    лишалось ~6.19.
+
+    Причина — порядок у `tick()`: гілка завершення робить `return` ДО
+    `_refresh_held_market()`, тож у фінальному тіку вимір не оновлювався
+    НІКОЛИ. У звіт ішло значення, зняте до продажу і до 30 хвилин давності.
+    """
+    from src.execution.soft_start_runner import SlotWarmer
+
+    calls = []
+
+    class _Camp:
+        state = type("S", (), {"tokens": ["MX"]})()
+        def expired(self): return True
+        def finish(self): pass
+
+    class _Spot:
+        plan = type("P", (), {"tokens": ["MX"]})()
+        async def wind_down(self, keep, tokens=None):
+            return 0                     # продавати вже нічого
+
+    w = SlotWarmer.__new__(SlotWarmer)
+    w.slot_id = 2
+    w.draining = False
+    w._wound_down = False
+    w._spot_viable = True
+    w._held_market = 9.49                # стале значення ДО продажу
+    w._held_market_at = 10 ** 12         # «щойно міряли» -> тротл мав би блокувати
+    w.campaign = _Camp()
+    w.spot = _Spot()
+    w.futures = object()
+
+    async def _refresh():
+        calls.append(w._held_market_at)
+        w._held_market = 6.19
+    w._refresh_held_market = _refresh
+
+    await SlotWarmer.tick(w)
+
+    assert calls, "після розпродажу вимір не оновлено"
+    assert calls[0] == 0.0, "тротл не скинуто — вимір лишився б старим"
+    assert w._held_spot_value() == 6.19
+
+
+def test_the_label_says_where_the_number_came_from():
+    """«За ціною купівлі» на РИНКОВОМУ числі — просто неправда, а різниця між
+    ними буває в рази (9.49 проти 6.19 у слоті 2)."""
+    from src.execution.soft_start_reporter import SoftStartReporter
+    r = SoftStartReporter(None, 2, dry_run=False)
+    measured = r.render_final("x", spent=0.5, futures_pnl=0.4, spot_pnl=0.0,
+                              held_value=6.19, held_measured=True)
+    accounted = r.render_final("x", spent=0.5, futures_pnl=0.4, spot_pnl=0.0,
+                               held_value=6.19, held_measured=False)
+    assert "за ринком" in measured and "за ціною купівлі" not in measured
+    assert "за ціною купівлі" in accounted and "за ринком" not in accounted
+
+
+def test_held_is_measured_reports_the_source():
+    from src.execution.soft_start_runner import SlotWarmer
+    w = SlotWarmer.__new__(SlotWarmer)
+    w._held_market = None
+    assert w.held_is_measured is False
+    w._held_market = 6.19
+    assert w.held_is_measured is True

@@ -303,6 +303,15 @@ class SlotWarmer:
             logger.debug("soft-start slot %d: денний план не прибрано",
                          self.slot_id, exc_info=True)
 
+    @property
+    def held_is_measured(self) -> bool:
+        """Звідки взялось «у монетах»: з БІРЖІ чи з обліку.
+
+        Підпис у звіті мусить це розрізняти — «за ціною купівлі» на ринковому
+        числі це просто неправда, а різниця між ними буває в рази.
+        """
+        return getattr(self, "_held_market", None) is not None
+
     def _snapshot(self) -> tuple:
         """The counters that tell us an action happened, for diffing a tick."""
         sp, fu = self.spot.plan, self.futures.state
@@ -377,6 +386,7 @@ class SlotWarmer:
             "futures_pnl": self.budget.futures_pnl,
             "spot_pnl": self.budget.spot_pnl,
             "held_value": self._held_spot_value(),
+            "held_measured": self.held_is_measured,
             "position": pos,
         }
 
@@ -429,6 +439,7 @@ class SlotWarmer:
         # Облік лишається запасним шляхом, поки біржу не прочитали.
         if self._held_market is not None:
             return float(self._held_market)
+        # (джерело позначає `held_is_measured` нижче)
         try:
             return self.budget.held_spot_value
         except Exception:
@@ -506,6 +517,15 @@ class SlotWarmer:
                                     self.slot_id, sent)
                         return          # ще один тік на решту
                     self._wound_down = True
+                    # ПЕРЕМІРЯТИ ПІСЛЯ РОЗПРОДАЖУ, ігноруючи тротл.
+                    #
+                    # `_refresh_held_market()` стоїть НИЖЧЕ по tick(), а ця
+                    # гілка робить `return` — тобто у фінальному тіку вимір не
+                    # оновлювався НІКОЛИ. У звіт ішло значення, зняте ДО
+                    # продажу і до 30 хвилин давності: слот 2 показав «у
+                    # монетах 9.49», коли на біржі лишалось ~6.19.
+                    self._held_market_at = 0.0
+                    await self._refresh_held_market()
                     # Без обіцянок: скільки саме лишилось — окремим рядком і
                     # з ВИМІРЯНОГО значення, а не з цілі. Раніше тут стояло
                     # «лишили ~20%» навіть тоді, коли не продалось нічого.
@@ -628,6 +648,7 @@ async def _final_report(w, slot_id: int, reason: str, *, position_left: bool) ->
             futures_pnl=w.budget.futures_pnl,
             spot_pnl=w.budget.spot_pnl,
             held_value=w._held_spot_value(),
+            held_measured=w.held_is_measured,
             position_left=position_left)
     except Exception:
         logger.exception("soft-start slot %d: final report failed", slot_id)
