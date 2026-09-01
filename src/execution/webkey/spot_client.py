@@ -202,8 +202,16 @@ class SpotWebClient:
             # написана, але ловила лише мережеві збої.
             logger.warning("spot balances HTTP %s", r.status_code)
             raise SpotBalancesUnavailable(f"spot balances HTTP {r.status_code}")
+        body = r.json()
+        if body.get("data") is None:
+            # `data: null` при HTTP 200 — це теж «не прочитали», а не «монет
+            # немає». Найчастіше так виглядає протухла сесія: код 200, тіло
+            # порожнє. Читати це як `free=0.00` означає мовчки зупинити
+            # купівлі і написати в лог хибну причину.
+            raise SpotBalancesUnavailable(
+                f"spot balances data=null (code={body.get('code')})")
         out: dict[str, dict] = {}
-        for row in (r.json().get("data") or []):
+        for row in (body.get("data") or []):
             cur = row.get("currency")
             if not cur:
                 continue

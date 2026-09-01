@@ -193,8 +193,13 @@ class SoftStartBudget:
                 # вигадуємо, але й «у монетах» не втрачаємо.
                 if int(raw.get("accounting_version", 0) or 0) < 2:
                     st.accounting_version = 2
+                    # ВІДНЯТИ ВЖЕ ВІДСТЕЖУВАНУ СОБІВАРТІСТЬ. Файл версії <2,
+                    # у якому вже є `spot_positions`, інакше порахував би ті
+                    # самі монети двічі: раз у позиціях, раз у legacy-відрі.
+                    _tracked = sum(float(v.get("cost", 0.0) or 0.0)
+                                   for v in (st.spot_positions or {}).values())
                     st.legacy_spot_cost = max(0.0, -float(
-                        st.spot_flow_usdt or 0.0))
+                        st.spot_flow_usdt or 0.0) - _tracked)
                     if st.legacy_spot_cost:
                         logger.info("soft-start budget: %.4f USDT монет із "
                                     "докоштовної епохи — PnL по них не "

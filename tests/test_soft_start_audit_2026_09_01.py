@@ -979,3 +979,83 @@ def test_the_futures_window_really_gates_the_open():
     assert e.active_now(at(12)) is True
     assert e.active_now(at(1)) is False, "нічне вікно не гейтиться"
     assert e.active_now(at(23)) is False
+
+
+# --------------------------------------------------------------------------
+# §2.3 — прогрів мусить бути СКАСОВНИМ, а пул закриватись ПІСЛЯ
+# --------------------------------------------------------------------------
+
+def test_the_soft_start_task_is_cancellable_and_the_pool_closes_last():
+    """ДЕФЕКТ §2.3 — тест ПРОВОДКИ по джерелу `main()`.
+
+    Задача прогріву створювалась голим `create_task` і НЕ потрапляла у
+    `tasks`, тож на зупинці бота її обробник `CancelledError` — єдине місце,
+    що закриває відкриту позицію при завершенні — не виконувався
+    детерміновано. Гірше: `webkey_client_pool.close_all()` стояв ПЕРЕД
+    скасуванням задач, тобто відбирав у прогріву рівно того клієнта, яким той
+    мав рятувати гроші.
+
+    Виконати `main()` у тесті неможливо, тож пінимо два факти в джерелі: що
+    задача кладеться у `tasks`, і що пул закривається ПІСЛЯ `gather`.
+    """
+    src = __import__("pathlib").Path("src/main.py").read_text()
+
+    assert "tasks.append(soft_start_task)" in src, (
+        "задача прогріву не потрапляє у `tasks` — на зупинці її ніхто не "
+        "скасує, і позиція лишиться відкритою")
+
+    i_gather = src.index("await asyncio.gather(*tasks")
+    i_close = src.index("await webkey_client_pool.close_all()")
+    assert i_close > i_gather, (
+        "пул вебкей-клієнтів закривається ДО скасування задач — прогріву не "
+        "буде чим закрити позицію")
+
+
+def test_an_old_budget_file_does_not_count_the_same_coins_twice(tmp_path):
+    """§1.5, друга половина: файл версії <2, у якому ВЖЕ є `spot_positions`.
+
+    Свіжий стан я закрив версією 2, але старий файл із обома джерелами
+    порахував би ті самі монети двічі — раз у позиціях, раз у legacy-відрі.
+    """
+    import json
+
+    from src.execution.soft_start_budget import SoftStartBudget
+
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({
+        "max_usdt": 5.0,
+        "accounting_version": 0,
+        "spot_flow_usdt": -30.0,          # витрачено 30 на монети
+        "spot_positions": {"ADA": {"qty": 10.0, "cost": 12.0}},
+        "entries": [],
+    }))
+    b = SoftStartBudget(str(p), 5.0)
+
+    assert b.state.legacy_spot_cost == pytest.approx(18.0), (
+        f"legacy={b.state.legacy_spot_cost} — відстежувані 12.0 не відняті")
+    assert b.held_spot_value == pytest.approx(30.0), "монети пораховано двічі"
+
+
+@pytest.mark.asyncio
+async def test_http_200_with_a_null_body_is_not_read_as_zero_funds():
+    """`data: null` при HTTP 200 — так виглядає протухла сесія. Читати це як
+    «монет немає» означає мовчки спинити купівлі і написати хибну причину."""
+    from src.execution.webkey.spot_client import (SpotBalancesUnavailable,
+                                                  SpotWebClient)
+
+    c = SpotWebClient.__new__(SpotWebClient)
+    c._timeout = 1
+    c.quote = "USDT"
+
+    class _R:
+        status_code = 200
+
+        def json(self):
+            return {"code": 401, "data": None}
+
+    c._ensure_session = lambda: type("S", (), {
+        "get": staticmethod(lambda *a, **kw: asyncio.sleep(0, result=_R()))})()
+    c._headers = lambda: {}
+
+    with pytest.raises(SpotBalancesUnavailable):
+        await c.balances(["cid"])

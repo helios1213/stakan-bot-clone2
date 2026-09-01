@@ -1213,7 +1213,13 @@ async def main() -> None:
             return []
 
     from src.execution.soft_start_runner import soft_start_loop
-    asyncio.create_task(
+    # ЗБЕРІГАЄМО ПОСИЛАННЯ і нижче кладемо у `tasks`. Голий `create_task` без
+    # цього означав, що задача НЕ скасовується на зупинці бота: її обробник
+    # `CancelledError` (єдине місце, що закриває прогрівну позицію при
+    # завершенні) не виконувався детерміновано — задача просто помирала разом
+    # із loop. Плюс `webkey_client_pool.close_all()` стояв ПЕРЕД скасуванням,
+    # тобто відбирав у неї клієнта, яким вона мала б закривати позицію.
+    soft_start_task = asyncio.create_task(
         soft_start_loop(webkey_store, webkey_client_pool, _soft_start_universe,
                         alerts=alerts),
         name="soft_start",
@@ -1477,6 +1483,9 @@ async def main() -> None:
             name="stats",
         ),
     ]
+    # Прогрів мусить бути СКАСОВНИМ: його обробник CancelledError закриває
+    # відкриту позицію перед виходом.
+    tasks.append(soft_start_task)
 
     # Spread monitor — Telegram alert when the MEXC book spread widens beyond
     # the tight-book threshold (the lead-lag edge needs ~1-tick books).
@@ -1554,13 +1563,17 @@ async def main() -> None:
         await shadow_engine.stop()
         await state_manager.stop()
         await signal_writer.stop()
-        await webkey_client_pool.close_all()
         for t in tasks:
             t.cancel()
         if stop_waiter is not None:
             stop_waiter.cancel()  # ad-hoc waiter isn't in `tasks`
         await asyncio.gather(*tasks, *( [stop_waiter] if stop_waiter is not None else [] ),
                              return_exceptions=True)
+        # ПІСЛЯ скасування задач, не перед. Прогрів на своєму CancelledError
+        # закриває відкриту позицію — а для цього йому потрібен живий
+        # webkey-клієнт. Закривши пул першим, ми забирали в нього рівно той
+        # інструмент, яким він мав рятувати гроші.
+        await webkey_client_pool.close_all()
         await db.close()
         await research_db.close()
         loguru_logger.info("Goodbye.")
