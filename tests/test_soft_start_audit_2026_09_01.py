@@ -109,11 +109,21 @@ async def test_a_wind_down_that_never_converges_still_ends_the_campaign():
 
 
 @pytest.mark.asyncio
-async def test_a_slot_with_no_spot_half_is_finished_immediately():
-    """Порожня спотова половина не має тримати кампанію: продавати нічого."""
+async def test_a_slot_below_the_floor_finishes_only_after_one_wind_down_pass():
+    """ПЕРЕПИСАНО 2026-09-02 разом зі зняттям гейта.
+
+    Раніше слот нижче порога вважався завершеним ОДРАЗУ — і саме тому його
+    монети лишались замкненими. Тепер він мусить пройти рівно один прохід
+    розпродажу; якщо продавати нічого, цей прохід і закриває кампанію, тож
+    затримки не виникає.
+    """
     camp, spot = _Camp(), _Spot([])
     w = _warmer_with(spot, camp)
     w._spot_viable = False
+
+    assert w.finished() is False, "завершився, не давши розпродажу ані шансу"
+    await SlotWarmer.tick(w)
+    assert spot.passes == 1
     assert w.finished() is True
 
 
@@ -1233,3 +1243,39 @@ async def test_selling_old_coins_cannot_lift_the_ceiling_above_the_balance(
             break
     assert bought == 10, (
         f"куплено {bought} ордерів по 2.0 при стелі 20 — стеля перестала бути стелею")
+
+
+@pytest.mark.asyncio
+async def test_the_wind_down_runs_even_below_the_viability_floor():
+    """Слот, що просів нижче порога, МУСИТЬ продати свої монети.
+
+    `_spot_viable` відповідає на питання «чи варто ГРІТИ» — для цього потрібен
+    USDT на купівлі. Розпродаж лише ПРОДАЄ: йому потрібні монети, і саме вони
+    в такому слоті й лежать. Гейтити вихід тією ж умовою, що й вхід, означало
+    замкнути монети назавжди — той самий дедлок, що ловили 31.08, тільки в
+    інший бік. Підняття порогу з 10 до 20 розширило б цю смугу вдвічі.
+    """
+    camp, spot = _Camp(), _Spot([2, 0])
+    w = _warmer_with(spot, camp)
+    w._spot_viable = False                     # баланс просів нижче порога
+
+    await SlotWarmer.tick(w)
+    assert spot.passes == 1, "розпродаж не запустився на слоті нижче порога"
+    assert w.finished() is False, "слот завершився, не дочекавшись розпродажу"
+
+    await SlotWarmer.tick(w)
+    assert w._wound_down is True
+    assert w.finished() is True
+    assert camp.finished == 1
+
+
+@pytest.mark.asyncio
+async def test_a_slot_with_nothing_to_sell_still_finishes_promptly():
+    """Знявши гейт, не можна отримати слот, що висить вічно: `wind_down`, якому
+    нема чого продавати, повертає 0 і одразу закриває кампанію."""
+    camp, spot = _Camp(), _Spot([])            # продавати нічого
+    w = _warmer_with(spot, camp)
+    w._spot_viable = False
+
+    await SlotWarmer.tick(w)
+    assert w._wound_down is True and w.finished() is True and camp.finished == 1
