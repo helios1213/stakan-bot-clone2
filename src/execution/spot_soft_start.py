@@ -60,7 +60,11 @@ class SoftStartConfig:
     order_usdt_min: float = 1.5          # keep >= the observed spot min notional
     order_usdt_max: float = 150.0
     baseline_usdt_per_token: float = 10.0   # never sell a token below this value
-    daily_buy_usdt_ceiling: float = 400.0   # hard cap on daily spend
+    # Стеля ЧИСТОГО розгортання в монети за добу: купівлі додають, продажі
+    # віднімають (з підлогою на нулі). До 2026-09-02 віднімання не було, і
+    # стеля мовчки міряла ВАЛОВІ купівлі — саме тому денний план ніколи не
+    # виконувався. Значення ставить раннер = спотовий баланс.
+    daily_buy_usdt_ceiling: float = 400.0
     sell_fraction_min: float = 0.2
     sell_fraction_max: float = 0.6
     marketable_buffer: float = 0.002     # cross the book slightly so orders fill
@@ -594,6 +598,24 @@ class SpotSoftStart:
             p.sells_done += 1
             self._count("spot_sells")
             proceeds = qty * px
+            # ПРОДАЖ ВІДПУСКАЄ ДЕННУ СТЕЛЮ (рішення оператора 2026-09-02).
+            #
+            # `spent_usdt` тільки РІС, тож стеля міряла ВАЛОВІ купівлі за добу,
+            # хоча коментар у конфігу описував її так, ніби продажі її
+            # звільняють. Через це план на 25 купівель не досягався НІКОЛИ, ні
+            # на якому балансі: стеля = баланс, середній ордер = 8% балансу,
+            # тобто впиралось на ~12 купівлях незалежно від розміру рахунку.
+            #
+            # Тепер стеля міряє ЧИСТЕ розгортання в монети за добу — те, що
+            # гаманець реально тягне. Це узгоджено з тим, що продаж справді
+            # повертає USDT: гейт `maybe_buy` уже перечитує вільний баланс.
+            #
+            # ЧОМУ ПІДЛОГА НА НУЛІ, а не просто віднімання. Монети
+            # накопичуються за ВСЮ історію слота, тож доба могла б початися з
+            # продажу старих монет на 15 USDT і отримати `spent = -15`, тобто
+            # стелю `баланс + продажі` замість `баланс`. Нуль лишає стелю
+            # стелею: за добу не можна розгорнути в монети більше за баланс.
+            p.spent_usdt = max(0.0, p.spent_usdt - proceeds)
             self.last_action = {
                 "kind": "sell", "symbol": symbol, "usdt": proceeds,
                 "qty": res.quantity, "price": res.price,

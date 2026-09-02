@@ -1147,3 +1147,89 @@ async def test_the_floor_is_applied_per_venue_not_to_the_total(monkeypatch):
     # сума 40 при перекосі 39/1 НЕ має проходити — інакше «20+20» це не поріг
     s, f = await run(2 * FLOOR - 1, 1.0)
     assert f is False, "поріг рахує СУМУ — тоді 39/1 пройшло б цілком"
+
+
+# --------------------------------------------------------------------------
+# Денна стеля: продажі її відпускають (рішення оператора 2026-09-02)
+# --------------------------------------------------------------------------
+
+def _spot_engine(tmp_path, monkeypatch, *, px=2.0, ceiling=20.0, order=2.0):
+    """Справжній SpotSoftStart із застабленими краями (без мережі й біржі)."""
+    from src.execution import spot_soft_start as sss
+
+    class _Cur:
+        currency_id = "cid"; market_currency_id = "mid"
+        price_decimals = 6; quantity_decimals = 6
+
+    class _Res:
+        def __init__(self, qty, price):
+            self.ok = True; self.dry_run = False
+            self.quantity = qty; self.price = price
+            self.code = 200; self.raw = {}
+
+    class _Client:
+        async def currency(self, t): return _Cur()
+        async def balances(self, ids):
+            return {"USDT": {"available": 10_000.0}, "MX": {"available": 10_000.0}}
+        async def buy(self, token, *, usdt, price): return _Res(usdt / price, price)
+        async def sell(self, token, *, quantity, price): return _Res(quantity, price)
+
+    monkeypatch.setattr(sss, "_price_async",
+                        lambda symbol: asyncio.sleep(0, result=px))
+    cfg = sss.SoftStartConfig(universe=("MX",),
+                              state_path=str(tmp_path / "s.json"),
+                              order_usdt_min=order, order_usdt_max=order,
+                              baseline_usdt_per_token=0.0,
+                              daily_buy_usdt_ceiling=ceiling)
+    e = sss.SpotSoftStart(_Client(), cfg)
+    e.plan.tokens = ["MX"]
+    e.plan.buys_done = 0; e.plan.buys_target = 999
+    e.plan.sells_done = 0; e.plan.sells_target = 999
+    return e
+
+
+@pytest.mark.asyncio
+async def test_a_sell_releases_the_daily_ceiling(tmp_path, monkeypatch):
+    """ДЕФЕКТ, ЩО РІЗАВ ДЕННИЙ ПЛАН НА БУДЬ-ЯКОМУ БАЛАНСІ.
+
+    `plan.spent_usdt` тільки РІС, тож стеля міряла ВАЛОВІ купівлі за добу, хоча
+    коментар у конфігу описував її так, ніби продажі її звільняють. Наслідок
+    арифметичний і не залежав від розміру рахунку: стеля = баланс, середній
+    ордер = 8% балансу -> впиралось на ~12 купівлях і на 20 USDT, і на 500,
+    тоді як план цілив у 25.
+    """
+    e = _spot_engine(tmp_path, monkeypatch, ceiling=20.0, order=2.0)
+
+    for _ in range(10):
+        assert await e.maybe_buy() is True
+    assert e.plan.spent_usdt == pytest.approx(20.0)
+    assert await e.maybe_buy() is False, "стеля не спрацювала — тест нічого не міряє"
+
+    assert await e.maybe_sell() is True
+    assert e.plan.spent_usdt < 20.0, "продаж не відпустив стелю"
+    assert await e.maybe_buy() is True, "після продажу купівля все ще заблокована"
+
+
+@pytest.mark.asyncio
+async def test_selling_old_coins_cannot_lift_the_ceiling_above_the_balance(
+        tmp_path, monkeypatch):
+    """ПІДЛОГА НА НУЛІ — не косметика.
+
+    Монети накопичуються за ВСЮ історію слота, тож доба могла б початися з
+    продажу старих монет і отримати відʼємний `spent`, тобто стелю
+    `баланс + продажі` замість `баланс`. Стеля має лишатись стелею.
+    """
+    e = _spot_engine(tmp_path, monkeypatch, ceiling=20.0, order=2.0)
+
+    for _ in range(5):                       # продаємо «старі» монети першими
+        assert await e.maybe_sell() is True
+    assert e.plan.spent_usdt == pytest.approx(0.0), (
+        f"spent={e.plan.spent_usdt} пішов нижче нуля — стеля роздулась")
+
+    bought = 0
+    while await e.maybe_buy():
+        bought += 1
+        if bought > 30:
+            break
+    assert bought == 10, (
+        f"куплено {bought} ордерів по 2.0 при стелі 20 — стеля перестала бути стелею")
