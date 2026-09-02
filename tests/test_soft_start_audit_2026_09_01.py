@@ -500,7 +500,7 @@ async def test_the_loop_actually_calls_the_orphan_sweep(monkeypatch):
 # §2.7 / §2.3 — порядок у start()
 # --------------------------------------------------------------------------
 
-async def _run_start(monkeypatch, *, free_usdt, coins_usdt, drawn):
+async def _run_start(monkeypatch, *, free_usdt, coins_usdt, drawn, fut_usdt=999.0):
     """Виконати СПРАВЖНІЙ `SlotWarmer.start()` із застабленими краями."""
     w = SlotWarmer.__new__(SlotWarmer)
     w.slot_id = 1
@@ -542,7 +542,7 @@ async def _run_start(monkeypatch, *, free_usdt, coins_usdt, drawn):
     w._reset_accounting = lambda: order.append("reset")
 
     async def _bal():
-        return free_usdt, 999.0
+        return free_usdt, fut_usdt
     w._read_balances = _bal
 
     async def _coins(tokens):
@@ -1111,3 +1111,39 @@ def test_the_final_report_is_fed_the_campaign_counters(monkeypatch):
     assert captured.get("stats", {}).get("spot_buys") == 13, (
         f"лічильники кампанії не дійшли до звіту: {captured.get('stats')}")
     assert captured.get("elapsed_h") == pytest.approx(72.0)
+
+
+# --------------------------------------------------------------------------
+# Поріг 20+20 (рішення оператора 2026-09-02)
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_the_floor_is_applied_per_venue_not_to_the_total(monkeypatch):
+    """«20 на споті і 20 на фʼючерсах = 40 разом» тримається РІВНО тому, що
+    поріг судить майданчики ОКРЕМО.
+
+    Якби він міряв суму, акаунт із 39 на споті і 1 на фʼючерсах пройшов би
+    цілком — і фʼючерсна половина відкривала б позиції з маржею 0.06-0.14,
+    які біржа відхиляє. Тест ПРОВОДКИ: ганяє справжній `start()`.
+    """
+    from src.execution.soft_start_budget import MIN_VIABLE_BALANCE_USDT as FLOOR
+
+    async def run(spot, fut):
+        w, _, _ = await _run_start(monkeypatch, free_usdt=spot, coins_usdt=0.0,
+                                   drawn=["MX"], fut_usdt=fut)
+        return w._spot_viable, w._fut_bal_ok
+
+    # обидва вище порога
+    s, f = await run(FLOOR + 5, FLOOR + 5)
+    assert (s, f) == (True, True)
+
+    # спот нижче — фʼючерси НЕ мають від цього постраждати, і навпаки
+    s, f = await run(FLOOR - 1, FLOOR + 5)
+    assert s is False and f is True, "поріг перетік між майданчиками"
+
+    s, f = await run(FLOOR + 5, FLOOR - 1)
+    assert s is True and f is False, "поріг перетік між майданчиками"
+
+    # сума 40 при перекосі 39/1 НЕ має проходити — інакше «20+20» це не поріг
+    s, f = await run(2 * FLOOR - 1, 1.0)
+    assert f is False, "поріг рахує СУМУ — тоді 39/1 пройшло б цілком"

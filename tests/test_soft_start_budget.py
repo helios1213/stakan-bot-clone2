@@ -178,10 +178,25 @@ def test_affordable_refuses_to_corner_the_wallet():
 
 
 def test_min_viable_balance_is_the_documented_floor():
-    # 25 -> 10 (рішення оператора 2026-08-26): поріг зупиняв фарм так само,
-    # як стеля витрат, яку прибрали. 10, а не 5, бо при 5 стеля розміру (12%)
-    # була б 0.60 — нижче мінімального ноціоналу біржі.
-    assert MIN_VIABLE_BALANCE_USDT == 10.0
+    # 25 -> 10 (2026-08-26): поріг зупиняв фарм так само, як стеля витрат, яку
+    # прибрали. 10 -> 20 (2026-09-02, рішення оператора): поріг застосовується
+    # до КОЖНОГО майданчика окремо, тож це «20 на споті І 20 на фʼючерсах».
+    assert MIN_VIABLE_BALANCE_USDT == 20.0
+
+
+def test_the_floor_leaves_spot_orders_above_the_exchange_minimum():
+    """Не магічне число: при порозі поріг-балансу найменший ордер мусить бути
+    ВИЩИМ за мінімальний ноціонал біржі, інакше кожен ордер відхиляється.
+
+    Саме через це поріг колись не опустили до 5: там стеля розміру виходила
+    0.60 при мінімумі біржі ~1.1.
+    """
+    from src.execution.spot_soft_start import MIN_EXCHANGE_NOTIONAL_USDT
+    s = scale_spot_config(MIN_VIABLE_BALANCE_USDT)
+    assert s.order_usdt_min >= MIN_EXCHANGE_NOTIONAL_USDT, (
+        f"на порозі {MIN_VIABLE_BALANCE_USDT} найменший ордер {s.order_usdt_min} "
+        f"нижчий за мінімум біржі {MIN_EXCHANGE_NOTIONAL_USDT}")
+    assert s.order_usdt_max > s.order_usdt_min, "діапазон розмірів схлопнувся"
 
 
 # ---- integration with the spot warmer -----------------------------------
