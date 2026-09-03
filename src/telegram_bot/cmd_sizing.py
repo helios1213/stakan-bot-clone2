@@ -183,40 +183,8 @@ async def _reset_slot(db, slot_id: int, symbol: str) -> bool:
 
 # ─────────────────────── Formatting ────────────────────────
 
-def _fmt_sizing_row(row: dict) -> str:
-    """One-line summary for a pair: symbol + ranges, or '(no config)'."""
-    sym = row["symbol"]
-    mn, mx = row.get("margin_min"), row.get("margin_max")
-    ln, lx = row.get("leverage_min"), row.get("leverage_max")
-    if mn is None or mx is None or ln is None or lx is None:
-        return f"<b>{sym}</b> — <i>no config (tap to set)</i>"
-    return (
-        f"<b>{sym}</b> — margin <code>${mn:g}–${mx:g}</code>, "
-        f"lev <code>{ln}–{lx}x</code>"
-    )
 
 
-def _fmt_picker_block(row: dict, slots: list) -> str:
-    """Picker entry: pair name + EACH account slot's effective sizing (its
-    (slot,pair) override, else the pair YAML) tagged override/pair — so the
-    picker itself shows exactly what every slot trades, no per-slot ambiguity."""
-    sym = row["symbol"]
-    mn, mx = row.get("margin_min"), row.get("margin_max")
-    ln, lx = row.get("leverage_min"), row.get("leverage_max")
-    if mn is None or mx is None or ln is None or lx is None:
-        return f"<b>{sym}</b> — <i>no config (tap to set)</i>"
-    lines = [f"<b>{sym}</b>"]
-    for _s in slots:
-        sid = _s["slot_id"]
-        smn, smx = _s.get("slot_margin_min_usdt"), _s.get("slot_margin_max_usdt")
-        sln, slx = _s.get("slot_leverage_min"), _s.get("slot_leverage_max")
-        emn = smn if smn is not None else mn
-        emx = smx if smx is not None else mx
-        eln = sln if sln is not None else ln
-        elx = slx if slx is not None else lx
-        tag = "override" if any(v is not None for v in (smn, smx, sln, slx)) else "pair"
-        lines.append(f"  S{sid}: <code>${emn:g}–{emx:g} · {eln}–{elx}x</code> ({tag})")
-    return "\n".join(lines)
 
 
 def _fmt_pair_detail(row: dict, slots: list | None = None) -> str:

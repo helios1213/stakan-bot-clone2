@@ -56,9 +56,14 @@ def _ro(db: str) -> sqlite3.Connection:
 
 
 def _rw(db: str) -> sqlite3.Connection:
-    """Read-write panel connection with a generous busy wait. The bot writes
-    signal_features to this SAME stakan.db continuously (and the prune thread
-    does a wal_checkpoint that can hold the writer >5s), so sqlite3's 5s default
+    """Read-write panel connection with a generous busy wait.
+
+    ВИПРАВЛЕНО 2026-09-03: тут писало, що бот пише `signal_features` у ЦЮ САМУ
+    `stakan.db`. Неправда з 2026-08-13 — таблиця переїхала в `stakan-research.db`.
+    АЛЕ ТАЙМАУТ ПОТРІБЕН І ДАЛІ, з іншої причини: у `stakan.db` безперервно
+    пише `signals` (~68 рядків/хв), а prune ходить туди з
+    `wal_checkpoint(TRUNCATE)`, який може тримати письменника >5с. Тобто
+    sqlite3's 5s default
     lets a panel control-write fail with 'database is locked'. Wait up to 8s.
     Keep the DEFAULT isolation_level: these functions SELECT-then-UPDATE on one
     connection; a snapshotting BEGIN would yield SQLITE_BUSY_SNAPSHOT, which no

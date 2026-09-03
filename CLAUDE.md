@@ -46,20 +46,21 @@ Project instructions for Claude Code. Read this fully at the start of every sess
   docker compose exec stakan-bot python /app/script.py --slot 1
   ```
 - **Files copied with `docker compose cp` DISAPPEAR on the next rebuild.** Keep originals in `~/` (or commit them).
-- **Webkey slot differs per machine.** Main bot = slot 2, this VPS = slot 1. Check first:
+- **НА КОЖНІЙ МАШИНІ ПО ДВА ЗАПОВНЕНІ СЛОТИ** (`MAX_SLOTS=2`, стеля вибрана). Старий рядок «Main bot = slot 2, this VPS = slot 1» був ХИБНИЙ і небезпечний: пробник із неправильним `--slot N` не впаде з «slot N empty», а **тихо відпрацює проти ЧУЖОГО акаунта**. Перед будь-яким пробником звір, ЯКИЙ акаунт у слоті (`walletBalance` з `tiered_fee_rate/v2` проти UI). Перевірити склад:
   ```bash
   docker compose exec stakan-bot python -c "import sqlite3;print(sqlite3.connect('/app/data/stakan.db').execute('SELECT slot_id, webkey_blob IS NOT NULL FROM webkey_slots').fetchall())"
   ```
 - All tools read the webkey from the DB by slot. **Never paste the webkey/cookies into a command or a file.**
 
 ## Signing & the web path (established facts — don't re-derive)
-> **ОНОВЛЕНО 2026-08-25: dolos ПОВЕРНУТО на `/order/create`** (рішення оператора). Абзац нижче про «dolos НЕ enforced» лишається ФАКТИЧНО ВІРНИМ — біржа приймає і без нього — але за замовчуванням ми його ШЛЕМО. `MEXC_DOLOS_ON_ORDER=0` вимикає без зміни коду. Ціна виміряна: `sign_dolos` p50=**1.708мс** проти HTTP RTT p50=152мс (~1% шляху).
+> **СТАНОМ НА 2026-09-03 dolos НА `/order/create` НЕ ШЛЕТЬСЯ.** Обидва боти працюють у `MEXC_PATH_MODE=bare` (задано в `docker-compose.yml` обох, коміт `4adc860` від 26.08), і бот сам це друкує на старті: `[PATH MODE] bare — dolos на /order/create: ні`. **Не плутати дефолт КОДУ (`full`) з розгорнутою КОНФІГУРАЦІЄЮ (`bare`)** — саме на цьому застаріло попереднє формулювання «за замовчуванням ми його ШЛЕМО». Абзац нижче про «dolos НЕ enforced» лишається ФАКТИЧНО ВІРНИМ. `close_all_positions` шле dolos ЗАВЖДИ (хардкод, `client.py:660`). Ціна виміряна: `sign_dolos` p50=**1.708мс** проти HTTP RTT p50=152мс (~1% шляху).
+> **ПЕРЕВІРЯЙ, А НЕ ЧИТАЙ ЦЕЙ РЯДОК:** `docker compose logs stakan-bot | grep 'PATH MODE'`.
 - `sign_web(body, webkey)` is **body-generic**: `md5(nonce + json_body + md5(webkey+nonce)[7:])`. Signs any JSON body — futures and spot alike. Reuse as-is.
 - **Dolos is NOT enforced** on futures `/order/create` or on spot `/order/place`. Plain body + web-sign is accepted (spot success code `200`; futures success `0`). `close_all_positions` KEEPS dolos.
 - **Web-sign IS required** — without `x-mxc-sign` the futures path returns `code=602`.
 
 ## The three client.py patches
-Propagated to clones via `patch_clone.py` (`--check` reports which are present; `--apply` adds only the missing ones, idempotent, scoped, backs up `.bak.<ts>`, verifies compile):
+Розкочуються на клон **ручним портом + звіркою md5** (`git apply --3way`, далі `md5sum` обох дерев). `patch_clone.py`, який тут описувався раніше, **не існує на жодній машині і ніколи не був у git** — існував разово в `~/` на клоні і був видалений. Самі три патчі ЖИВІ:
 1. **warmup-removal** — Akamai cookie warmup proven unneeded; `_ensure_session` seeds `u_id`/`uc_token` app-cookies once, no network; `warmup()` is a no-op.
 2. **dolos-drop** — `needs_dolos=False` on `/order/create` ONLY. `close_all_positions` still signs dolos.
 3. **host-switch** — split `BASE_URL` (web origin, origin/referer headers only -> stays `futures.mexc.com`) from `API_URL` (where requests are sent -> `contract.mexc.com`). Env `MEXC_API_HOST` reverts without a code change. **Don't point both at one host without re-measuring.**
@@ -98,7 +99,7 @@ Propagated to clones via `patch_clone.py` (`--check` reports which are present; 
 **⚠️ ГОЛОВНЕ, ЩО ТРЕБА ЗНАТИ ПЕРШИМ**
 - **Прогрів (soft-start) торгує ЖИВИМИ ГРОШИМА на ОБОХ ботах.** Озброєно двома гейтами: `SOFT_START_LIVE=1` у compose (читається ОДИН РАЗ на старті — перемикається лише через `up -d`) і кнопка 🌱 у `/slot N`. Роззброїти: прибрати змінну + `up -d`, але **лише коли позиція прогріву закрита**.
 - **Арбітражна торгівля (`live_enabled`) ВИМКНЕНА** на всіх слотах. `shadow_twin` не росте.
-- Кампанії: **обидві на клоні ЗАВЕРШЕНІ**, там уже НОВІ вебкеї (баланси 29.58 / 27.40), `soft_start_enabled=0` — наступне 🌱 стартує з чистого аркуша. primary слот 1 ще йде. Кожна кампанія триває 3 доби і вимикає себе сама.
+- **КАМПАНІЇ ЙДУТЬ НА ВСІХ ЧОТИРЬОХ СЛОТАХ** (`soft_start_enabled=1` скрізь). Кожна триває 3 доби і вимикає себе сама; після завершення 🌱 можна натиснути знову — почнеться нова з чистим обліком. **Перед тим як щось роззброювати, ПЕРЕВІР стан**, а не вір цьому рядку: `SELECT slot_id, soft_start_enabled, live_enabled FROM webkey_slots` і `soft_start_campaign_slotN.json`. Роззброєння посеред живої кампанії осиротить фʼючерсну позицію або обнулить облік.
 - **Прогрів можна запускати повторно** (до 30.08 — рівно один раз на слот, назавжди). **Заміна вебкея в слоті = нова кампанія і обнулений облік**, бо стан лежить per-slot: інакше новий акаунт успадкував би чужі гроші в обліку.
 - **Поріг viability рахується від ПОВНОЇ спотової вартості** (вільний USDT + монети), а не від вільного USDT. Інакше спот, витративши USDT на монети, вимикався і вже не міг продати, щоб їх повернути — дедлок, спійманий 31.08.
 - **Дві межі, які легко переплутати** (і я плутав): `cfg.order_usdt_min` — мінімальний розмір ордера ПРОГРІВУ, масштабується від балансу; `MIN_EXCHANGE_NOTIONAL_USDT = 1.1` — мінімальний ноціонал БІРЖІ. Друга в розпродажі, перша в купівлях.
@@ -158,7 +159,16 @@ primary слот 2       9.83 + 15.66 = 25.49         28.13      2/3       0
 - усі файли стану пишуться атомарно; битий файл кампанії НЕ починає нову (fail-closed);
 - ціни й `contract_meta` тягнуться в потоці — синхронний `urlopen` морозив event loop арбітражу на 1.39с.
 
-## Current state (as of 2026-08-21, кінець дня)
+## Історичні знімки (2026-08-20/21) — НЕ ПОТОЧНИЙ СТАН
+
+> **УВАГА.** Нижче — ЗАМОРОЖЕНІ знімки, лишені заради виміряних чисел
+> (латентність, shadow-realism, причина схрещень). **Твердження про стан
+> слотів у них ХИБНІ станом на сьогодні:** там написано `live_enabled=1` і
+> «слот 2 торгує живими грошима», тоді як зараз `live_enabled=0` на всіх
+> чотирьох слотах обох ботів, а `pair_states` не має жодної пари в `live`.
+> Поточний стан — ЛИШЕ у розділі `## Current state` вище.
+
+### Знімок 2026-08-21 (кінець дня) — shadow-realism
 **Стан shadow-realism (аудит `shadow_realism_audit_2026-08-21.md`):**
 - **T0 — ЗРОБЛЕНО**: чесний знаменник fill-rate, живий сліпедж (`entry_limit_price`), звіти в bps, мертвий ключ прибрано.
 - **T1.0 — ЗРОБЛЕНО**: `[BOOKLAG]` міряє вік нашої книги на момент живого філу. 109 семплів: p50=116мс, p90=205, max=335.
@@ -186,7 +196,7 @@ twin пише 30 рядків/год, з них ПРОТУХЛИХ ~4/год   <
 
 **Burst-алерт при троттлі не спрацює взагалі:** треба >=10 угод у 180с, при 1/хв буде максимум 3. Свідомо лишено як є.
 
-## Current state (as of 2026-08-20)
+### Знімок 2026-08-20 — фід, схрещення, латентність
 - **ДВІ БАЗИ, ДВІ МАШИНИ — перевіряти ОБИДВІ.** Коштувало найбільше часу цієї сесії: я тричі казав «SOXL 18-го не торгував», дивлячись лише у БД primary. Аномальні дні SOXL (`08-18 +$460.83`, `08-13 +$175.74`) живуть на **srv1**.
 - **bookTicker-фід: УВІМКНЕНИЙ на ОБОХ ботах.** Баг прунінгу полагоджено з обох боків, A/B підтвердив користь, усе розкочено й запушено (primary `c8fac18`, клон `f88efe1`, фід на клоні `b540331`). Схрещення на 2-годинному вікні: **primary 77/год (0.27% сигналів), клон 344/год (1.24%)** проти історичних ~3000/год. Деталі й числа — у ворклозі.
 - **CPU: боти рівні — ~42.5% (primary) і ~45.1% (клон) від одного ядра**, 6 семплів по 10с на кожному. Одиничний `docker stats --no-stream` шумить у діапазоні 33-72% — по ньому НЕ можна робити висновків (одного разу вже здалося, що фід коштує +10пп; на усереднених семплах різниці немає). Обидві машини — **1 ядро, 955M RAM**. Навантаження створює САМ бот (`python -m src.main`); процесів-паразитів немає, тож чистка файлів CPU не змінює.
@@ -204,7 +214,9 @@ twin пише 30 рядків/год, з них ПРОТУХЛИХ ~4/год   <
 
 ## Gotchas that have bitten us
 - `docker compose` from the wrong dir -> `no configuration file provided`.
-- Wrong slot (2 vs 1) -> `slot N empty or missing`.
+- **`config/config.yaml` — 36 із 65 ключів схема ВІДКИДАЄ МОВЧКИ** (`extra: ignore`). Серед них 13 читаються як озброєні запобіжники: `shadow.stop_loss_roi_pct`, `shadow.hard_time_limit_sec`, усі три `trailing_take_profit.*`, `risk.pause_on_anomaly`, `risk.daily_max_signals`, три `anomaly_thresholds.*`. **Реальні виходи живуть у `config/pairs/*.yaml`** (`stop_loss_ticks`, `max_hold_sec`, `stop_adverse_bps`, `sl_grace_sec`) і справді читаються `shadow_engine.py`/`config_loader.py`. Конкретна пастка: `config.yaml` обіцяє «нічого не живе >10 хв» (`hard_time_limit_sec: 600`), реальний ліміт **60с**. Перш ніж крутити будь-що в `config.yaml`, ДОВЕДИ мутацією, що ключ доходить до моделі: підстав абсурдне значення і звір `load_yaml(Path(...))` до і після.
+- **`shadow.fill_latency_ms` гірший за ті 36:** він ПРОХОДИТЬ у модель і сидить поруч із живими `entry_latency_min/max_ms`, але споживачів нуль. Стадія order->fill у shadow не змодельована взагалі.
+- **Неправильний `--slot N` БІЛЬШЕ НЕ ПАДАЄ** — заповнені обидва слоти на обох машинах, тож пробник тихо відпрацює проти чужого акаунта. Звіряй акаунт, а не покладайся на помилку.
 - `pip` in the container needs `--break-system-packages`.
 - Shell prompt chars (`❯`, `$`) pasted into commands.
 - Probe files vanishing after a rebuild — keep originals in `~/`.

@@ -249,7 +249,8 @@ async def init_live_db(live_db: LiveDatabase) -> None:
 
     # Idempotent column migration for DBs created before latency-logging patch.
     await _add_columns_idempotent_live(live_db, "live_trades", LIVE_TRADES_LATENCY_COLUMNS)
-    # 2026-07-20: per-signal join key (signal.created_at_ms) — no FK, links trade→signal_features.
+    # 2026-07-20: signal.created_at_ms. НЕ join до `signal_features` (колонки
+    # `signal_uid` там немає) — ключ для попарного порівняння у `shadow_twin`.
     await _add_columns_idempotent_live(live_db, "live_trades", [("signal_uid", "INTEGER")])
     # 2026-08-21: the limit price we ACTUALLY submitted. entry_slippage_pct used
     # to be measured against a stub equal to the signal price and so came out

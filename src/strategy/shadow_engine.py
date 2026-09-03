@@ -665,11 +665,13 @@ class ShadowEngine:
 
     async def start(self) -> None:
         await self._reload_pair_configs()
-        # NO-TRADES TG watchdog DISABLED 2026-08-17 (оператор: марний алерт —
+        # NO-TRADES TG watchdog вимкнено 2026-08-17 (оператор: марний алерт —
         # спамив "NO TRADES · SLOT1 HYPEUSDT" на парах у live-стані, що фактично
-        # не торгують). Цикл слав ЛИШЕ цей алерт, тож просто не стартуємо його.
-        # (container-healthcheck heartbeat у main.py — окремий, не чіпаємо.)
-        self._heartbeat_task = None
+        # не торгували). Цикл слав ЛИШЕ цей алерт, тож не стартував узагалі.
+        # 2026-09-03: сам цикл і `_heartbeat_keys` ВИДАЛЕНО (112 рядків) —
+        # вимкнений код, що півтора місяця виглядав як робоча сторожа.
+        # `NO TRADES` у логах: 0 входжень за весь архів на обох ботах.
+        # (container-healthcheck heartbeat у main.py — ІНШЕ, не чіпати.)
         # Детектор СПЛЕСКУ ВОЛАТИЛЬНОСТІ → Telegram-алерт (оператор сам
         # збільшує розмір). РОЗМІР/ОРДЕРИ НЕ ЧІПАЄ. Валідовано на 08-13/08-18.
         self._burst_alert_task = asyncio.create_task(self._burst_alert_loop())
@@ -701,12 +703,6 @@ class ShadowEngine:
             self._twin_tape_task.cancel()
             try:
                 await self._twin_tape_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if hasattr(self, "_heartbeat_task") and self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
             except (asyncio.CancelledError, Exception):
                 pass
         # Cancel funnel-log task
@@ -1114,97 +1110,6 @@ class ShadowEngine:
         except asyncio.CancelledError:
             return
 
-    async def _heartbeat_loop(self) -> None:
-        """
-        Every 5 minutes check if any live pair has been
-        silent (no live_trades) for >30 min. If so, send a Telegram alert.
-        Throttled to fire at most once per 60 minutes per pair.
-        """
-        check_interval_sec = 300       # check every 5min
-        silence_threshold_sec = 1800   # 30min without trade = alarm
-        last_alert: dict[str, int] = {}
-        alert_cooldown_sec = 3600      # at most 1 alert/hour per pair
-
-        try:
-            while not self._stop.is_set():
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=check_interval_sec)
-                    return  # _stop set → exit
-                except asyncio.TimeoutError:
-                    pass  # interval elapsed, run check
-
-                if self.alerts is None or self.live_db is None or self.state_manager is None:
-                    continue
-
-                try:
-                    now = int(time.time())
-                    # Get all pairs in live state
-                    live_pairs: list[str] = []
-                    try:
-                        live_pairs = [ps.symbol for ps in self.state_manager.states_by_status("live")]
-                    except Exception:
-                        continue
-
-                    if not live_pairs:
-                        continue
-
-                    # One grouped query instead of N sequential ones.
-                    # Old code did `await fetchall(... WHERE symbol=?)` per
-                    # pair — N roundtrips at N×~10ms each, blocking the
-                    # event loop. GROUP BY in a single query is O(1) trips.
-                    try:
-                        placeholders = ",".join("?" * len(live_pairs))
-                        rows = await self.live_db.fetchall(
-                            f"SELECT symbol, account_label, "
-                            f"       MAX(opened_at) AS last_ts "
-                            f"FROM live_trades "
-                            f"WHERE symbol IN ({placeholders}) "
-                            f"GROUP BY symbol, account_label",
-                            tuple(live_pairs),
-                        )
-                    except Exception:
-                        logger.exception("Heartbeat: batched fetch failed")
-                        continue
-
-                    # Keyed (symbol, account_label): grouped by symbol alone, a
-                    # slot that stopped trading stayed invisible for as long as
-                    # its sibling kept the pair's MAX(opened_at) fresh.
-                    last_ts_by_key: dict[tuple, int] = {}
-                    for r in rows or []:
-                        try:
-                            last_ts_by_key[(r["symbol"], r["account_label"])] = (
-                                int(r["last_ts"]) if r["last_ts"] else 0)
-                        except Exception:
-                            logger.debug("Heartbeat: unparseable last_ts row %r", r)
-
-                    for symbol, label in self._heartbeat_keys(live_pairs):
-                        last_ts = last_ts_by_key.get((symbol, label), 0)
-                        silence_sec = now - last_ts if last_ts else 999999
-
-                        if silence_sec >= silence_threshold_sec:
-                            # Throttle: don't alert more than once per cooldown
-                            if now - last_alert.get((symbol, label), 0) < alert_cooldown_sec:
-                                continue
-                            last_alert[(symbol, label)] = now
-
-                            silence_min = silence_sec // 60
-                            try:
-                                await self.alerts.send(
-                                    f"😴 <b>NO TRADES</b>"
-                                    f"{(' · <b>' + label.upper() + '</b>') if label else ''}\n"
-                                    f"Symbol: <code>{symbol}</code>\n"
-                                    f"Silent for: <b>{silence_min} min</b>\n"
-                                    f"Bot is alive but not trading. Check: kill switch? state? webkey?",
-                                    category=f"heartbeat:{symbol}:{label}",
-                                    throttle_sec=0,  # already throttled by last_alert dict
-                                    suppress_during_quiet=False,
-                                )
-                            except Exception:
-                                logger.exception("Failed to send heartbeat alert for %s", symbol)
-                except Exception:
-                    logger.exception("Heartbeat loop iteration failed")
-        except asyncio.CancelledError:
-            return
 
     async def _funnel_log_loop(self) -> None:
         """
@@ -1463,27 +1368,6 @@ class ShadowEngine:
         key = (slot, reason)
         self._slot_skips[key] = self._slot_skips.get(key, 0) + 1
 
-    def _heartbeat_keys(self, live_pairs) -> list:
-        """(symbol, account_label) pairs the heartbeat should watch.
-
-        One entry per live slot assigned to the pair, so a slot that stopped
-        trading is noticed even while its sibling keeps the pair busy. Falls
-        back to (symbol, None) when the slot map is unavailable — that is the
-        original symbol-wide behaviour.
-        """
-        keys: list = []
-        for symbol in live_pairs:
-            slots = []
-            if self.live_pool is not None:
-                try:
-                    slots = list(self.live_pool.find_slots_for_pair(symbol))
-                except Exception:
-                    slots = []
-            if slots:
-                keys.extend((symbol, f"slot{s}") for s in slots)
-            else:
-                keys.append((symbol, None))
-        return keys
 
     def _entry_slots(self, symbol: str) -> list:
         """Slots that act on a signal for this pair, each one independently.

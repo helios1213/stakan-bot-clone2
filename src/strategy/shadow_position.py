@@ -42,7 +42,12 @@ class ShadowPosition:
     detector_source: str            # which detector emitted the original signal
     confidence: float
     signal_id: int | None = None
-    signal_uid: int | None = None   # signal.created_at_ms — joins trade→signal_features (no FK)
+    # signal.created_at_ms. НЕ join-ключ до `signal_features`: колонки
+    # `signal_uid` там не було НІКОЛИ, а збіг за (symbol, ts) дає лише 20.4%
+    # (вимір n=500) — це два різні виклики time() плюс дедуп 800мс.
+    # Поле ЖИВЕ і потрібне: воно живить `shadow_twin` (попарне порівняння
+    # shadow/live на ОДНОМУ сигналі). Не видаляти.
+    signal_uid: int | None = None
     gap_ticks: float = 0.0          # signal gap size at entry (bid/ask ticks) — the real entry metric
 
     # Sizing
