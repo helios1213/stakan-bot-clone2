@@ -274,7 +274,12 @@ async def test_book_ticker_records_latency_advantage_sample():
 
     assert c.book_ticker_matched == 1
     assert len(c._bt_latency_advantage_ms) == 1
-    advantage = c._bt_latency_advantage_ms[0]
+    # ФОРМАТ ЗМІНЕНО 2026-09-04: тепер (ts_ms, advantage_ms), а не голе число.
+    # Вікно діагностики стало ЧАСОВИМ, бо `deque(maxlen=2000)` ніколи не
+    # обертався і `mean` був кумулятивний від старту процесу — один шторм
+    # отруював діагностику на добу вперед.
+    ts_ms, advantage = c._bt_latency_advantage_ms[0]
+    assert ts_ms > 0, "мітка часу семпла не проставлена — вікно не працюватиме"
     # Should be ~50ms (allow some scheduling slack)
     assert 30 <= advantage <= 200, f"unexpected advantage_ms={advantage}"
 

@@ -38,6 +38,11 @@ from src.exchanges.orderbook import OrderBookManager
 
 logger = logging.getLogger(__name__)
 
+# Скільки секунд діагностика bookTicker дивиться назад. Раніше вікна не було
+# зовсім — дек жив від старту процесу, тож `mean` не міг відновитись після
+# жодного шторму і брехав добами.
+BT_DIAG_WINDOW_SEC = 600
+
 
 @dataclass
 class Trade:
@@ -123,7 +128,12 @@ class BinanceWSClient:
         self._bt_last: dict[str, tuple[float, float, int]] = {}
         # Latency advantage samples in ms (bookTicker saw change N ms earlier
         # than depth diff). Bounded to avoid unbounded memory.
-        self._bt_latency_advantage_ms: deque[int] = deque(maxlen=2000)
+        # ВІКНО ЗА ЧАСОМ, не за кількістю. `deque(maxlen=2000)` ніколи не
+        # обертався (найбільше спостережене n=592 за 12 годин), тож `mean`
+        # був КУМУЛЯТИВНИЙ від старту процесу: один шторм отруював діагностику
+        # на добу вперед, а рядок друкувався ідентичним годинами.
+        # Тепер зберігаємо (ts_ms, advantage_ms) і ріжемо за віком.
+        self._bt_latency_advantage_ms: deque[tuple[int, int]] = deque(maxlen=20000)
         self.book_ticker_messages = 0
         # How many bookTicker frames actually MOVED the top (feed mode). The
         # gap between this and book_ticker_messages is the throttle we get for
@@ -226,6 +236,18 @@ class BinanceWSClient:
                 raise
             except Exception as e:
                 logger.error("Binance WS [%s] error: %s — reconnecting in %ds", name, e, delay)
+                if name == "book_ticker":
+                    # ОБОВʼЯЗКОВО СКИНУТИ ЗНІМКИ.
+                    #
+                    # `_bt_last` тримає (bid, ask, seen_at_ms) на символ і до
+                    # 2026-09-04 попався ЛИШЕ в `unsubscribe()` — на реконекті
+                    # ніколи. Через це поки стрім лежав у бекофі, перший же
+                    # depth-рух топу писав у `advantage_ms` не фору фіду, а
+                    # ВІК ОБРИВУ: спостережені 59951/59683/59418 мс проти
+                    # `max_reconnect_delay_sec: 60`, тобто метрика впиралась
+                    # рівно в стелю бекофу. Це згенерувало хибну тривогу
+                    # «фід деградував у 600 разів» 04.09.
+                    self._bt_last.clear()
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.cfg.max_reconnect_delay_sec)
 
@@ -621,7 +643,7 @@ class BinanceWSClient:
         # (clock jitter); clamp at 0 for clean stats.
         if advantage_ms < 0:
             advantage_ms = 0
-        self._bt_latency_advantage_ms.append(advantage_ms)
+        self._bt_latency_advantage_ms.append((now_ms, advantage_ms))
         self.book_ticker_matched += 1
 
     async def _book_ticker_summary_loop(self, interval_sec: int) -> None:
@@ -629,7 +651,9 @@ class BinanceWSClient:
         while not self._stop_event.is_set():
             try:
                 await asyncio.sleep(interval_sec)
-                samples = list(self._bt_latency_advantage_ms)
+                _cut = int(time.time() * 1000) - BT_DIAG_WINDOW_SEC * 1000
+                samples = [a for (t_, a) in self._bt_latency_advantage_ms
+                           if t_ >= _cut]
                 if not samples:
                     logger.info(
                         "[BOOK_TICKER_DIAG] no samples yet "

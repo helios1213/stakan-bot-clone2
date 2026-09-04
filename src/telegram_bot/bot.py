@@ -1577,6 +1577,19 @@ class StakanTelegramBot:
             keyboard_text_handler,
         ))
 
+    async def _on_handler_error(self, update, context) -> None:
+        """Логувати і жити далі. НІКОЛИ не піднімати виняток звідси.
+
+        Це остання лінія: усе, що не спіймали хендлери, приходить сюди. Якщо
+        цей метод сам кине — PTB знову покладе процес, тож він обгорнутий.
+        """
+        try:
+            logger.error("Telegram handler failed (update=%s): %s",
+                         getattr(update, "update_id", "?"),
+                         context.error, exc_info=context.error)
+        except Exception:
+            pass
+
     async def start(self) -> None:
         self.application = (
             Application.builder()
@@ -1597,6 +1610,15 @@ class StakanTelegramBot:
             self.application.bot_data["live_pool"] = self.live_pool
 
         self._register_handlers(self.application)
+
+        # ГЛОБАЛЬНИЙ ОБРОБНИК ПОМИЛОК — його не було ЗОВСІМ до 2026-09-04.
+        #
+        # Без нього виняток із будь-якого хендлера йшов угору через
+        # `Application._update_fetcher` і клав `asyncio.run(main())`, тобто
+        # ВЕСЬ торговий бот. Спіймано на живому: незловлений
+        # `httpx.ConnectTimeout` до `api.telegram.org` із `reply_text`.
+        # Мережевий таймаут до Telegram не має зупиняти торгівлю.
+        self.application.add_error_handler(self._on_handler_error)
 
         await self.application.initialize()
         # We drive the lifecycle manually (initialize/start/start_polling) instead

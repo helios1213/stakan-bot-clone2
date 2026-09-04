@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import traceback
 import signal
 import sys
 import time
@@ -91,9 +93,50 @@ def setup_logging(env_log_level: str, log_file: str) -> None:
     # with root level=0 the InterceptHandler runs getMessage() (frame __str__)
     # on each one BEFORE loguru drops it at INFO — pure CPU waste on the hot WS
     # path, bursting exactly when order submission needs the loop. Filter at source.
+    # httpx/httpcore ДОДАНО 2026-09-04. Вони логують КОЖЕН запит на рівні INFO
+    # разом із повним URL, а URL телеграм-API містить ТОКЕН. Виміряно перед
+    # правкою: 1 282 входження токена в поточному `stakan.log` і 120 145 в
+    # архівах. У CLAUDE.md від 20.08 стояло «3 входження» — це число застаріло
+    # на чотири порядки.
     for _noisy in ("websockets", "websockets.client", "websockets.protocol",
-                   "websockets.server", "asyncio", "urllib3"):
+                   "websockets.server", "asyncio", "urllib3",
+                   "httpx", "httpcore", "telegram", "telegram.ext"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+    # ЗАГЛУШЕННЯ РІВНЕМ НЕДОСТАТНЬО — і це головна половина фікса.
+    # Незловлений виняток друкує ТРЕЙСБЕК, а в ньому URL із токеном, причому
+    # на рівні ERROR, який жодне заглушення не прибирає. Саме так токен і
+    # потрапляв у лог тисячами рядків. Тому редагуємо сам ТЕКСТ запису.
+    _TOKEN_RE = re.compile(r"(bot)\d{6,12}:[A-Za-z0-9_-]{30,}")
+
+    class _RedactSecrets(logging.Filter):
+        """Вирізає телеграм-токен із будь-якого запису, включно з трейсбеками."""
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                if record.args:
+                    record.msg = record.getMessage()
+                    record.args = ()
+                if isinstance(record.msg, str) and "bot" in record.msg:
+                    record.msg = _TOKEN_RE.sub(r"\1<REDACTED>", record.msg)
+                # ТРЕЙСБЕК ТРЕБА ФОРМАТУВАТИ ТУТ САМИМ.
+                # `record.exc_text` на момент фільтра ще None — його заповнює
+                # форматер ПІСЛЯ нас. Тому форматуємо самі, редагуємо і кладемо
+                # в `exc_text`: форматер потім бере готовий рядок і повторно
+                # не формує. Без цього трейсбек `httpx.ConnectTimeout` до
+                # api.telegram.org і далі ніс би токен у лог на рівні ERROR,
+                # який жодним заглушенням не прибрати.
+                if record.exc_info and not record.exc_text:
+                    record.exc_text = "".join(
+                        traceback.format_exception(*record.exc_info))
+                if record.exc_text and "bot" in record.exc_text:
+                    record.exc_text = _TOKEN_RE.sub(r"\1<REDACTED>", record.exc_text)
+                    record.exc_info = None      # інакше loguru переформатує сире
+            except Exception:
+                pass          # логування ніколи не має ламати бота
+            return True
+
+    logging.getLogger().addFilter(_RedactSecrets())
 
 
 # ---- Heartbeat ----
