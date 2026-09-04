@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -1279,3 +1280,63 @@ async def test_a_slot_with_nothing_to_sell_still_finishes_promptly():
 
     await SlotWarmer.tick(w)
     assert w._wound_down is True and w.finished() is True and camp.finished == 1
+
+
+# --------------------------------------------------------------------------
+# Закриття: стан на диску пишеться ДО читання PnL (2026-09-04)
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_the_close_is_persisted_before_the_pnl_read(tmp_path):
+    """SIGKILL посеред читання PnL більше не лишає ФАНТОМНОЇ позиції.
+
+    Порядок був: закрити на біржі -> прочитати PnL (до 4 спроб, 1.5+3.0+4.5 =
+    9.0с сну) -> лише тоді очистити стан. Докерський грейс на зупинку —
+    10 секунд. Тобто SIGKILL цілком міг прилетіти між закриттям і записом, і
+    на диску лишався запис про позицію, якої на біржі вже НЕМАЄ: наступний
+    старт бачив фантом, а `record_pnl` не виконувався — дірка в обліку.
+
+    PnL — це ЗВІТНІСТЬ, факт закриття — це СТАН. Стан мусить лягати першим.
+    """
+    from src.execution import futures_soft_start as fss
+
+    seen_on_disk = {}
+
+    class _Client:
+        async def close_all_positions(self, sym):
+            return {"code": "0", "data": {}}
+
+    e = fss.FuturesSoftStart.__new__(fss.FuturesSoftStart)
+    e.client = _Client()
+    e.cfg = fss.FuturesSoftStartConfig(state_path=str(tmp_path / "f.json"))
+    e.state = fss.FuturesState(position={
+        "symbol": "HYPEUSDT", "side": 1, "vol": 1, "leverage": 9,
+        "opened_at": 0.0, "close_after": 1.0, "opened_live": True})
+    e.dry_run = False          # `sending` — property: not dry_run AND live_allowed()
+    e.budget = None
+    e.on_action = None
+    e.rng = __import__("random").Random(0)
+    e.last_closed = None
+    e._last_fee_estimate = 0.0
+
+    async def _pnl(pos):
+        # Момент, коли читання PnL ТІЛЬКИ починається — саме тут прилітав SIGKILL.
+        raw = json.loads(open(e.cfg.state_path).read())
+        seen_on_disk["position"] = raw.get("position")
+        return -0.12
+    e._realised_pnl = _pnl
+
+    monkey = __import__("os")
+    _prev = monkey.environ.get(fss.LIVE_ENV)
+    monkey.environ[fss.LIVE_ENV] = "1"
+    try:
+        assert await e.close_position(forced=True) is True
+    finally:
+        if _prev is None: monkey.environ.pop(fss.LIVE_ENV, None)
+        else: monkey.environ[fss.LIVE_ENV] = _prev
+
+    assert "position" in seen_on_disk, "PnL не читався — тест нічого не міряє"
+    assert seen_on_disk["position"] is None, (
+        "на диску ще лежала позиція на момент читання PnL — SIGKILL у цьому "
+        "вікні лишив би фантом")
+    assert e.state.position is None

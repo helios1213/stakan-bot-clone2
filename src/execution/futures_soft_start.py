@@ -594,6 +594,20 @@ class FuturesSoftStart:
             return False
 
         held = pos.held_minutes()
+
+        # ЗАПИС ПРО ЗАКРИТТЯ — НЕГАЙНО, ЩЕ ДО ЧИТАННЯ PnL.
+        #
+        # Біржа щойно підтвердила закриття (`code == 0`), тобто позиції вже
+        # НЕМАЄ. Стан на диску мусить це відображати ОДРАЗУ, бо читання PnL
+        # нижче ретраїть до 4 разів і спить 1.5+3.0+4.5 = 9.0 секунд — а
+        # докерський грейс на зупинку контейнера всього 10с (`stop_grace_period`
+        # тепер 60с, але покладатись лише на нього не можна: SIGKILL посеред
+        # цього вікна лишав на диску ФАНТОМНУ позицію, якої на біржі немає).
+        # PnL — це ЗВІТНІСТЬ; факт закриття — це СТАН. Плутати їх не можна.
+        self._count("futures_closes")
+        self.state.position = None
+        save_state(self.cfg.state_path, self.state)
+
         # РЕАЛІЗОВАНИЙ PnL із біржі, а не з наших припущень. Модель вартості
         # рахувала лише спред+фандинг+комісію і свідомо ігнорувала рух ринку —
         # але за 53 хвилини тримання рух і є основною частиною вартості: на
@@ -611,9 +625,6 @@ class FuturesSoftStart:
                 self.budget.record_pnl(realised, f"futures {pos.symbol}")
             except Exception:
                 logger.debug("futures soft-start: PnL не записано", exc_info=True)
-        self._count("futures_closes")
-        self.state.position = None
-        save_state(self.cfg.state_path, self.state)
         return True
 
     def _count(self, kind: str, n: int = 1) -> None:
