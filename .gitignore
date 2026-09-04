@@ -48,3 +48,8 @@ src.before-cleanup/
 
 # Claude Code local tool config
 .claude/
+
+# ВИНЯТОК: q[0-9]*.py у checks/research/ — це ЄДИНІ читачі signal_features
+# (рекордера). Загальне правило писалось під разові чернетки в корені; через
+# нього дев'ять робочих скриптів прожили поза версійним контролем.
+!checks/research/q[0-9]*.py
