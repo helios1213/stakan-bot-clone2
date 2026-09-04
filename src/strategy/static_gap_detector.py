@@ -38,6 +38,7 @@ from src.exchanges.orderbook import OrderBookManager
 from src.execution.live_executor import get_tick_size
 from src.exchanges.mexc_rest import to_mexc, get_binance_scale
 from src.strategy.signal import Signal, SignalWriter
+from src.strategy.signal_recorder import SignalRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ class StaticGapDetector:
         signal_writer: SignalWriter,
         reference_only_symbols: set[str] | None = None,
         db = None,           # DB per-pair config fallback (used when config_loader has no value; wired from main.py)
-        research_db = None,  # isolated DB (orderbook); no SignalRecorder on clone
+        research_db = None,  # isolated DB for signal_features writes (wired from main.py)
         config_loader = None,  # YAML-based per-pair config (preferred)
         pair_config_ttl_sec: float = 30.0,
     ) -> None:
@@ -200,6 +201,21 @@ class StaticGapDetector:
         # float multiply on every _check_symbol call.
         self._fast_paths: dict[str, _SymbolFastPath] = {}
 
+        # ─── leader/follower velocity (revives binance_impulse_pct) ──────
+        # Per-symbol rolling mid history; impulse = mid move over _VELO_WINDOW_MS
+        # in bps. Binance impulse (in signal direction) is the "is the leader
+        # actually moving NOW" feature — was a hardcoded 0.0 stub before.
+        self._VELO_WINDOW_MS = 300
+        self._bmid_hist: dict[str, deque] = {}
+        self._mmid_hist: dict[str, deque] = {}
+        self._gap_open_ms: dict[tuple, int] = {}   # (symbol,dir) -> first-seen ms (gap age)
+
+        # ─── signal recorder (log-only entry-feature discovery) ─────────
+        self._recorder = SignalRecorder(
+            research_db if research_db is not None else db,
+            os.environ.get("SIGNAL_RECORDER", "0") == "1")
+        self._recorder_task: asyncio.Task | None = None
+
     async def start(self) -> None:
         if not self.cfg.enabled:
             logger.info("StaticGapDetector disabled in config")
@@ -212,6 +228,13 @@ class StaticGapDetector:
             # in scan loop will retry. Just log.
             logger.warning("Initial pair_overrides load failed: %s", e)
         self._task = asyncio.create_task(self._scan_loop(), name="static_gap_detector")
+        if self._recorder.enabled:
+            try:
+                await self._recorder.ensure_table()
+            except Exception as e:
+                logger.warning("[SIGNAL_RECORDER] ensure_table failed: %s", e)
+            self._recorder_task = asyncio.create_task(
+                self._recorder_flush_loop(), name="signal_recorder_flush")
         logger.info(
             "StaticGapDetector started (min_gap=%dt interval=%.2fs cooldown=%.1fs)",
             self.cfg.min_gap_ticks,
@@ -233,6 +256,27 @@ class StaticGapDetector:
                 await self._metric_log_task
             except (asyncio.CancelledError, Exception):
                 pass
+        if self._recorder_task:
+            self._recorder_task.cancel()
+            try:
+                await self._recorder_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await self._recorder.flush()
+        except Exception:
+            pass
+
+    async def _recorder_flush_loop(self) -> None:
+        """Batch-write finalized signal_features rows every ~2s (log-only)."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(2.0)
+                await self._recorder.flush()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning("[SIGNAL_RECORDER] flush loop error: %s", e)
 
     # ─── per-pair config cache ──────────────────────────────────────────
     async def _reload_pair_overrides(self) -> None:
@@ -605,12 +649,80 @@ class StaticGapDetector:
         b_mid = (b_bid_p + b_ask_p) / 2
         m_mid = (m_bid_p + m_ask_p) / 2
 
+        # ─── leader/follower velocity (revives binance_impulse_pct) ──────
+        # Rolling mid history → impulse = mid move over _VELO_WINDOW_MS in bps.
+        # Cheap (deque append + 1-2 pops + 2 divs); runs always — it feeds the
+        # real Signal AND the recorder. `_raw` is unsigned (up=+); sign by dir.
+        _now_ns = time.perf_counter_ns()
+        _cut = _now_ns - self._VELO_WINDOW_MS * 1_000_000
+        _bh = self._bmid_hist.setdefault(symbol, deque())
+        _mh = self._mmid_hist.setdefault(symbol, deque())
+        _bh.append((_now_ns, b_mid)); _mh.append((_now_ns, m_mid))
+        while len(_bh) > 1 and _bh[0][0] < _cut: _bh.popleft()
+        while len(_mh) > 1 and _mh[0][0] < _cut: _mh.popleft()
+        b_impulse_raw = (b_mid - _bh[0][1]) / _bh[0][1] * 1e4 if _bh[0][1] > 0 else 0.0
+        m_impulse_raw = (m_mid - _mh[0][1]) / _mh[0][1] * 1e4 if _mh[0][1] > 0 else 0.0
+
+        # forward-fill any pending recorder candidates with this fresh MEXC book
+        self._recorder.on_tick(symbol, now_ms, m_mid, m_ask_p, m_bid_p)
+
         long_gap_ticks  = (b_bid_p - m_bid_p) / tick_scaled
         short_gap_ticks = (m_ask_p - b_ask_p) / tick_scaled
 
-        # exec_buy/sell kept for logging (informational).
+        # Підняте вище рекордера, щоб exec потрапляв у signal_features: раніше
+        # рахувалось нижче й нікуди не зберігалось. Чиста арифметика, порядок
+        # обчислень ні на що інше не впливає.
         exec_buy_ticks  = (b_bid_p - m_ask_p) / tick_scaled
         exec_sell_ticks = (m_bid_p - b_ask_p) / tick_scaled
+
+        # ─── SIGNAL RECORDER: log the FULL candidate space (incl. rejected) ──
+        if self._recorder.enabled:
+            _cdir = "long" if long_gap_ticks >= short_gap_ticks else "short"
+            _cgap = long_gap_ticks if _cdir == "long" else short_gap_ticks
+            _gk = (symbol, _cdir)
+            if _cgap >= self._recorder.record_min_ticks:
+                self._gap_open_ms.setdefault(_gk, now_ms)
+                _sign = 1.0 if _cdir == "long" else -1.0
+                # OrderBookLevel is (price, size) — reading `.volume` raised
+                # AttributeError on EVERY signal and the bare except below turned
+                # it into the 0.5 default, so this column was a constant from the
+                # day it was added. Narrow except: only a missing book is a normal
+                # condition, an attribute error must not be silently absorbed
+                # again.
+                try:
+                    _mb = mexc_ob.best_bid(); _ma = mexc_ob.best_ask()
+                    _bv = _mb.size if _mb else 0.0; _av = _ma.size if _ma else 0.0
+                    _imb = _bv / (_bv + _av) if (_bv + _av) > 0 else 0.5
+                except (AttributeError, TypeError, ZeroDivisionError):
+                    logger.warning(
+                        "[RECORDER] book_imbalance unreadable for %s — check "
+                        "OrderBookLevel fields", symbol)
+                    _imb = 0.5
+                self._recorder.record(symbol, _cdir, now_ms, m_mid, {
+                    "gap_ticks": round(_cgap, 3),
+                    "long_gap": round(long_gap_ticks, 3),
+                    "short_gap": round(short_gap_ticks, 3),
+                    "mid_gap_bps": round((b_mid - m_mid) / b_mid * 1e4, 3) if b_mid > 0 else 0.0,
+                    "passes_gate": 1 if _cgap >= eff_min_gap_ticks - gap_eps else 0,
+                    "bin_impulse": round(_sign * b_impulse_raw, 3),
+                    "mexc_impulse": round(_sign * m_impulse_raw, 3),
+                    "spread_bps": round((m_ask_p - m_bid_p) / m_mid * 1e4, 3) if m_mid > 0 else 0.0,
+                    "imbalance": round(_imb, 3),
+                    "gap_age_ms": now_ms - self._gap_open_ms.get(_gk, now_ms),
+                    "hour": time.localtime(now_ms / 1000).tm_hour,
+                    "entry_exec": m_ask_p if _cdir == "long" else m_bid_p,
+                    "exec_ticks": round(exec_buy_ticks if _cdir == "long"
+                                        else exec_sell_ticks, 3),
+                    # Ставиться воротами нижче через recorder.mark_rejected().
+                    "rejected_by": None,
+                    # Вік лідерського bookTicker-івенту на момент детекції
+                    # (feed-режим). None коли feed вимкнено (top_lead_ts_ms=0).
+                    "binance_signal_age_ms": (
+                        (now_ms - binance_ob.top_lead_ts_ms)
+                        if getattr(binance_ob, "top_lead_ts_ms", 0) else None),
+                })
+            else:
+                self._gap_open_ms.pop(_gk, None)
 
         # Direction selection. Both directions could theoretically fire
         # at once if both sides of MEXC lag Binance simultaneously
@@ -637,6 +749,7 @@ class StaticGapDetector:
 
         if direction is None:
             self.signals_skip_below_threshold += 1
+            self._recorder.mark_rejected(symbol, now_ms, "below_min_ticks")
             self._last_emitted_direction.pop(symbol, None)
             return
 
@@ -645,6 +758,7 @@ class StaticGapDetector:
             ovr = self._pair_overrides.get(symbol)
             if ovr is not None and ovr.long_only:
                 self.signals_skip_direction_filter += 1
+                self._recorder.mark_rejected(symbol, now_ms, "long_only")
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
@@ -653,28 +767,33 @@ class StaticGapDetector:
             ovr = self._pair_overrides.get(symbol)
             if ovr is not None and getattr(ovr, "short_only", False):
                 self.signals_skip_direction_filter += 1
+                self._recorder.mark_rejected(symbol, now_ms, "short_only")
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
-        # Spread-cap gate: reject when the MEXC book is too wide to fill
-        # cleanly (ported from primary 2026-06-21). Per-pair max_spread_bps; 0=off.
-        # TICKS take priority over bps, because the MEXC spread is always a
-        # whole number of ticks: a bps cap is really "<= N ticks" where N jumps as
-        # the price crosses levels. On TAO (tick $0.01) the 2.0 bps cap is <=2t
-        # below $150, <=3t at $191 and <=4t above $200 — the gate re-tunes itself
-        # on a price move with no config edit. Same failure as min_mexc_lag_pct and
-        # the PEPE entry band, both fixed 2026-08-04. Both keys 0 = off.
+        # Spread-cap gate: reject when the MEXC book is too wide to fill cleanly
+        # (verified real-money lever: wide-spread signals fill into toxic
+        # post-convergence prints).
+        #
+        # TICKS take priority over bps, because the MEXC spread is always a whole
+        # number of ticks: a bps cap is really "<= N ticks" where N jumps as the
+        # price crosses levels. On TAO (tick $0.01) the 2.0 bps cap is <=2t below
+        # $150, <=3t at $191 and <=4t above $200 — the gate re-tunes itself on a
+        # price move with no config edit. Same failure as min_mexc_lag_pct and the
+        # PEPE entry band, both fixed 2026-08-04. Both keys 0 = off.
         _ovr_sp = self._pair_overrides.get(symbol)
         if _ovr_sp is not None and m_mid > 0:
             _sp_raw = m_ask_p - m_bid_p
             if _ovr_sp.max_spread_ticks > 0 and tick_scaled > 0:
                 if _sp_raw / tick_scaled > _ovr_sp.max_spread_ticks + gap_eps:
                     self.signals_skip_wide_spread_t += 1
+                    self._recorder.mark_rejected(symbol, now_ms, "max_spread_ticks")
                     self._last_emitted_direction.pop(symbol, None)
                     return
             elif _ovr_sp.max_spread_bps > 0:
                 if _sp_raw / m_mid * 1e4 > _ovr_sp.max_spread_bps:
                     self.signals_skip_wide_spread += 1
+                    self._recorder.mark_rejected(symbol, now_ms, "max_spread_bps")
                     self._last_emitted_direction.pop(symbol, None)
                     return
 
@@ -696,11 +815,13 @@ class StaticGapDetector:
         if _ovr_mg is not None and _ovr_mg.min_mid_gap_ticks > 0 and tick_scaled > 0:
             if abs(b_mid - m_mid) / tick_scaled < _ovr_mg.min_mid_gap_ticks - gap_eps:
                 self.signals_skip_narrow_mid_gap += 1
+                self._recorder.mark_rejected(symbol, now_ms, "min_mid_gap_ticks")
                 self._last_emitted_direction.pop(symbol, None)
                 return
         if _ovr_mg is not None and _ovr_mg.max_mid_gap_ticks > 0 and tick_scaled > 0:
             if abs(b_mid - m_mid) / tick_scaled > _ovr_mg.max_mid_gap_ticks + gap_eps:
                 self.signals_skip_wide_mid_gap += 1
+                self._recorder.mark_rejected(symbol, now_ms, "max_mid_gap_ticks")
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
@@ -721,6 +842,7 @@ class StaticGapDetector:
             _exec_t = exec_buy_ticks if direction == "long" else exec_sell_ticks
             if _exec_t < _ovr_ex.min_exec_ticks - gap_eps:
                 self.signals_skip_no_exec_edge += 1
+                self._recorder.mark_rejected(symbol, now_ms, "min_exec_ticks")
                 self._last_emitted_direction.pop(symbol, None)
                 return
 
@@ -729,6 +851,10 @@ class StaticGapDetector:
         last_dir = self._last_emitted_direction.get(symbol)
         if now_ms < cooldown_until and last_dir == direction:
             self.signals_skip_cooldown += 1
+            # Ворота пройдено — прибрав анти-дублікатний захист. passes_gate
+            # лишається 1, інакше дві різні причини зіллються в одну.
+            self._recorder.mark_rejected(symbol, now_ms, "cooldown",
+                                         clears_gate=False)
             return
 
         # Confidence: scales linearly with how far above threshold.
@@ -750,7 +876,10 @@ class StaticGapDetector:
             confidence=confidence,
             binance_price=b_mid,
             mexc_price=m_mid,
-            binance_impulse_pct=0.0,
+            # REVIVED (was hardcoded 0.0): Binance mid impulse over the last
+            # ~300ms, in bps, SIGNED in the signal direction (+ = leader moving
+            # our way NOW). The "is this a real lead or stale noise" feature.
+            binance_impulse_pct=round((1.0 if direction == "long" else -1.0) * b_impulse_raw, 4),
             mexc_lag_pct=mexc_lag_pct,
             metadata={
                 "gap_ticks": round(gap_ticks, 2),
