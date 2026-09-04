@@ -3,6 +3,12 @@ services:
   stakan-bot:
     build: .
     container_name: stakan-bot
+    # ГРЕЙС НА ЗУПИНКУ. Дефолт docker — 10с, і цього НЕ ВИСТАЧАЄ: дренаж
+    # прогріву при відкритій позиції читає реалізований PnL із ретраями
+    # (1.5+3.0+4.5 = 9.0с сну), а reconcile_pending має власні 9.0с у тому
+    # самому вікні. SIGKILL посеред дренажу лишав фантомний запис на диску і
+    # дірку в обліку кампанії. 60с дають дренажу вдосталь запасу.
+    stop_grace_period: 60s
     restart: unless-stopped
     dns:
       - 108.61.10.10   # Vultr Tokyo resolver -> Akamai 23.56.0.x fast POP (~0.5ms)
