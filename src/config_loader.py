@@ -48,13 +48,13 @@ class DetectorConfig:
     cooldown_sec: float = 5.0
     long_only: bool = False
     short_only: bool = False
-    max_spread_bps: float = 0.0
+    max_spread_bps: float = 0.0   # >0 = reject signals when MEXC book spread exceeds this (bps); 0=off
     # >0 = the same cap in TICKS, and it WINS over max_spread_bps.
     # The MEXC spread is always a whole number of ticks, so a bps cap is
     # really "<= N ticks" where N jumps as the price crosses levels: on TAO
     # (tick $0.01) a 2.0 bps cap is <=2t below $150, <=3t at $191, <=4t above
     # $200. Ticks do not drift. 0 = off (default; behaviour-preserving).
-    max_spread_ticks: float = 0.0   # >0 = reject signals when MEXC book spread exceeds this (bps); 0=off
+    max_spread_ticks: float = 0.0
     # >0 = reject signals whose BINANCE<->MEXC MID gap is below this many
     # ticks. Distinct from min_ticks, which reads the same-side quote gap
     # and so is also satisfied by a wide MEXC book:
