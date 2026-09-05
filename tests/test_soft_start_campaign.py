@@ -598,6 +598,8 @@ async def test_expired_campaign_winds_down_before_switching_off():
         # вміти, інакше він розійдеться з реальним SoftStartCampaign і
         # тест мовчки перевірятиме не той шлях.
         def preclear_pending(self): return False
+        # Частка залишку тепер розігрується кампанією (2026-09-05).
+        def wind_down_keep(self): return 0.20
         # state.tokens — раннер бере набір кампанії, щоб розпродати й монети
         # зі старого юніверсу. Фейк мусить це вміти, інакше виняток тихо
         # проковтнеться і тест побачить лише «finish».
@@ -640,6 +642,8 @@ async def test_wind_down_gets_another_tick_while_it_still_sells():
         # вміти, інакше він розійдеться з реальним SoftStartCampaign і
         # тест мовчки перевірятиме не той шлях.
         def preclear_pending(self): return False
+        # Частка залишку тепер розігрується кампанією (2026-09-05).
+        def wind_down_keep(self): return 0.20
         state = type("S", (), {"tokens": ["LINK"]})()
         def expired(self): return True
         def finish(self): finished.append(1)
@@ -676,6 +680,8 @@ async def test_a_failing_wind_down_does_not_wedge_the_slot_forever():
         # вміти, інакше він розійдеться з реальним SoftStartCampaign і
         # тест мовчки перевірятиме не той шлях.
         def preclear_pending(self): return False
+        # Частка залишку тепер розігрується кампанією (2026-09-05).
+        def wind_down_keep(self): return 0.20
         state = type("S", (), {"tokens": ["LINK"]})()
         def expired(self): return True
         def finish(self): finished.append(1)
@@ -713,6 +719,8 @@ async def test_runner_passes_the_full_token_pool_to_wind_down():
         # вміти, інакше він розійдеться з реальним SoftStartCampaign і
         # тест мовчки перевірятиме не той шлях.
         def preclear_pending(self): return False
+        # Частка залишку тепер розігрується кампанією (2026-09-05).
+        def wind_down_keep(self): return 0.20
         state = type("S", (), {"tokens": ["LINK", "PENGU"]})()
         def expired(self): return True
         def finish(self): pass

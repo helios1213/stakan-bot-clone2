@@ -48,13 +48,18 @@ logger = logging.getLogger(__name__)
 
 POLL_SEC = 60
 
-# Яка частка СПОТОВОГО БАЛАНСУ (монети + вільний USDT) лишається в монетах
-# після кампанії — не частка вартості самих монет і не частка кожної монети
-# окремо: це різні числа (див. `wind_down` у spot_soft_start.py: 3.46 проти
-# 5.09). Не нуль:
-# рахунок, вичищений у нуль рівно в мить завершення прогріву, — це теж
-# патерн, і помітніший за невеликий залишок.
-SPOT_WIND_DOWN_KEEP = 0.20
+# Частка спотового балансу, що лишається в монетах після кампанії, живе НЕ
+# ТУТ: з 2026-09-05 це діапазон [0.15; 0.25], який `SoftStartCampaign`
+# розігрує раз на кампанію і зберігає (`wind_down_keep()`). Константи —
+# `WIND_DOWN_KEEP_MIN/MAX` у soft_start_campaign.py.
+#
+# ЧОМУ ДІАПАЗОН: рівно 0.20 після КОЖНОЇ кампанії й на КОЖНОМУ акаунті —
+# це підпис; решта прогріву рандомізована, а ця частка лишалась константою.
+# ЧОМУ НЕ НУЛЬ: рахунок, вичищений у нуль рівно в мить завершення прогріву,
+# теж патерн, і помітніший за невеликий залишок.
+# ВІД ЧОГО РАХУЄТЬСЯ: від спотового балансу РАЗОМ (монети + вільний USDT), а
+# не від вартості монет і не від кожної монети окремо — це різні числа
+# (див. `wind_down` у spot_soft_start.py: 3.46 проти 5.09).
 
 # Кандидати на спотовий прогрів. Юніверс був `("MX",)` — один токен, тобто
 # всі покупки йшли по MX, а `tokens_per_day_max=4` не мав сенсу взагалі.
@@ -629,8 +634,8 @@ class SlotWarmer:
                         list(self.spot.plan.tokens)
                         + list(self.campaign.state.tokens or [])
                         + list(SPOT_CANDIDATES)))
-                    sent = await self.spot.wind_down(SPOT_WIND_DOWN_KEEP,
-                                                     tokens=_pool)
+                    _keep = self.campaign.wind_down_keep()
+                    sent = await self.spot.wind_down(_keep, tokens=_pool)
                     self._wind_passes += 1
                     if sent and self._wind_passes < MAX_WIND_DOWN_PASSES:
                         logger.info("soft-start slot %d: розпродаж — %d ордер(ів)"
@@ -661,7 +666,8 @@ class SlotWarmer:
                     # «лишили ~20%» навіть тоді, коли не продалось нічого.
                     logger.info("soft-start slot %d: розпродаж завершено "
                                 "(ціль %.0f%%), у монетах зараз ~%.2f USDT",
-                                self.slot_id, SPOT_WIND_DOWN_KEEP * 100,
+                                self.slot_id,
+                                self.campaign.wind_down_keep() * 100,
                                 self._held_spot_value())
                 except Exception:
                     logger.exception("soft-start slot %d: розпродаж упав — "

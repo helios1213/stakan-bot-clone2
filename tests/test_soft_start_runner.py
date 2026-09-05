@@ -62,6 +62,8 @@ class FakeCampaign:
     # вміти, інакше він розійдеться з реальним SoftStartCampaign і
     # тест мовчки перевірятиме не той шлях.
     def preclear_pending(self): return False
+    # Частка залишку тепер розігрується кампанією (2026-09-05).
+    def wind_down_keep(self): return 0.20
     def __init__(self, done=False):
         self.done = done
 
@@ -496,6 +498,8 @@ async def test_an_idle_futures_half_still_drains_a_leftover_position():
                                 # ПЕРШИМ і виходить, якщо True. Дзеркалимо тут,
                                 # як і просить коментар вище.
                                 "preclear_pending": lambda self: False,
+                                # Частка залишку — теж з кампанії (2026-09-05).
+                                "wind_down_keep": lambda self: 0.20,
                                 "day_weight": lambda self: 1.0,
                                 "scale_target": lambda self, base: base,
                                 "finish": lambda self: None,

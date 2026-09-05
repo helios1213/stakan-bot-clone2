@@ -49,6 +49,8 @@ class _Camp:
     # вміти, інакше він розійдеться з реальним SoftStartCampaign і
     # тест мовчки перевірятиме не той шлях.
     def preclear_pending(self): return False
+    # Частка залишку тепер розігрується кампанією (2026-09-05).
+    def wind_down_keep(self): return 0.20
     def __init__(self):
         self.finished = 0
         self.state = type("S", (), {"tokens": ["MX"]})()

@@ -936,6 +936,8 @@ async def test_held_value_is_remeasured_after_the_wind_down():
         # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це ПЕРШИМ і виходить, якщо
         # True. Фейк мусить уміти, інакше тест перевіряв би не той шлях.
         def preclear_pending(self): return False
+        # Частка залишку тепер розігрується кампанією (2026-09-05).
+        def wind_down_keep(self): return 0.20
 
     class _Spot:
         plan = type("P", (), {"tokens": ["MX"]})()
