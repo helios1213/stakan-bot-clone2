@@ -2,7 +2,8 @@
 LiveDatabase — окрема SQLite БД для live trading даних.
 
 Повністю ізольована від shadow DB. Створюється і керується незалежно.
-Schema: live_trades, live_state.
+Schema: live_trades, live_open_misses, live_state, slot_pnl_reset,
+        live_schema_version.
 
 Використання:
     live_db = LiveDatabase("/app/data/stakan-live.db")

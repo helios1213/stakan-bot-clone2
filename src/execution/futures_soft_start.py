@@ -94,8 +94,10 @@ class FuturesSoftStartConfig:
     # без промо прогрів не йшов узагалі — а це саме той акаунт, якому прогрів
     # потрібен найбільше. Тепер нуль — це ПЕРЕВАГА, а не умова: платні пари
     # беруться теж, а комісія списується у бюджет як витрата.
-    # `require_zero_taker=True` лишається як ПРІОРИТЕТ (спершу шукаємо 0/0),
-    # а `allow_paid_fees=False` повертає стару жорстку поведінку.
+    # Пріоритет 0/0 лишається, але він БЕЗУМОВНИЙ: `pick_pair` повертає першу
+    # ж пару з `zero_both`, а прапорця `require_zero_taker` не читає ніхто
+    # (греп по src/ і tests/: лише оголошення нижче). `allow_paid_fees=False`
+    # повертає стару жорстку поведінку.
     # Години, у які дозволено ВІДКРИВАТИ. Спотова половина такий гейт мала з
     # самого початку, фʼючерсна — ні, і 26.08 вона відкрила позицію о 01:35
     # ночі, поки спот законно спав. Одна половина суворо тримається людських
@@ -213,7 +215,7 @@ def live_allowed() -> bool:
 
 
 class FuturesSoftStart:
-    """Open -> hold 10-300min -> close, 1-3 times a day, 3-10h apart.
+    """Open -> hold 10-300min -> close, 1-6 times a day, 3-10h apart.
 
         ss = FuturesSoftStart(client, fee_gate, universe=[...])
         await ss.recover()          # close anything left open by a restart
@@ -296,10 +298,11 @@ class FuturesSoftStart:
     def _size_position(self, sym: str, leverage: int, fee_frac: float = 0.0):
         """(contracts, margin_usdt, notional_usdt) or (None, ..) to skip.
 
-        Skips when: the contract metadata is unreadable, a single contract would
-        tie up too much of the wallet, or the round-trip cost would breach the
-        spend ceiling. Every skip is a refusal to trade — never a silent
-        fallback to some other size.
+        Skips when: the contract metadata is unreadable, or a single contract
+        would tie up too much of the wallet. Стелі витрат більше немає (див.
+        коментар нижче в цій же функції), тож вартість round-trip тут нічого
+        не блокує. Every skip is a refusal to trade — never a silent fallback
+        to some other size.
         """
         from .soft_start_budget import (affordable, contracts_for_margin,
                                         futures_round_trip_cost, futures_target_margin)

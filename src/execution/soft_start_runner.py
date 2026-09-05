@@ -5,10 +5,14 @@ alive per enabled slot. Flipping the Telegram button is all it takes — no
 restart, no redeploy.
 
 Per slot it runs both halves of the spec:
-  * SpotSoftStart     — 1-4 tokens/day, 0-10 buys, 0-10 sells, 1-150 USDT,
+  * SpotSoftStart     — 1-4 tokens/day, 0-25 buys, 0-20 sells, order size
+                        scaled to the balance (config default 1.5-150 USDT),
                         always keeping a baseline hold of each token.
-  * FuturesSoftStart  — 1-3 orders/day, hold 10-300min, 3-10h apart, and ONLY
-                        on pairs this account trades at 0% (checked per open).
+  * FuturesSoftStart  — 1-6 orders/day, hold 10-300min, 3-10h apart, and
+                        PREFERRING pairs this account trades at 0% (fee checked
+                        per open) — since 2026-08-26 a paid pair is warmed too,
+                        the cheapest one under `max_fee_frac` (10 bps/leg);
+                        `allow_paid_fees=False` restores the old 0%-only rule.
 
 Safety:
   * DRY-RUN unless `SOFT_START_LIVE=1` is set in the environment. The button
@@ -43,7 +47,10 @@ logger = logging.getLogger(__name__)
 
 POLL_SEC = 60
 
-# Скільки вартості монет лишається на балансі після кампанії. Не нуль:
+# Яка частка СПОТОВОГО БАЛАНСУ (монети + вільний USDT) лишається в монетах
+# після кампанії — не частка вартості самих монет і не частка кожної монети
+# окремо: це різні числа (див. `wind_down` у spot_soft_start.py: 3.46 проти
+# 5.09). Не нуль:
 # рахунок, вичищений у нуль рівно в мить завершення прогріву, — це теж
 # патерн, і помітніший за невеликий залишок.
 SPOT_WIND_DOWN_KEEP = 0.20
@@ -607,7 +614,9 @@ class SlotWarmer:
         await self._report_diff(before, self._snapshot())
 
     def finished(self) -> bool:
-        """True when this slot has nothing left to do: campaign over or budget spent."""
+        """True when this slot has nothing left to do: the campaign EXPIRED
+        (time only — the spend ceiling was removed) and the wind-down sell-off
+        has finished."""
         # Кампанія закінчується ЛИШЕ за часом (3 дні). Стелю витрат прибрано
         # свідомо: прогрів має гріти, а не впиратись у ліміт.
         if not self.campaign.expired():
@@ -920,9 +929,11 @@ async def soft_start_loop(store, client_pool, universe_provider,
                     logger.exception("soft-start slot %d: tick failed", sid)
                     continue
 
-                # A finished campaign (or a spent budget) switches ITSELF off in
-                # the DB, so the button reflects reality rather than claiming to
-                # warm an account nothing is happening on.
+                # A finished campaign switches ITSELF off in the DB, so the
+                # button reflects reality rather than claiming to warm an
+                # account nothing is happening on. Завершує її ЛИШЕ час: стелю
+                # витрат прибрано, тож по бюджету це не спрацьовує — гілка
+                # "spend ceiling reached" нижче лишилась, але недосяжна.
                 if w.finished():
                     reason = ("campaign finished" if w.campaign.expired()
                               else "spend ceiling reached")

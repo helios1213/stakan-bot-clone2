@@ -1,4 +1,4 @@
-"""A hard spend ceiling for account warming, and balance-driven sizing.
+"""What account warming costs (the ceiling is gone), and balance-driven sizing.
 
 Two problems this solves.
 
@@ -11,13 +11,17 @@ Two problems this solves.
    actually burns is:
 
      * spread it crosses to make an order fill (`marketable_buffer` per side),
+     * комісія біржі за ордер / за ногу (`fee_frac`, з 2026-08-26),
      * funding on a futures position held across a settlement,
      * a futures close that came back negative.
 
-   The first two are known BEFORE the order is sent, so they are charged
-   up-front and an order that would breach the ceiling is never placed. The
-   third is charged after the fact. Profitable closes do NOT refund the budget —
-   the ceiling is a one-way ratchet, which is the conservative reading.
+   Перші три відомі ДО відправки і заряджаються наперед через `charge()` —
+   одностороннє: прибуток `spent` не повертає. Четвертий сюди НЕ заряджається
+   взагалі: реалізований PnL (у тому числі відʼємне закриття) живе окремо в
+   `record_pnl()`, і той ДВОСТОРОННІЙ; разом вони дають `net_cost`.
+   СТЕЛІ БІЛЬШЕ НЕМАЄ (рішення оператора): `can_afford()` і `exhausted()`
+   лишились, але з `src/` їх не кличе НІХТО — ордер через них не блокується,
+   лишився самий ОБЛІК.
 
 2. HOW BIG THE ORDERS SHOULD BE
    The same config must work on a 25 USDT balance and on a 50 USDT one, without
@@ -25,8 +29,9 @@ Two problems this solves.
    the balance, so a bigger account simply warms harder, and a small one still
    places orders that clear the exchange minimum.
 
-State is persisted so the ceiling survives restarts — otherwise a crash loop
-would silently reset the budget and spend forever.
+State is persisted so the ACCOUNTING survives restarts — otherwise a crash
+loop would silently reset it, and the report would understate what warming
+has already cost.
 """
 from __future__ import annotations
 
@@ -39,8 +44,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Below this a spot account cannot place a compliant order at all: MEXC's
-# practical spot minimum is ~1.5 USDT and we keep a baseline hold per token.
+# Нижче цього балансу спотовій половині нічим торгувати: мінімальний ноціонал
+# біржі ~1 USDT (у коді з запасом: `MIN_EXCHANGE_NOTIONAL_USDT = 1.1` у
+# `spot_soft_start.py`), а з балансу ще й тримається базовий залишок на КОЖЕН
+# токен.
 # Нижче цього балансу половина прогріву простоює. 25 -> 10 (рішення оператора
 # 2026-08-26): на живому дні спот просів 25.00 -> 13.21, бо покупки
 # перетворили USDT на монети, і половина стала — тобто поріг зупиняв фарм
@@ -134,7 +141,12 @@ class BudgetState:
 
 
 class SoftStartBudget:
-    """One-way spend ceiling shared by the spot and futures warmers of a slot."""
+    """One-way cost ledger shared by the spot and futures warmers of a slot.
+
+    Стелею це вже не є: `can_afford()` з `src/` не кличе ніхто. Односторонній
+    лишається `charge()` — прибуток `spent` не повертає; реалізований PnL іде
+    окремо через `record_pnl()`.
+    """
 
     def __init__(self, path: str, max_usdt: float = DEFAULT_MAX_COST_USDT) -> None:
         self.path = path
@@ -258,7 +270,8 @@ class SoftStartBudget:
         return self.state.exhausted()
 
     def can_afford(self, cost_usdt: float) -> bool:
-        """Would this charge stay inside the ceiling? Checked BEFORE sending."""
+        """Чи вліз би цей заряд у стелю. НІХТО ЦЬОГО НЕ КЛИЧЕ: стелю прибрано
+        (рішення оператора) — у `src/` виклику немає, лишився сам метод."""
         return (self.state.spent_usdt + max(0.0, cost_usdt)) <= self.state.max_usdt
 
     # ---- charging -------------------------------------------------------
@@ -469,8 +482,8 @@ def scale_spot_config(balance_usdt: float, *, max_tokens: int = 4) -> SpotSizing
       * a daily ceiling of the whole balance — buys and sells cycle, they do not
         accumulate.
 
-    At 25 USDT that gives 1.5-3.0 per order and a 2.0 baseline; at 50 it gives
-    1.5-6.0 and 4.0 — bigger account, harder warming, same config object.
+    At 25 USDT that gives 1.1-3.0 per order and a 2.0 baseline; at 50 it gives
+    2.0-6.0 and 4.0 — bigger account, harder warming, same config object.
     """
     bal = max(0.0, float(balance_usdt))
     # НИЖНЯ МЕЖА ТЕЖ МАСШТАБУЄТЬСЯ. Була прибита 1.5, і на малому балансі це

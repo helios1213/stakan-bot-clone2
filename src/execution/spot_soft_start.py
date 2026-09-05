@@ -11,10 +11,11 @@ things that made the standalone version awkward removed:
     endpoint and decimals from `api.mexc.com/exchangeInfo`; they could disagree.
     Both now come from the same `info` blob.
 
-Behaviour (unchanged from the spec): each day pick 1-4 tokens; 0-10 buys and
-0-10 sells spread across them, each 1-150 USDT; never sell a token below
-`baseline_usdt_per_token`; a hard daily spend ceiling; randomised timing inside
-an active-hours window.
+Behaviour: each day pick 1-4 tokens; 0-25 buys and 0-20 sells spread across
+them (квоту піднято 2026-08-26 — див. `SoftStartConfig`), each 1.5-150 USDT;
+never sell a token below `baseline_usdt_per_token`; a daily ceiling on NET
+deployment into coins, which sells release (2026-09-02); randomised timing
+inside an active-hours window.
 
 SAFETY:
   * DRY-RUN by default. Live requires BOTH an explicit `dry_run=False` and the
@@ -337,9 +338,11 @@ class SpotSoftStart:
                         symbol, usdt, cfg.quote, free)
             return False
 
-        # The buffer we cross to get filled IS the cost of this order, and it is
-        # known before sending — so an order that would breach the ceiling is
-        # never placed rather than being noticed afterwards.
+        # Вартість ЦЬОГО ордера — перетин книги ПЛЮС комісія — відома ДО
+        # відправки, тож у бюджет вона лягає точним числом, а не оцінкою
+        # заднім числом. Але це ОБЛІК, а не гейт: стелі витрат більше немає,
+        # `can_afford()` звідси не викликається (купівлю гейтять денна стеля
+        # і вільний USDT вище).
         cost = _order_cost(usdt, cfg.marketable_buffer, cfg.spot_fee_frac)
         res = await self.client.buy(token, usdt=usdt,
                                     price=px * (1 + cfg.marketable_buffer))
@@ -646,8 +649,9 @@ class SpotSoftStart:
         try:
             # Shuffle the order rather than always considering a buy first: a
             # fixed buy-then-sell rhythm is a pattern, and warming exists to not
-            # look like one. Each action still fires only ~half the time, so a
-            # tick can also do nothing at all.
+            # look like one. Прибите 0.5 звідси прибрано: кожну дію пропускає
+            # темп `_tick_probability()` (лишилось дій / хвилин до кінця
+            # вікна, стеля 0.5), тож тік цілком може не зробити нічого.
             from .soft_start_campaign import shuffled_actions
             p = self.plan
             pace = self._tick_probability()

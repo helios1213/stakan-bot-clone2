@@ -8,14 +8,23 @@ Architecture (v5, post-discovery):
       - visitor_id             (Fernet-encrypted, auto-generated on setup)
 
     Auto-generated/derived (NOT user-provided, NOT stored as user data):
-      - chash       — bootstrap constant from /dolos/config, identical for all users
+      - chash       — comes from the LIVE dolos config (`dolos_config.CACHE`,
+                      POST /ucgateway/device_api/dolos/all_biz_config); same
+                      value for every account. The constants below are only a
+                      snapshot / rollback value — the value actually signed
+                      is cfg["chash"] or MEXC_CHASH, in as_signing_dict
+                      (MEXC_DOLOS_LEGACY=1 signs dolos_config.LEGACY_CHASH).
       - mhash       — MD5(visitor_id), computed at request time
-      - member_id   — server-side identification via webkey; we send "0" as
-                      a placeholder in the trochilus-uid header (MEXC doesn't
-                      validate it).
+      - member_id   — the account's public uid, read at request time from
+                      MEXC_TROCHILUS_UID_SLOT<N> (global MEXC_TROCHILUS_UID as
+                      fallback). Empty = the p0 field stays empty AND the
+                      trochilus-uid header is not sent; the literal "0" we used
+                      to send is gone (browser snapshot 2026-08-26).
 
-    Akamai cookies are NOT stored — MexcWebClient acquires them per-slot
-    via cold GET /futures/{symbol} on first request.
+    Akamai cookies are NOT stored and NOT fetched at all — the private host
+    enforces them on neither reads nor /order/create (probe 2026-08-12), so the
+    cold GET /futures/{symbol} is gone and MexcWebClient.warmup() is a no-op
+    that only seeds the app-auth cookies.
 
 Empty slot = `webkey_blob IS NULL`. The MAX_SLOTS rows are always present in
 DB (seeded on first init) so UI iteration is straightforward.
@@ -178,10 +187,11 @@ class WebkeySlot:
     # must be able to warm an account without running the strategy, and to run
     # the strategy without warming. Needs a webkey, but NOT an assigned pair.
     soft_start_enabled: bool = False
-    # УВАГА: колонок slot_margin_*/slot_leverage_* тут БІЛЬШЕ НЕМАЄ.
-    # Вони існують у таблиці webkey_slots (2026-07-19), але були замінені тим
-    # самим днем на slot_pair_sizing і не читались ніде — при цьому мали ті
-    # самі імена, що й ключі, які реально сайзять угоду в shadow_engine.
+    # УВАГА: колонок slot_margin_*/slot_leverage_* тут БІЛЬШЕ НЕМАЄ — і в
+    # таблиці webkey_slots їх теж немає: додані 2026-07-19, того ж дня
+    # замінені на slot_pair_sizing, ніде не читались, ВИДАЛЕНІ 2026-08-19
+    # (init_db дропає їх на старті, db.py). Пастка була в іменах: вони
+    # збігались із ключами, які реально сайзять угоду в shadow_engine.
     # Розмір: slot_pair_sizing (slot_id, symbol) → live_pool.get_slot_config.
     # Epoch until which this account is under a MEXC 10014 open-rate limit.
     open_throttle_until: int | None = None
@@ -190,8 +200,10 @@ class WebkeySlot:
     def is_live_active(self) -> bool:
         """True if this slot is configured to place real orders.
 
-        The bot connects to futures.mexc.com directly (see
-        MexcWebClient._BASE_URL); proxy support was removed entirely.
+        The bot connects directly, with no proxy at all (support removed).
+        Requests go to MexcWebClient.API_URL — contract.mexc.com by default,
+        MEXC_API_HOST reverts it; _BASE_URL (futures.mexc.com) is only the
+        origin/referer header.
         """
         return (
             self.live_enabled
@@ -540,8 +552,9 @@ class WebkeyStore:
     async def list_enabled_complete(self) -> list[WebkeySlot]:
         """Slots that are enabled AND have webkey. For trading.
 
-        Proxy is not required (direct mode hits futures.mexc.com without
-        a SOCKS hop), so the filter is just enabled + is_complete.
+        Proxy is not required (direct mode hits API_URL — contract.mexc.com by
+        default — without a SOCKS hop), so the filter is just enabled +
+        is_complete.
         """
         return [
             s for s in await self.list_all()
@@ -551,8 +564,11 @@ class WebkeyStore:
     async def list_live_active(self) -> list[WebkeySlot]:
         """Slots that are configured to place real orders.
 
-        Requires: enabled, complete, has assigned_pair, live_enabled=1.
-        (Proxy was removed in v6.1 — direct mode hits futures.mexc.com.)
+        Requires (see is_live_active): complete, has assigned_pair,
+        live_enabled=1. The `enabled` display flag is NOT part of the filter —
+        set_live_enabled raises it when live goes on, but a slot with
+        enabled=0 and live_enabled=1 still lands in this list.
+        (Proxy was removed in v6.1 — direct mode hits API_URL, contract.mexc.com.)
         """
         return [s for s in await self.list_all() if s.is_live_active]
 
@@ -571,8 +587,10 @@ class WebkeyStore:
         AUTO-SHADOWS the displaced pair: unassigning (pair=None) or
         reassigning to a different pair MAY leave the OLD pair with no slot
         to execute it — but only when no other slot is assigned to it, since
-        two slots can trade the same pair as independent accounts. Like delete(), drive BOTH pair_configs.mode AND
-        pair_states.state to 'shadow' — the state machine is the REAL
+        two slots can trade the same pair as independent accounts. Like
+        delete(), it drives pair_states.state to 'shadow' via
+        demote_pair_to_shadow() — and ONLY that: the pair_configs.mode mirror
+        is gone (init_db drops the column). The state machine is the REAL
         live/shadow determinant, so leaving the old pair in 'live' state
         with no slot strands it (silent [SKIP SHADOW] errors, no trades).
         _load_states_from_db (≤60s) reloads pair_states into memory.

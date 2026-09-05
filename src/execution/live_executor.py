@@ -1148,15 +1148,22 @@ class LiveExecutor:
     ) -> LiveOrderResult:
         """
         Place IOC LIMIT order to OPEN a position. This is the economic core
-        of the strategy: IOC limit fills count as MAKER on MEXC promo (0% fee),
-        whereas market entry pays ~0.04% taker × leverage = strategy-killing.
+        of the strategy: the IOC limit BOUNDS what we pay — at-touch, or a
+        capped N-tick cross per cfg.ioc_offset_ticks (see ENTRY EXECUTION MODE
+        above) — whereas market entry takes whatever the book holds and pays
+        ~0.04% taker × leverage = strategy-killing. NB: at offset_ticks >= 0 the
+        limit sits AT or THROUGH the touch, so a fill REMOVES liquidity (taker
+        side; only offset_ticks < 0 is maker-style) — free only while the 0%
+        promo holds, which is exactly what the fee guard watches.
 
         Behaviour:
           - For LONG: limit_price = best_ask + offset_ticks×tick → 0=at-touch, N>0=cross N ticks
           - For SHORT: limit_price = best_bid − offset_ticks×tick → 0=at-touch, N>0=cross N ticks
           - On MEXC, IOC orders auto-cancel any unfilled remainder (no /order/cancel needed)
           - Up to `max_attempts` tries; between attempts re-fetch fresh OB + check open_positions
-          - If all attempts expire → return success=False with error_msg='ioc_all_expired'
+          - If all attempts expire → return success=False with
+            error_msg='ioc_expired_no_fill' — 'ioc_all_expired' is only the
+            fallback for an attempt that left no reason at all
             (caller should treat this as "skipped signal", NOT fall back to market)
 
         Price scaling:
@@ -1585,7 +1592,7 @@ class LiveExecutor:
                             logger.exception("Failed to send slot resume alert")
 
                 # latency breakdown
-                # last_latency_ms = submit→response (line 912)
+                # last_latency_ms = submit→response (set right after the submit)
                 # t_before_poll → t_after_poll = poll waiting time
                 submit_lat = last_latency_ms  # entire POST roundtrip
                 # response_latency_ms split: ~0 ms for the parse itself,

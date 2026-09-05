@@ -9,12 +9,23 @@ Auth model:
     - webkey from slot       → Authorization header + u_id cookie
     - visitor_id from slot   → mtoken header + mtoken body field
     - mhash = MD5(visitor)   → mhash URL param + mhash body field
-    - chash = bootstrap      → chash body field (constant for all users)
-    - trochilus-uid = "0"    → header (placeholder; server doesn't validate)
+    - chash                  → chash body field, taken from the LIVE dolos
+                               config (dolos_config.CACHE), MEXC_CHASH overrides
+                               it, MEXC_DOLOS_LEGACY=1 reverts to the pinned
+                               legacy chash. Same value for every account; the
+                               BOOTSTRAP_CHASH default on _DolosRuntime is NOT
+                               what gets signed (see as_signing_dict).
+    - trochilus-uid          → header, but ONLY when MEXC_TROCHILUS_UID_SLOT<N>
+                               (or the global MEXC_TROCHILUS_UID) is set —
+                               otherwise it is not sent at all. The literal "0"
+                               placeholder is gone (browser snapshot 2026-08-26:
+                               the real header carries the account uid).
 
-Akamai cookies are fetched on demand via cold GET /futures/{symbol}, then
-cached in the AsyncSession's cookie jar (per-instance — no cross-slot
-contamination).
+Akamai cookies are NOT fetched: the private host enforces them on neither
+reads nor /order/create (probe 2026-08-12), so the cold GET /futures/{symbol}
+is gone and warmup() is a no-op. The AsyncSession's cookie jar carries only
+the app-auth cookies seeded once in _ensure_session (per-instance — no
+cross-slot contamination).
 """
 from __future__ import annotations
 
@@ -805,8 +816,10 @@ class MexcWebClient:
 
         Performance:
             balance and positions are fetched IN PARALLEL via asyncio.gather.
-            On a typical proxy round-trip of ~700ms, this saves ~700ms vs
-            sequential. Total wall-clock is roughly max(balance, positions).
+            Total wall-clock is roughly max(balance, positions) instead of
+            their sum. (The old "~700ms proxy round-trip" figure is stale —
+            this client has no proxy path left; requests go straight to
+            API_URL.)
 
             latency_ms reports the wall-clock of the parallel block (the
             slower of the two requests, since gather waits for both).

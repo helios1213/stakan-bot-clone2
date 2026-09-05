@@ -50,8 +50,10 @@ class LiveExecutorPool:
         alerts=None,        # Optional[TelegramAlerts]
         private_ws_pool=None,  # Optional[MexcPrivateWSPool] — push-based fills
         live_db=None,       # Optional[LiveDatabase] — щоб відновити сесію після рестарту
-        # Просадка: межа = min(стеля, pct × нотіонал).
-        # env LIVE_MAX_DRAWDOWN (main.py). Плоский стоп від піку сесії.
+        # Просадка: ПЛОСКА межа в доларах від піку сесії, однакова за будь-якого
+        # розміру позиції (env LIVE_MAX_DRAWDOWN, main.py). Плоский стоп.
+        # Правило «% від ноціоналу» прибрано 2026-08-11 разом із денним кілом —
+        # див. LiveSafetyController.drawdown_limit() і шапку live_safety.py.
         default_max_drawdown_usdt: float = 25.0,
         default_max_per_symbol: int = 1,
         default_max_total: int = 1,
@@ -166,7 +168,7 @@ class LiveExecutorPool:
 
         Call this:
           - At boot
-          - Periodically (e.g. every 60s) to pick up config changes
+          - Periodically — main.py runs live_pool_rebuild_loop every 30s
           - After explicit slot config update via Telegram
         """
         slots = await self.webkey_store.list_live_active()

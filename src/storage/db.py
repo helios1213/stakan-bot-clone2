@@ -13,8 +13,9 @@ v4 (Multi-slot): webkey_slots (5-slot multi-account: webkey + dolos + proxy
                  per slot, all encrypted). v3 data migrated into slot 1.
 v5 (Webkey-only): webkey_slots simplified — dolos_blob dropped, replaced
                   with visitor_blob (auto-generated visitor_id only).
-                  member_id/chash/mhash no longer stored (chash is hardcoded
-                  bootstrap, mhash = MD5(visitor), member_id placeholder).
+                  member_id/chash/mhash no longer stored (chash comes from the
+                  live dolos config at request time, mhash = MD5(visitor),
+                  member_id from MEXC_TROCHILUS_UID_SLOT<N> or empty).
 """
 from __future__ import annotations
 
@@ -373,9 +374,11 @@ async def _migrate_v5_to_v6(db: aiosqlite.Connection) -> None:
       - pair_configs: margin_usdt, leverage (legacy single-value fields —
         replaced by margin_min/max + leverage_min/max)
 
-    After this migration, `pair_configs` is the ONLY source for live and
-    shadow trade sizing. Same row drives both modes, so shadow PnL and
-    live PnL are directly comparable.
+    After this migration `pair_configs` was the ONLY source for live and
+    shadow trade sizing — true in v6, NOT true any more: since 2026-06-15
+    sizing resolves from the per-pair YAML (ConfigLoader) and init_db drops
+    margin_*/leverage_* from pair_configs too. One source still drives both
+    modes, so shadow PnL and live PnL stay directly comparable.
 
     SQLite doesn't reliably support DROP COLUMN before 3.35, so we use
     the table-rename + recreate strategy for each affected table.
@@ -649,8 +652,10 @@ async def init_db(db_path: str) -> None:
 
         # v5.3 → v6: multi-slot pair assignment.
         # Sizing columns (live_margin_*, live_leverage_*) were REMOVED in v6 —
-        # sizing is now read exclusively from pair_configs, which is the
-        # single source of truth for both shadow and live modes.
+        # sizing moved to pair_configs then, and since 2026-06-15 it lives in
+        # the per-pair YAML (ConfigLoader), the single source of truth for both
+        # shadow and live; pair_configs' own margin_*/leverage_* are dropped
+        # above. Per-(slot, pair) overrides live in slot_pair_sizing.
         await _add_columns_idempotent(db, "webkey_slots", [
             ("assigned_pair",        "TEXT DEFAULT NULL"),
             ("live_enabled",         "INTEGER NOT NULL DEFAULT 0"),

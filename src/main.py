@@ -225,8 +225,10 @@ def _prune_db_sync(db_path: str, live_db_path: str, research_path: str, ret_shad
 
 
 async def db_prune_loop(db_path: str, live_db_path: str, research_path: str, interval_sec: int = 86400) -> None:
-    """Periodic DB prune — keeps stakan.db from growing unbounded as new
-    signals / orderbook-snapshots accumulate.
+    """Periodic DB prune — keeps all three DBs from growing unbounded: the
+    shadow/signal tables in stakan.db, live_trades in stakan-live.db, and
+    signal_features + orderbook snapshots in stakan-research.db (those two
+    moved out of stakan.db 2026-08-13).
 
     DELETE only — no VACUUM, since VACUUM holds an exclusive lock for tens of
     seconds and is too disruptive at a daily cadence. Freed pages get reused
@@ -239,8 +241,9 @@ async def db_prune_loop(db_path: str, live_db_path: str, research_path: str, int
     """
     import sqlite3
     RET_SHADOW = [
-        # (table, age_column, retention_seconds) — orderbook snapshots are
-        # diagnostic only, 3 days is plenty.
+        # (table, age_column, retention_seconds). Orderbook snapshots are NOT in
+        # this list: they moved to the research DB 2026-08-13, and their 3-day
+        # window (they are diagnostic only) now lives in RET_RESEARCH below.
         ("signals",                  "created_at",  7 * 86400),
         ("historical_candles",       "open_time",  30 * 86400),
         ("shadow_trades",            "opened_at",   3 * 86400),  # 3-day shadow retention (user)
@@ -1083,9 +1086,10 @@ async def main() -> None:
 
     asyncio.create_task(dolos_config_refresh_loop(webkey_store), name="dolos_config")
 
-    # Daily DB prune so stakan.db doesn't grow forever — orderbook snapshots
-    # and signals accumulate at ~50K/hour combined. See db_prune_loop docstring
-    # for retention windows.
+    # Daily DB prune so the DBs don't grow forever — signals accumulate in
+    # stakan.db, signal_features + orderbook snapshots in stakan-research.db
+    # (moved out of stakan.db 2026-08-13); the two streams ran at ~50K/hour
+    # combined. See db_prune_loop docstring for retention windows.
     _live_db_path = os.environ.get("LIVE_DB_PATH", "/app/data/stakan-live.db")
     asyncio.create_task(
         db_prune_loop(env.db_path, _live_db_path, research_path, 86400),
@@ -1250,7 +1254,10 @@ async def main() -> None:
     # Stays DRY-RUN unless SOFT_START_LIVE=1 is in the environment — the button
     # alone can never start placing real orders.
     def _soft_start_universe() -> list[str]:
-        """Candidate pairs. FeeGate narrows these to the 0%-fee ones per open."""
+        """Candidate pairs. FeeGate PRICES each one per open: a 0%-fee pair wins
+        outright; if none is free, the cheapest paid pair under max_fee_frac is
+        warmed and its taker fee counted as spend (allow_paid_fees=True since
+        2026-08-26)."""
         import sqlite3
         try:
             con = sqlite3.connect(f"file:{env.db_path}?mode=ro", uri=True)

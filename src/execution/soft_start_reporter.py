@@ -12,8 +12,9 @@ whole point of "let me see that it is working".
 The message carries:
   * what just happened, with a timestamp,
   * the last few actions before it,
-  * campaign progress (day N of 3), spend against the ceiling, and whether a
-    futures position is currently held,
+  * campaign progress (day N of 3), what warming has cost so far — fees+spread
+    and both PnL legs, with NO denominator since the spend ceiling was removed
+    (2026-08-26) — and whether a futures position is currently held,
   * whether this is DRY-RUN or live — so a dry-run is never mistaken for real
     trading.
 

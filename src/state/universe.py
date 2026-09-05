@@ -137,8 +137,11 @@ class UniverseProvider:
         # Historical data (signals, shadow_trades, walls, state_transitions)
         # is also preserved — auto-prune only touches the lightweight
         # registry tables (pair_states, pair_configs, pairs_universe).
-        # For full historical cleanup, use the one-shot SQL migration:
-        # scripts/migrations/prune_non_whitelist_pairs.sql
+        # For full historical cleanup there is NO script — the file this
+        # line used to point at is not in the repo (checked 2026-09-05):
+        #     scripts/migrations/prune_non_whitelist_pairs.sql
+        # scripts/migrations/ holds only nizar_pengu_strategy.sql,
+        # scanner_removal.sql and _applied/. Clean historical tables by hand.
         prune_stats = await self._prune_non_whitelist(set(filtered))
 
         elapsed = time.time() - start_ts
@@ -175,7 +178,9 @@ class UniverseProvider:
           - pairs_universe  (always deleted for non-whitelist symbols)
 
         Historical tables (signals, shadow_trades, walls, state_transitions)
-        are NEVER touched here — use the one-shot SQL migration instead.
+        are NEVER touched here — and no migration script does it either:
+        prune_non_whitelist_pairs.sql is not in the repo (checked 2026-09-05).
+        Clean them by hand if it is ever needed.
 
         Returns dict with counters for logging.
         """

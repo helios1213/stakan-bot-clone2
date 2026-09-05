@@ -7,11 +7,13 @@ Flow per signal:
   3. Lookup pair_config for tunable params (per-pair)
   4. Try IOC entry up to ioc_max_attempts
   5. If filled → create ShadowPosition, start watching task
-  6. Watching task ticks every 100ms checking exit conditions:
+  6. Watching task wakes on each MEXC book update (timer floor
+     _WATCH_TIME_TICK_SEC, 50ms default) checking exit conditions:
      - stop_loss (catastrophic protection, after sl_grace_sec)
      - max_hold_sec timeout
-     - adaptive_stalled / adaptive_reversal (when adaptive_exit_enabled)
-     - reverse_signal (if enabled)
+     - binance_reversal (leader reversed past entry)
+     - simple_trail rules: adverse / nevergreen_cut / breakeven / trail /
+       stalled / dead_on_arrival (see _check_simple_trail_exit)
   7. When exit triggered → MarketExecutor → record trade in DB
   8. Apply post-trade cooldown (per-pair)
 
@@ -42,7 +44,7 @@ from src.execution.live_executor import (
 # ── Shadow-only sizing (DECOUPLED from the live cfg margin/leverage) ──
 # Shadow trades use THIS fixed margin/leverage so that tuning the per-pair LIVE
 # margin never shifts shadow stats (stable benchmark for comparison). LIVE pairs
-# override pos.margin_usdt -> live_margin/live_leverage further below (~line 1211),
+# override pos.margin_usdt -> live_margin/live_leverage in _open_position's live branch,
 # so the real orders + live_trades are UNAFFECTED by these values.
 SHADOW_MARGIN_MIN_USDT = 25.0
 SHADOW_MARGIN_MAX_USDT = 30.0
@@ -91,8 +93,8 @@ def open_freq_limit_code(err_msg: str | None) -> str | None:
 
 # Hardcoded upper bound on position age, independent of strategy config.
 # If a position lives this long, force-close it regardless of strategy
-# state (phase exits, trailing stops, etc.). Catches scenarios where the
-# normal exit logic fails to fire — WS stall, phase config bug, watcher
+# state (trailing stops, binance_reversal, etc.). Catches scenarios where
+# the normal exit logic fails to fire — WS stall, exit-config bug, watcher
 # desync. Default 600s = 10 min is far beyond normal trade duration; any
 # trade reaching this is presumed stuck.
 # ⚠️ This is the ABSOLUTE SAFETY CEILING (infra/env, deploy-level), NOT the
@@ -377,7 +379,9 @@ def classify_live_fail(err_msg: str, raw: str, sym: str) -> dict:
             "throttle": throttle, "auto_pause": auto_pause}
 
 
-# Per-pair config defaults — loaded from DB but cached
+# Per-pair execution config — tuning fields are filled from the pair YAML by
+# ConfigLoader (_reload_pair_configs); the DB pair_configs table only says
+# WHICH symbols exist. Cached on the engine.
 @dataclass
 class PairExecConfig:
     """Subset of pair_configs that ShadowEngine uses for execution."""
@@ -849,9 +853,11 @@ class ShadowEngine:
         """Детектор сплеску волатильності → Telegram-алерт. РОЗМІР НЕ ЧІПАЄ —
         лише сповіщає, щоб оператор сам збільшив розмір. Валідовано причинно на
         08-13 (шумний чоп — коректно проігноровано) та 08-18 (+$450 — зловлено
-        93%): сплеск = частота угод по live-парі >= RATE_MULT× її норми (медіана
-        угод/хв за годину) І поточний rolling PnL(5хв) > 0 І середня confidence
-        >= CONF_MIN. Усе через env (BURST_*)."""
+        93%): сплеск = ОБОВʼЯЗКОВИЙ гейт руху (pk1000, відносний АБО абсолютний)
+        І один із чотирьох тригерів — частота (>= RATE_MULT× медіани угод/хв за
+        годину, при PnL(5хв) > 0), bps, абс.bps або тривалість — і все це має
+        протриматись BURST_PERSIST_SEC без розриву. Confidence НЕ гейтить: вона
+        лише друкується в алерті. Усе через env (BURST_*)."""
         import os, statistics
         if os.environ.get("BURST_ALERT_ENABLED", "1") != "1":
             logger.info("[BURST] детектор вимкнено (BURST_ALERT_ENABLED!=1)")
@@ -1444,7 +1450,8 @@ class ShadowEngine:
         Try IOC entry up to ioc_max_attempts. Open position if any attempt succeeds.
 
         Latency simulation:
-          1. Sleep random(80, 300)ms to model real API roundtrip
+          1. Sleep random(entry_latency_min_ms, entry_latency_max_ms)
+             (150..205ms — live PENGU submit p10..p90) to model API roundtrip
           2. Re-fetch orderbook price after delay
           3. If price moved adversely > max_acceptable_drift_pct → expire (signal stale)
           4. Otherwise proceed with IOC entry at NEW price
@@ -2747,16 +2754,16 @@ class ShadowEngine:
         return _listener
 
     async def _watch_position(self, pos: ShadowPosition, cfg: PairExecConfig) -> None:
-        """Monitor pos every 20ms (was 100ms), exit when conditions met.
+        """Monitor pos, exit when conditions met.
 
-        Polling interval is 20ms to
-        catch micro-impulse peaks. Original 100ms missed peaks that lived
-        20-50ms, causing trailing stops and phase3 profit reversal to fire
-        on already-decayed prices instead of actual MFE.
-
-        Trade-off: 5x more orderbook reads + state comparisons per second
-        per open position. With max_concurrent_positions=1 and current pair
-        count, CPU overhead is negligible (~5-10% additional load).
+        Event-driven: the loop wakes on a MEXC book update, with the
+        _WATCH_TIME_TICK_SEC timer floor (50ms default) as the backstop that
+        keeps TIME-based exits (max_hold, sl_grace, stall, dead_on_arrival)
+        and the staleness guard running while the book is quiet. The old
+        fixed poll (20ms, itself a replacement for 100ms that missed peaks
+        living 20-50ms) is gone; sub-tick peaks are now captured by the
+        per-position book listener at full WS resolution — see
+        _make_position_listener.
         """
         try:
             while pos.is_open and not self._stop.is_set():
@@ -2767,15 +2774,15 @@ class ShadowEngine:
                     getattr(pos, "_book_event", None), _WATCH_TIME_TICK_SEC
                 )
 
-                # Hard ceiling on position age, INDEPENDENT of strategy
-                # phase exits. If a position lives longer than this, force
+                # Hard ceiling on position age, INDEPENDENT of the strategy
+                # exits. If a position lives longer than this, force
                 # close regardless of strategy state. Catches:
-                #   - phase exit logic broken / desync'd
+                #   - simple_trail / binance_reversal logic broken or desync'd
                 #   - WS price feed stalled (no price → no exit triggered)
                 #   - any "forgotten" position scenarios
                 # Env override: STAKAN_ABSOLUTE_MAX_HOLD_SEC (default 600s).
                 # 600s = 10 min is far beyond any normal trade duration
-                # (phase exits typically fire within seconds). False
+                # (the strategy exits typically fire within seconds). False
                 # positives are acceptable: forcing close on a "stuck for
                 # 10 min" position is correct behavior.
                 # _close_position will route through the safety-patched
@@ -2923,7 +2930,9 @@ class ShadowEngine:
         Priority (first match wins):
           1. time_limit  — safety net, always active
           2. stop_loss   — tick-based catastrophic protection (after sl_grace_sec)
-          3. simple_trail — trailing / adverse / breakeven exit
+          3. binance_reversal — leader reversed past entry (fixed ticks or
+             gap_retrace_frac); needs binance_best_bid/ask + tick_scaled
+          4. simple_trail — trailing / adverse / breakeven exit
 
         binance_best_bid/ask + tick_scaled (passed-through from _watch_position):
         used by the Binance reversal stop. If callers don't provide them, it
@@ -3057,10 +3066,12 @@ class ShadowEngine:
         return self._check_simple_trail_exit(pos)
 
     def _check_simple_trail_exit(self, pos: ShadowPosition) -> str | None:
-        """Simple trail exit with 5 rules.
+        """Simple trail exit with 6 rules.
 
         Priority (first match wins):
           1. simple_adverse        — price moved N ticks against entry
+          1b. nevergreen_cut       — never green AND already deep adverse,
+                                     past nevergreen_cut_ms (0 = disabled)
           2. simple_breakeven      — peak reached trigger, current ≤0.5t
           3. simple_trail          — pullback M ticks from running peak
           4. simple_stalled        — in profit but peak hasn't improved
