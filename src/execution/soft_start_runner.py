@@ -107,7 +107,7 @@ class SlotWarmer:
         # Розпродаж наприкінці кампанії робиться один раз; прапорець не дає
         # крутити його вічно, якщо продавати вже нічого.
         self._wound_down = False
-        # Скільки тіків передпродаж уже пробував ПІСЛЯ свого дедлайну. Потрібне
+        # Скільки тіків розчистка спота вже пробувала ПІСЛЯ свого дедлайну. Потрібне
         # лише як запобіжник проти вічного блокування: сам дедлайн уже є межею,
         # а це ловить випадок, коли біржа стабільно не віддає баланси.
         self._preclear_grace = 0
@@ -553,18 +553,18 @@ class SlotWarmer:
             # НЕ позначаємо зробленим: гріти на невідомому балансі — це те, чого
             # оператор просив уникнути. Але й не блокуємо вічно (див. нижче).
             self._preclear_grace += 1
-            logger.warning("soft-start slot %d: передпродаж — помилка (%s), "
+            logger.warning("soft-start slot %d: розчистка спота — помилка (%s), "
                            "спроба %d/%d", self.slot_id, e,
                            self._preclear_grace, MAX_PRECLEAR_GRACE)
             if self._preclear_grace >= MAX_PRECLEAR_GRACE:
-                logger.critical("soft-start slot %d: передпродаж НЕ ВДАВСЯ %d "
+                logger.critical("soft-start slot %d: розчистка спота НЕ ВДАЛАСЬ %d "
                                 "разів — починаю прогрів на балансі ЯК Є; "
                                 "монети попередньої кампанії лишились",
                                 self.slot_id, self._preclear_grace)
                 if self.reporter is not None:
                     try:
                         await self.reporter.skipped(
-                            "⚠️ передпродаж не вдався — прогрів починається "
+                            "⚠️ розчистка спота не вдалась — прогрів починається "
                             "на балансі ЯК Є", **self._status())
                     except Exception:
                         logger.debug("soft-start slot %d: preclear alert failed",
@@ -573,7 +573,7 @@ class SlotWarmer:
             return
 
         if sent:
-            logger.info("soft-start slot %d: передпродаж — %d ордер(ів), "
+            logger.info("soft-start slot %d: розчистка спота — %d ордер(ів), "
                         "лишаємо %.0f%% вартості монет, до кінця %.1f хв",
                         self.slot_id, sent, keep * 100,
                         max(0.0, self.campaign.state.preclear_until - now) / 60)
@@ -585,7 +585,7 @@ class SlotWarmer:
         # піде наступним тіком, коли keep_frac просяде.
         if not past_deadline and keep > 0.0:
             return
-        logger.info("soft-start slot %d: передпродаж завершено — прогрів "
+        logger.info("soft-start slot %d: розчистку спота завершено — прогрів "
                     "починається з чистого балансу", self.slot_id)
         self.campaign.mark_precleared()
 
@@ -595,7 +595,7 @@ class SlotWarmer:
         if self.draining:
             return                                  # OFF requested — stop() drains
 
-        # ПЕРЕДПРОДАЖ ЙДЕ ПЕРШИМ І БЛОКУЄ ВСЕ ІНШЕ.
+        # РОЗЧИСТКА СПОТА ЙДЕ ПЕРШОЮ І БЛОКУЄ ВСЕ ІНШЕ.
         # Оператор: «коли я додаю ключ — спершу продати монети, і лише тоді
         # починати прогрів». Тому вище за `expired()` і за будь-яку купівлю.
         if self.campaign.preclear_pending():
@@ -782,7 +782,7 @@ STUCK_ALERT_EVERY = 30
 # ордери не тримали кампанію відкритою нескінченно.
 MAX_WIND_DOWN_PASSES = 6
 
-# Скільки тіків передпродаж пробує ПІСЛЯ свого дедлайну, перш ніж здатись.
+# Скільки тіків розчистка спота пробує ПІСЛЯ свого дедлайну, перш ніж здатись.
 # Сам дедлайн (10-30 хв) уже є межею; ця стеля ловить лише випадок, коли
 # біржа стабільно не віддає баланси. Вічно блокувати прогрів гірше, ніж
 # почати його з монетами на балансі: другий стан оператор бачить у звіті,

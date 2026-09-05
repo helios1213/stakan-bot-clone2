@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Передпродаж монет ПЕРЕД новою кампанією прогріву (рішення оператора 2026-09-05).
+"""Розчистка спота монет ПЕРЕД новою кампанією прогріву (рішення оператора 2026-09-05).
 
 НАВІЩО ФІЧА. Прогрів має починатись із чистого спотового балансу. Монети
 лишаються на слоті завжди: `maybe_sell` ніколи не продає нижче базового
@@ -59,7 +59,7 @@ def test_an_old_state_file_does_NOT_trigger_a_liquidation(tmp_path):
     """НАЙВАЖЛИВІШИЙ ТЕСТ ФАЙЛУ.
 
     Стан читається як `CampaignState(**json)`. Файл, що його писала попередня
-    версія, не має ключів передпродажу — вони візьмуть дефолт. Якби дефолт
+    версія, не має ключів розчистки спота — вони візьмуть дефолт. Якби дефолт
     був False, ПЕРШИЙ ЖЕ тік після деплою почав би зливати баланс кампанії,
     яка спокійно триває. Дефолт мусить бути True.
     """
@@ -111,12 +111,12 @@ class _Spot:
         return self.per_pass.pop(0) if self.per_pass else 0
 
     async def tick(self):                       # прогрів
-        raise AssertionError("прогрів не має йти до кінця передпродажу")
+        raise AssertionError("прогрів не має йти до кінця розчистки спота")
 
 
 class _Futures:
     async def tick(self):
-        raise AssertionError("прогрів не має йти до кінця передпродажу")
+        raise AssertionError("прогрів не має йти до кінця розчистки спота")
 
 
 def _warmer(camp, spot, futures=None):
@@ -146,13 +146,13 @@ async def test_tick_runs_the_preclear_and_does_NOT_warm(tmp_path):
     """ТЕСТ ПРОВОДКИ. Прибери гачок із `tick()` — і цей тест мусить упасти.
 
     `_Spot.tick`/`_Futures.tick` кидають AssertionError: якщо прогрів усе ж
-    пішов, ми дізнаємось про це гучно, а не через тихо пропущений передпродаж.
+    пішов, ми дізнаємось про це гучно, а не через тихо пропущену розчистку спота.
     """
     c = _camp(tmp_path)
     spot = _Spot(per_pass=[2])
     w = _warmer(c, spot)
     await w.tick()
-    assert spot.calls, "wind_down не викликано — передпродаж не проведено в tick()"
+    assert spot.calls, "wind_down не викликано — розчистку спота не проведено в tick()"
     assert c.preclear_pending() is True          # ордери пішли, ще не кінець
 
 
@@ -217,7 +217,7 @@ async def test_a_failing_exchange_does_not_wedge_the_slot_forever(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_finished_preclear_lets_the_warming_run(tmp_path):
-    """Зворотний бік проводки: коли передпродаж завершено, tick() йде далі.
+    """Зворотний бік проводки: коли розчистку спота завершено, tick() йде далі.
 
     Без цього тесту фіча могла б «працювати», заблокувавши прогрів назавжди.
     """
@@ -234,7 +234,7 @@ async def test_a_finished_preclear_lets_the_warming_run(tmp_path):
             reached["yes"] = True
 
     w = _warmer(c, _OkSpot(), _OkFut())
-    # далі по tick() йде гілка expired() — доводимо лише, що передпродаж
+    # далі по tick() йде гілка expired() — доводимо лише, що розчистка спота
     # більше не перехоплює керування.
     assert c.preclear_pending() is False
     try:
