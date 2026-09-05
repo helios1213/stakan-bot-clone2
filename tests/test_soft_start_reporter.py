@@ -933,6 +933,9 @@ async def test_held_value_is_remeasured_after_the_wind_down():
         state = type("S", (), {"tokens": ["MX"]})()
         def expired(self): return True
         def finish(self): pass
+        # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це ПЕРШИМ і виходить, якщо
+        # True. Фейк мусить уміти, інакше тест перевіряв би не той шлях.
+        def preclear_pending(self): return False
 
     class _Spot:
         plan = type("P", (), {"tokens": ["MX"]})()

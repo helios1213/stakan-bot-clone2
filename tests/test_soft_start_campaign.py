@@ -594,6 +594,10 @@ async def test_expired_campaign_winds_down_before_switching_off():
     order = []
 
     class _Camp:
+        # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це ПЕРШИМ. Фейк мусить
+        # вміти, інакше він розійдеться з реальним SoftStartCampaign і
+        # тест мовчки перевірятиме не той шлях.
+        def preclear_pending(self): return False
         # state.tokens — раннер бере набір кампанії, щоб розпродати й монети
         # зі старого юніверсу. Фейк мусить це вміти, інакше виняток тихо
         # проковтнеться і тест побачить лише «finish».
@@ -632,6 +636,10 @@ async def test_wind_down_gets_another_tick_while_it_still_sells():
     finished = []
 
     class _Camp:
+        # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це ПЕРШИМ. Фейк мусить
+        # вміти, інакше він розійдеться з реальним SoftStartCampaign і
+        # тест мовчки перевірятиме не той шлях.
+        def preclear_pending(self): return False
         state = type("S", (), {"tokens": ["LINK"]})()
         def expired(self): return True
         def finish(self): finished.append(1)
@@ -664,6 +672,10 @@ async def test_a_failing_wind_down_does_not_wedge_the_slot_forever():
     finished = []
 
     class _Camp:
+        # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це ПЕРШИМ. Фейк мусить
+        # вміти, інакше він розійдеться з реальним SoftStartCampaign і
+        # тест мовчки перевірятиме не той шлях.
+        def preclear_pending(self): return False
         state = type("S", (), {"tokens": ["LINK"]})()
         def expired(self): return True
         def finish(self): finished.append(1)
@@ -697,6 +709,10 @@ async def test_runner_passes_the_full_token_pool_to_wind_down():
     got = {}
 
     class _Camp:
+        # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це ПЕРШИМ. Фейк мусить
+        # вміти, інакше він розійдеться з реальним SoftStartCampaign і
+        # тест мовчки перевірятиме не той шлях.
+        def preclear_pending(self): return False
         state = type("S", (), {"tokens": ["LINK", "PENGU"]})()
         def expired(self): return True
         def finish(self): pass

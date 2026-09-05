@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import random
+import time
 
 from .fee_gate import FeeGate
 from .futures_soft_start import FuturesSoftStart, FuturesSoftStartConfig, live_allowed
@@ -106,6 +107,10 @@ class SlotWarmer:
         # Розпродаж наприкінці кампанії робиться один раз; прапорець не дає
         # крутити його вічно, якщо продавати вже нічого.
         self._wound_down = False
+        # Скільки тіків передпродаж уже пробував ПІСЛЯ свого дедлайну. Потрібне
+        # лише як запобіжник проти вічного блокування: сам дедлайн уже є межею,
+        # а це ловить випадок, коли біржа стабільно не віддає баланси.
+        self._preclear_grace = 0
         # Виміряна вартість монет на біржі + коли міряли. None = ще не міряли.
         self._held_market: float | None = None
         self._held_market_at: float = 0.0
@@ -519,11 +524,83 @@ class SlotWarmer:
                 before[0], after[0], before[1], after[1], before[2], after[2])
         self._weighted_logged = after
 
+    async def _preclear_tick(self) -> None:
+        """Злити монети, що лишились від попередньої кампанії, ПЕРЕД прогрівом.
+
+        НАВІЩО. Прогрів має починатись із чистого спотового балансу: `maybe_sell`
+        ніколи не продає нижче базового залишку, а фінальний розпродаж свідомо
+        лишає 20%. Тож нова кампанія стартувала б там, де USDT майже немає, а
+        вартість замкнена в монетах — саме так зараз виглядає слот 1 клона
+        (0.93 вільних USDT при 27.37 у монетах), і саме це 31.08 дало дедлок.
+
+        ЯК. Щотіку кличемо той самий `wind_down`, але з `keep_frac`, що лінійно
+        спадає 1.0 -> 0.0 за вікно 10-30 хв. Один виклик із `keep_frac=0` злив
+        би все однією пачкою; поступове зменшення виглядає як звичайне
+        скорочення позицій — те саме міркування, що вже стоїть у `wind_down`.
+
+        НЕ ГЕЙТИТЬСЯ ПОРОГОМ ЖИТТЄЗДАТНОСТІ, як і фінальний розпродаж: гейт
+        відповідає на «чи варто ГРІТИ» і вимагає USDT, а тут ми лише ПРОДАЄМО,
+        і монети — це рівно те, що в такому слоті й лежить (урок 2026-09-02).
+        """
+        now = time.time()
+        keep = self.campaign.preclear_keep_frac(now)
+        past_deadline = now >= self.campaign.state.preclear_until
+        _pool = list(dict.fromkeys(
+            list(self.campaign.state.tokens or []) + list(SPOT_CANDIDATES)))
+        try:
+            sent = await self.spot.wind_down(keep, tokens=_pool)
+        except Exception as e:
+            # НЕ позначаємо зробленим: гріти на невідомому балансі — це те, чого
+            # оператор просив уникнути. Але й не блокуємо вічно (див. нижче).
+            self._preclear_grace += 1
+            logger.warning("soft-start slot %d: передпродаж — помилка (%s), "
+                           "спроба %d/%d", self.slot_id, e,
+                           self._preclear_grace, MAX_PRECLEAR_GRACE)
+            if self._preclear_grace >= MAX_PRECLEAR_GRACE:
+                logger.critical("soft-start slot %d: передпродаж НЕ ВДАВСЯ %d "
+                                "разів — починаю прогрів на балансі ЯК Є; "
+                                "монети попередньої кампанії лишились",
+                                self.slot_id, self._preclear_grace)
+                if self.reporter is not None:
+                    try:
+                        await self.reporter.skipped(
+                            "⚠️ передпродаж не вдався — прогрів починається "
+                            "на балансі ЯК Є", **self._status())
+                    except Exception:
+                        logger.debug("soft-start slot %d: preclear alert failed",
+                                     self.slot_id)
+                self.campaign.mark_precleared()
+            return
+
+        if sent:
+            logger.info("soft-start slot %d: передпродаж — %d ордер(ів), "
+                        "лишаємо %.0f%% вартості монет, до кінця %.1f хв",
+                        self.slot_id, sent, keep * 100,
+                        max(0.0, self.campaign.state.preclear_until - now) / 60)
+            return                      # ще один тік на решту
+
+        # Ордерів не пішло. Це або «монет уже немає», або «лишився пил нижче
+        # біржового мінімуму» — обидва означають, що продавати більше нічого.
+        # До дедлайну ще чекаємо: монета могла не влізти в поточну частку і
+        # піде наступним тіком, коли keep_frac просяде.
+        if not past_deadline and keep > 0.0:
+            return
+        logger.info("soft-start slot %d: передпродаж завершено — прогрів "
+                    "починається з чистого балансу", self.slot_id)
+        self.campaign.mark_precleared()
+
     async def tick(self) -> None:
         if self.spot is None or self.futures is None:
             return                                  # start() has not run yet
         if self.draining:
             return                                  # OFF requested — stop() drains
+
+        # ПЕРЕДПРОДАЖ ЙДЕ ПЕРШИМ І БЛОКУЄ ВСЕ ІНШЕ.
+        # Оператор: «коли я додаю ключ — спершу продати монети, і лише тоді
+        # починати прогрів». Тому вище за `expired()` і за будь-яку купівлю.
+        if self.campaign.preclear_pending():
+            await self._preclear_tick()
+            return
 
         if self.campaign.expired():
             # РОЗПРОДАЖ ПЕРЕД ВИМКНЕННЯМ. `maybe_sell` ніколи не продає нижче
@@ -704,6 +781,13 @@ STUCK_ALERT_EVERY = 30
 # збіжний розпродаж укладається у 1-2. Стеля існує лише щоб відхилені біржею
 # ордери не тримали кампанію відкритою нескінченно.
 MAX_WIND_DOWN_PASSES = 6
+
+# Скільки тіків передпродаж пробує ПІСЛЯ свого дедлайну, перш ніж здатись.
+# Сам дедлайн (10-30 хв) уже є межею; ця стеля ловить лише випадок, коли
+# біржа стабільно не віддає баланси. Вічно блокувати прогрів гірше, ніж
+# почати його з монетами на балансі: другий стан оператор бачить у звіті,
+# а перший виглядає як мовчазна зупинка.
+MAX_PRECLEAR_GRACE = 10
 
 
 async def _alert_stuck(w, slot_id: int) -> None:

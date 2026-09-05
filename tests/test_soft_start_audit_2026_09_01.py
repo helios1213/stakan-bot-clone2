@@ -45,6 +45,10 @@ def _warmer_with(spot, camp, wound_down=False):
 
 
 class _Camp:
+    # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це ПЕРШИМ. Фейк мусить
+    # вміти, інакше він розійдеться з реальним SoftStartCampaign і
+    # тест мовчки перевірятиме не той шлях.
+    def preclear_pending(self): return False
     def __init__(self):
         self.finished = 0
         self.state = type("S", (), {"tokens": ["MX"]})()

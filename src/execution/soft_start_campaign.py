@@ -39,6 +39,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAMPAIGN_DAYS = 3
 DAY_SEC = 86400
 
+# ПЕРЕДПРОДАЖ ПЕРЕД НОВОЮ КАМПАНІЄЮ (рішення оператора 2026-09-05).
+#
+# Прогрів має починатись із чистого спотового балансу. Монети лишаються на
+# слоті завжди: `maybe_sell` НІКОЛИ не продає нижче базового залишку, а
+# розпродаж наприкінці кампанії свідомо лишає 20% спотового балансу. Тож
+# наступна кампанія стартувала б на балансі, де USDT майже немає, а вся
+# вартість замкнена в монетах — рівно та ситуація, що дала 31.08 дедлок і
+# що зараз тримає слот 1 клона з 0.93 вільних USDT при 27.37 у монетах.
+#
+# Вікно РОЗМАЗАНЕ, а не миттєве: `wind_down` ріже всі монети однією часткою
+# за ОДИН виклик, тож `keep_frac=0` злив би баланс однією пачкою ордерів.
+# Поступове зменшення виглядає як звичайне скорочення позицій — те саме
+# міркування, що вже записане в самому `wind_down`.
+PRECLEAR_MIN_SEC = 600      # 10 хв
+PRECLEAR_MAX_SEC = 1800     # 30 хв
+
 
 def _atomic_write_json(path: str, payload: dict) -> None:
     """tmp + os.replace: читач бачить або старий файл, або новий, ніколи обрізаний.
@@ -82,6 +98,19 @@ class CampaignState:
     # разом із її бюджетом, монетами в legacy-відрі та лічильниками. Тепер
     # зміна ключа = нова кампанія з чистого аркуша.
     account_key: str = ""
+    # ПЕРЕДПРОДАЖ: до якої миті монети мають бути злиті, і чи вже злиті.
+    #
+    # ДЕФОЛТ `preclear_done=True` НАВМИСНО, і це найважливіше в цих двох
+    # полях. Стан читається як `CampaignState(**json)`, тож у файлі, який
+    # писала попередня версія, цих ключів немає і вони візьмуть дефолт.
+    # Якби дефолт був False, перший же тік після деплою почав би ліквідувати
+    # баланс ЧИННОЇ кампанії. Передпродаж вмикає ЛИШЕ `start_if_new()` —
+    # тобто момент, коли кампанія справді починається.
+    #
+    # Початок вікна не зберігаємо окремо: він дорівнює `started_at`, бо
+    # кампанія і передпродаж озброюються одним викликом.
+    preclear_until: float = 0.0
+    preclear_done: bool = True
 
     def elapsed_days(self, now: float | None = None) -> float:
         if not self.started_at:
@@ -186,11 +215,48 @@ class SoftStartCampaign:
         # ПОВНИЙ СКИД, а не часткове оновлення: лічильники, ваги днів, набір
         # токенів і прапорець finished належали ТІЙ кампанії. Часткове
         # оновлення лишило б, наприклад, чужі підсумки у фінальному звіті.
-        self.state = CampaignState(days=days, started_at=time.time(),
-                                   account_key=account_key or prev_key)
+        _now = time.time()
+        _window = self.rng.uniform(PRECLEAR_MIN_SEC, PRECLEAR_MAX_SEC)
+        self.state = CampaignState(days=days, started_at=_now,
+                                   account_key=account_key or prev_key,
+                                   preclear_until=_now + _window,
+                                   preclear_done=False)
         self._save()
-        logger.info("soft-start campaign: старт (%s), %d доби", why, days)
+        logger.info("soft-start campaign: старт (%s), %d доби; передпродаж "
+                    "монет розмазано на %.0f хв", why, days, _window / 60)
         return True
+
+    # ---- передпродаж перед стартом --------------------------------------
+
+    def preclear_pending(self) -> bool:
+        """Чи треба ще злити монети, перш ніж гріти."""
+        if self._unreadable:
+            return False          # fail-closed: кампанії однаково не буде
+        return not self.state.preclear_done
+
+    def preclear_keep_frac(self, now: float | None = None) -> float:
+        """Яку частку вартості монет ЩЕ можна лишити на цьому тіку.
+
+        Лінійно 1.0 -> 0.0 від `started_at` до `preclear_until`. Саме це
+        число йде в `wind_down(keep_frac=...)`, тож кожен тік зрізає
+        черговий шматок, а на дедлайні лишається нуль.
+
+        Повертає 0.0, якщо вікно вже минуло або зіпсоване (until <= start) —
+        тобто «продай усе», а не «не продавай нічого». Помилка в цей бік
+        самовиправляється наступним тіком; у протилежний — лишила б монети
+        назавжди.
+        """
+        n = now if now is not None else time.time()
+        span = self.state.preclear_until - self.state.started_at
+        if span <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (self.state.preclear_until - n) / span))
+
+    def mark_precleared(self) -> None:
+        if self.state.preclear_done:
+            return
+        self.state.preclear_done = True
+        self._save()
 
     def expired(self) -> bool:
         if self._unreadable:

@@ -58,6 +58,10 @@ class FakePool:
 
 
 class FakeCampaign:
+    # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це ПЕРШИМ. Фейк мусить
+    # вміти, інакше він розійдеться з реальним SoftStartCampaign і
+    # тест мовчки перевірятиме не той шлях.
+    def preclear_pending(self): return False
     def __init__(self, done=False):
         self.done = done
 
@@ -488,6 +492,10 @@ async def test_an_idle_futures_half_still_drains_a_leftover_position():
     # фейк мусить це вміти. Якщо додаси раннеру ще виклик до campaign —
     # дзеркаль його ТУТ у тому ж коміті.
     w.campaign = type("C", (), {"expired": lambda self: False,
+                                # ПЕРЕДПРОДАЖ (2026-09-05): tick() питає це
+                                # ПЕРШИМ і виходить, якщо True. Дзеркалимо тут,
+                                # як і просить коментар вище.
+                                "preclear_pending": lambda self: False,
                                 "day_weight": lambda self: 1.0,
                                 "scale_target": lambda self, base: base,
                                 "finish": lambda self: None,
