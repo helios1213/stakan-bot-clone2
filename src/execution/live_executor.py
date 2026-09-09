@@ -364,6 +364,23 @@ CLOSE_FILL_POLL_INTERVAL_SEC = float(
 # only filters float dust, never a genuine 0-fee fill.
 FEE_GUARD_EPSILON_USDT = 1e-6
 
+# РЕЖИМ ПРОБИ ПІСЛЯ ПРЕВЕНТИВНОГО ХАЛТУ (рішення оператора 2026-09-09).
+#
+# Превентивний сторож халтить слот за ТАРИФОМ з `/account/tiered_fee_rate/v2`,
+# тобто без жодного філу. Це читання вже двічі провалило власну перевірку
+# ідентичності: 2026-09-04 усі чотири відповіді прийшли з `walletBalance=0`,
+# тоді як за 69с до халту на тому ж акаунті пройшло 57 WS-філів із НУЛЬОВОЮ
+# комісією. «Тариф каже платно» і «з нас беруть гроші» — різні твердження.
+#
+# Проба перетворює здогад на ВИМІР: після скидання гарда сторож глушиться, і
+# перший реальний філ виносить вирок. Ціна відповіді — комісія однієї угоди
+# (при маржі 20-25 USDT і тейкері 0.0004 це ~цент), тоді як зараз ціною є слот,
+# що стоїть.
+#
+# Вікно обмежене свідомо: проба, що лишилась увімкненою мовчки, — це знятий
+# запобіжник. Не дочекались філу — сторож вертається і халтить знову.
+FEE_PROBE_WINDOW_SEC = 1800     # 30 хв
+
 # Mapping: symbol → tick size (priceUnit). Used by passive placement.
 # Synced with PRICE_SCALES — these are 10^(-priceScale).
 TICK_SIZES: dict[str, float] = {
@@ -747,6 +764,12 @@ class LiveExecutor:
         # Fee guard: set True once a non-zero MEXC fee is observed on a fill.
         # While True, place_ioc_open refuses to open (slot also disabled in DB).
         self._halted = False
+        # Звідки прийшов халт: превентивний сторож (ТАРИФ) чи реальний філ.
+        # Різниця не косметична — проба дозволена ЛИШЕ після превентивного,
+        # бо там факт списання НЕ доведений. Після реактивного він доведений.
+        self._halt_was_preventive = False
+        # До якої миті діє проба (unix ts). 0.0 = проби немає.
+        self._fee_probe_until = 0.0
 
         # Fire-and-forget phantom-fill checks (strong refs so the GC can't kill
         # an in-flight check before it flattens a naked position).
@@ -1046,7 +1069,8 @@ class LiveExecutor:
         except Exception:
             return False
 
-    async def _trip_fee_guard(self, symbol: str, fee_usdt: float) -> None:
+    async def _trip_fee_guard(self, symbol: str, fee_usdt: float,
+                              *, preventive: bool = False) -> None:
         """A fill came back with a non-zero MEXC fee → the 0%-maker premise that
         makes this strategy profitable is broken. Halt this slot's live trading:
 
@@ -1061,11 +1085,20 @@ class LiveExecutor:
         if self._halted:
             return
         self._halted = True
-        logger.critical(
-            "🚨 FEE GUARD: slot %d %s fill charged fee=$%.6f — strategy needs 0%% "
-            "maker fee. Disabling live on this slot.",
-            self.slot_id, symbol, fee_usdt,
-        )
+        self._halt_was_preventive = bool(preventive)
+        self._fee_probe_until = 0.0        # новий халт гасить пробу, що йшла
+        if preventive:
+            logger.critical(
+                "🚨 FEE GUARD (ПРЕВЕНТИВНО): slot %d %s — ТАРИФ показав ненульову "
+                "ставку, платного філу НЕ БУЛО. Disabling live on this slot.",
+                self.slot_id, symbol,
+            )
+        else:
+            logger.critical(
+                "🚨 FEE GUARD: slot %d %s fill charged fee=$%.6f — strategy needs 0%% "
+                "maker fee. Disabling live on this slot.",
+                self.slot_id, symbol, fee_usdt,
+            )
         if self.webkey_store is not None:
             try:
                 await self.webkey_store.set_live_enabled(self.slot_id, False)
@@ -1076,7 +1109,9 @@ class LiveExecutor:
             try:
                 await self.webkey_store.set_slot_error(
                     self.slot_id,
-                    f"⚠️ fee guard: MEXC стягнула комісію ${fee_usdt:.6f} (0% премісу зламано)")
+                    (f"⚠️ fee guard ПРЕВЕНТИВНО: тариф показав ненульову ставку, філу не було — натисни Reset fee guard, щоб перевірити реальним ордером"
+                     if preventive else
+                     f"⚠️ fee guard: MEXC стягнула комісію ${fee_usdt:.6f} (0% премісу зламано)"))
             except Exception:
                 logger.exception("fee guard: failed to persist last_error slot %d", self.slot_id)
             # Durably flip the pair to SHADOW. live_enabled alone leaves the
@@ -1107,16 +1142,29 @@ class LiveExecutor:
                 )
         if self.alerts is not None:
             try:
-                await self.alerts.send(
+                _msg = (
+                    f"🚨 <b>ТАРИФ ПОКАЗАВ КОМІСІЮ — SLOT{self.slot_id} live DISABLED</b>\n\n"
+                    f"{symbol}: біржа віддала НЕНУЛЬОВУ тарифну ставку.\n"
+                    f"<b>Платного філу НЕ БУЛО</b> — з тебе нічого не знімали. Слот "
+                    f"зупинено превентивно, ДО першої платної угоди.\n\n"
+                    f"Тарифному читанню не завжди можна вірити: 2026-09-04 воно "
+                    f"віддало ненульову ставку з <code>walletBalance=0</code> (тобто "
+                    f"питало не той акаунт), а за 69с до того на цьому ж акаунті "
+                    f"пройшло 57 філів із НУЛЬОВОЮ комісією.\n\n"
+                    f"<b>Перевірити реально:</b> 🔑 Webkey → слот {self.slot_id} → "
+                    f"Reset fee guard. Сторож замовкне на 30 хв, і перший живий ордер "
+                    f"дасть відповідь — нульова комісія означає, що тариф брехав."
+                ) if preventive else (
                     f"🚨 <b>FEE DETECTED — SLOT{self.slot_id} live DISABLED</b>\n\n"
                     f"{symbol}: MEXC charged a non-zero fee (${fee_usdt:.6f}) on a fill.\n\n"
                     f"This bot only has edge at <b>0% maker fee</b>, so live trading on "
                     f"slot {self.slot_id} was halted automatically. The pair falls back "
                     f"to shadow.\n\n"
                     f"Check the account's fee tier on MEXC; once it's 0% again, "
-                    f"re-enable via 🔑 Webkey → slot {self.slot_id}.",
-                    category=f"fee_guard_{self.slot_id}",
+                    f"re-enable via 🔑 Webkey → slot {self.slot_id}."
                 )
+                await self.alerts.send(
+                    _msg, category=f"fee_guard_{self.slot_id}")
             except Exception:
                 logger.exception("fee guard: alert failed for slot %d", self.slot_id)
 
@@ -1128,10 +1176,67 @@ class LiveExecutor:
         prior pair's trip. Returns True if it had been halted.
         """
         was = self._halted
+        preventive = getattr(self, "_halt_was_preventive", False)
         self._halted = False
-        if was:
-            logger.warning("Fee guard manually RESET for slot %d", self.slot_id)
+        if was and preventive:
+            # РЕЖИМ ПРОБИ. Халт стався за ТАРИФОМ, тобто факт списання не
+            # доведений. Глушимо сторожа, щоб він не халтнув знову за 20с
+            # (він опитує раз на 10с, підтверджень 2) і перший живий філ так
+            # і не встиг би статись. Вирок винесе сам філ.
+            self._fee_probe_until = time.time() + FEE_PROBE_WINDOW_SEC
+            self._halt_was_preventive = False
+            logger.warning(
+                "Fee guard RESET (slot %d): халт був ПРЕВЕНТИВНИЙ -> проба на "
+                "%.0f хв, сторож приглушено. Вирок винесе перший реальний філ.",
+                self.slot_id, FEE_PROBE_WINDOW_SEC / 60)
+        elif was:
+            # Реактивний халт: комісію ВЖЕ бачили на філі. Пробу не вмикаємо —
+            # перевіряти нічого, факт доведений.
+            logger.warning("Fee guard manually RESET for slot %d (халт був "
+                           "реактивний — проба НЕ вмикається)", self.slot_id)
         return was
+
+    def fee_probe_active(self, now: float | None = None) -> bool:
+        """Чи діє зараз проба — тобто чи має превентивний сторож мовчати.
+
+        Вікно обмежене: проба, що лишилась увімкненою мовчки, це знятий
+        запобіжник. Минув час без філу — сторож вертається і халтить знову.
+        """
+        until = getattr(self, "_fee_probe_until", 0.0)
+        if not until:
+            return False
+        if (now if now is not None else time.time()) >= until:
+            self._fee_probe_until = 0.0
+            logger.warning("Fee probe slot %d: вікно минуло без жодного філу — "
+                           "сторож знову пильнує", self.slot_id)
+            return False
+        return True
+
+    def _resolve_fee_probe(self, symbol: str, fee_usdt: float) -> None:
+        """Перший реальний філ під час проби — і це ВИМІР, а не здогад.
+
+        Нульова комісія доводить, що тарифне читання брехало: промо на місці.
+        Ненульову обробляє звичайний реактивний гард вище за стеком — сюди
+        така не доходить.
+        """
+        if not self.fee_probe_active():
+            return
+        self._fee_probe_until = 0.0
+        logger.warning(
+            "✅ FEE PROBE slot %d: %s налився з комісією $%.6f — тариф брехав, "
+            "промо на місці. Проба знята, сторож пильнує далі.",
+            self.slot_id, symbol, fee_usdt)
+        if self.alerts is not None:
+            try:
+                import asyncio as _a
+                _a.get_running_loop().create_task(self.alerts.send(
+                    f"✅ <b>SLOT{self.slot_id}: тариф брехав</b>\n\n"
+                    f"{symbol} налився з комісією <b>${fee_usdt:.6f}</b> — тобто "
+                    f"промо на місці, а превентивний халт був хибним.\n\n"
+                    f"Проба знята, сторож пильнує далі.",
+                    category=f"fee_probe_{self.slot_id}"))
+            except Exception:
+                logger.debug("fee probe: alert failed slot %d", self.slot_id)
 
     async def place_ioc_open(
         self,
@@ -1544,6 +1649,10 @@ class LiveExecutor:
                 _fill_fee = _fee_box[0] if _fee_box else 0.0
                 if _fill_fee > FEE_GUARD_EPSILON_USDT:
                     await self._trip_fee_guard(symbol, _fill_fee)
+                else:
+                    # Нульова комісія на РЕАЛЬНОМУ філі. Якщо йшла проба після
+                    # превентивного халту — це і є її вирок: тариф брехав.
+                    self._resolve_fee_probe(symbol, _fill_fee)
                 # FILLED (possibly partial) — compute REAL notional from
                 # MEXC-authoritative numbers.
                 contract_size = CONTRACT_SIZES.get(symbol, 1.0)
@@ -1821,6 +1930,8 @@ class LiveExecutor:
             return
         if cf is not None and cf.fee > FEE_GUARD_EPSILON_USDT:
             await self._trip_fee_guard(symbol, cf.fee)
+        elif cf is not None:
+            self._resolve_fee_probe(symbol, cf.fee)
 
     async def _close_fill_ws_or_rest(
         self, client, symbol, position_id, close_after_ts_ms, after_ts_monotonic,

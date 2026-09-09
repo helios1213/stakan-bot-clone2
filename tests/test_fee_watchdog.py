@@ -31,11 +31,24 @@ class _Client:
 
 
 class _Executor:
-    def __init__(self):
-        self.tripped = []
+    """Дзеркалить реальний executor у тому, що читає сторож.
 
-    async def _trip_fee_guard(self, symbol, fee_usdt):
+    Сторож із 2026-09-09 (а) позначає халт `preventive=True` і (б) питає
+    `fee_probe_active()`, щоб мовчати під час проби. Фейк без цих двох
+    сигнатур давав ТИХИЙ провал: `_trip_fee_guard` кидав TypeError, сторож
+    ловив його своїм `except` і халт просто не відбувався.
+    """
+
+    def __init__(self, probe=False):
+        self.tripped = []
+        self.probe = probe
+
+    def fee_probe_active(self):
+        return self.probe
+
+    async def _trip_fee_guard(self, symbol, fee_usdt, *, preventive=False):
         self.tripped.append((symbol, fee_usdt))
+        self.preventive = preventive
 
 
 def _resp(maker, taker, balance=213.68):
@@ -153,7 +166,10 @@ async def test_it_reuses_the_existing_guard_not_its_own_halt():
 @pytest.mark.asyncio
 async def test_a_failing_halt_does_not_crash_the_loop(wd):
     class Boom:
-        async def _trip_fee_guard(self, *a):
+        def fee_probe_active(self):
+            return False
+
+        async def _trip_fee_guard(self, *a, **kw):
             raise RuntimeError("біда")
     for _ in range(fw.CONFIRMATIONS):
         r = await wd.check_slot(1, _Client(_resp(0.0001, 0.0004)), "PEPE_USDT", Boom())

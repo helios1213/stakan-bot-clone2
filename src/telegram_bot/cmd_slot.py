@@ -562,9 +562,16 @@ async def handle_slot_callback(query, context, data: str) -> None:
         # live, so a 0%-fee pair isn't blocked by another pair's fee-trip.
         live_pool = context.bot_data.get("live_pool")
         was_halted = False
+        probe_armed = False
         if live_pool is not None:
             try:
                 was_halted = live_pool.reset_fee_guard(slot_id)
+            except Exception:
+                pass
+            try:
+                # Проба вмикається САМА, якщо халт був превентивним (за тарифом,
+                # без філу). Кнопка має сказати оператору, що саме сталось.
+                probe_armed = live_pool.fee_probe_active(slot_id)
             except Exception:
                 pass
         try:
@@ -573,6 +580,8 @@ async def handle_slot_callback(query, context, data: str) -> None:
             pass
         try:
             await query.answer(
+                "Проба ✅ сторож мовчить 30 хв — перший філ покаже правду"
+                if probe_armed else
                 "Fee-guard reset ✅ — live re-enabled" if was_halted
                 else "Fee-guard was not active — live re-enabled"
             )

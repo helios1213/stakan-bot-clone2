@@ -411,6 +411,15 @@ class LiveExecutorPool:
         ex = self._executors.get(slot_id)
         return ex.reset_fee_guard() if ex is not None else False
 
+    def fee_probe_active(self, slot_id: int) -> bool:
+        """Чи діє проба на слоті — щоб кнопка сказала оператору правду про те,
+        що саме вона щойно зробила."""
+        ex = self._executors.get(slot_id)
+        try:
+            return bool(ex is not None and ex.fee_probe_active())
+        except Exception:
+            return False
+
     def get_safety(self, slot_id: int) -> LiveSafetyController | None:
         return self._safety_controllers.get(slot_id)
 

@@ -83,6 +83,17 @@ class FeeWatchdog:
         out = {"slot": slot_id, "symbol": symbol_mexc, "ok": False,
                "maker": None, "taker": None, "balance": None,
                "strikes": self._strikes.get(slot_id, 0), "halted": False}
+        # ПРОБА. Оператор скинув превентивний халт, щоб перевірити тариф
+        # РЕАЛЬНИМ ордером. Якби ми далі опитували тариф, то халтнули б знову
+        # за ~20с (10с × 2 підтвердження) — і жоден живий ордер не встиг би
+        # статись, бо він чекає на сигнал детектора, а не йде негайно.
+        # Мовчимо, доки проба діє; вирок винесе філ, а не тариф.
+        try:
+            if executor is not None and executor.fee_probe_active():
+                out["probe"] = True
+                return out
+        except Exception:
+            pass
         try:
             resp = await client._request(
                 "GET", f"/account/tiered_fee_rate/v2?symbol={symbol_mexc}",
@@ -130,7 +141,7 @@ class FeeWatchdog:
             # вимкнення слота в БД, пара в shadow, алерт у Telegram.
             # fee_usdt=0.0 — платного філу НЕ БУЛО, і саме в цьому суть:
             # ми зупиняємось до нього.
-            await executor._trip_fee_guard(symbol_mexc, 0.0)
+            await executor._trip_fee_guard(symbol_mexc, 0.0, preventive=True)
             out["halted"] = True
             logger.critical(
                 "🚨 [FEE WATCH] slot %d ЗУПИНЕНО ПРЕВЕНТИВНО: %s maker=%s "
