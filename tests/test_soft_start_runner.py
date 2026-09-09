@@ -100,6 +100,13 @@ class FakeWarmer:
     def __init__(self, slot_id, webkey, client, universe, *, dry_run,
                  futures_allowed=True, **kw):
         self.slot_id = slot_id
+        # ВІДБИТОК АКАУНТА — сторож дрейфу, не косметика.
+        #
+        # Цикл щополла звіряє `w._account_key` з живим ключем слота і
+        # перестворює warmer при розбіжності (заміна вебкея на льоту,
+        # 2026-09-09). Фейк без цього поля виглядав би для циклу як warmer
+        # з ЧУЖИМ ключем — і перестворювався б КОЖЕН полл.
+        self._account_key = ssr._account_fingerprint(webkey)
         self.dry_run = dry_run
         self.universe = universe
         self.futures_allowed = futures_allowed

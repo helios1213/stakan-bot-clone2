@@ -147,6 +147,11 @@ class _StuckWarmer:
     def __init__(self, slot_id, webkey, client, universe, *, dry_run,
                  futures_allowed=True, **kw):
         self.slot_id = slot_id
+        # Сторож дрейфу: цикл щополла звіряє це з живим ключем слота і
+        # перестворює warmer при розбіжності (заміна вебкея, 2026-09-09).
+        # Без поля фейк виглядав би як warmer із ЧУЖИМ ключем.
+        from src.execution.soft_start_runner import _account_fingerprint
+        self._account_key = _account_fingerprint(webkey)
         self.stop_calls = 0
         self.ticks = 0
         self.draining = False

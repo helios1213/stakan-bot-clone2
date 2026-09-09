@@ -48,6 +48,19 @@ logger = logging.getLogger(__name__)
 
 POLL_SEC = 60
 
+
+def _account_fingerprint(webkey: str) -> str:
+    """Відбиток АКАУНТА за вебкеєм — НЕ сам ключ (у стані секретам не місце).
+
+    ОДНА функція на обидва вживання свідомо: `SlotWarmer` штампує ним
+    `_account_key` при створенні, а цикл раннера щополла звіряє з ним живий
+    ключ слота. Якби формула була продубльована, найгірший наслідок був би
+    не помилкою, а ТИШЕЮ: відбитки ніколи не збіглись би (або збігались би
+    завжди), і перевірка заміни ключа стала б no-op, який виглядає робочим.
+    """
+    import hashlib
+    return hashlib.sha256((webkey or "").encode("utf-8")).hexdigest()[:16]
+
 # Частка спотового балансу, що лишається в монетах після кампанії, живе НЕ
 # ТУТ: з 2026-09-05 це діапазон [0.15; 0.25], який `SoftStartCampaign`
 # розігрує раз на кампанію і зберігає (`wind_down_keep()`). Константи —
@@ -135,9 +148,7 @@ class SlotWarmer:
         # Відбиток АКАУНТА — не сам ключ. Потрібен, щоб помітити заміну
         # вебкея: стан прогріву лежить per-slot, і новий акаунт успадкував би
         # чужу кампанію разом із її грошима в обліку.
-        import hashlib
-        self._account_key = hashlib.sha256(
-            (webkey or "").encode("utf-8")).hexdigest()[:16]
+        self._account_key = _account_fingerprint(webkey)
         self.spot_client = SpotWebClient(webkey, dry_run=dry_run,
                                          slot_id=slot_id)
         self.spot: SpotSoftStart | None = None
@@ -940,6 +951,63 @@ async def soft_start_loop(store, client_pool, universe_provider,
                         continue
                     warmers.pop(slot_id, None)
                     logger.info("soft-start slot %d: OFF", slot_id)
+
+            # ЗАМІНА ВЕБКЕЯ НА ЛЬОТУ — warmer МУСИТЬ бути перестворений.
+            #
+            # `SlotWarmer` захоплює ключ у момент створення і більше ніколи його
+            # не перечитує: `_account_key`, `SpotWebClient(webkey)` і
+            # `FeeGate(client)` беруться в `__init__`. Пул клієнтів при цьому
+            # інвалідується правильно (`cmd_webkey.py` кличе `pool.invalidate`),
+            # але warmer тримає ПОСИЛАННЯ на старий обʼєкт клієнта, тож це його
+            # не рятує.
+            #
+            # ВИМІРЯНО на primary слот 1 (2026-09-09): ключ помер о 09-07 22:25
+            # (`code=401`), оператор замінив його о 22:32 і ще раз 09-08 12:01 —
+            # і після цього слот стояв мовчки ДВІ ДОБИ. Симптоми: fee gate не
+            # читає ЖОДНОЇ з 23 пар (`ставку не прочитано у 23 із 23`, ~37 разів
+            # на годину), баланси не читаються, спотова половина визнається
+            # нежиттєздатною, а її файл стану замерзає на позавчорашній даті.
+            # Бот при цьому `healthy` і торгує в shadow — тиша повна.
+            #
+            # КНОПКА НЕ РЯТУЄ, і це не здогад: за ті дві доби в лозі немає ані
+            # `ON`, ані `OFF` для слота 1. Цикл опитує раз на POLL_SEC; якщо OFF
+            # і ON встигають між поллами, проміжного стану він не бачить, а
+            # гілка старту нижче пропускає слот через `sid in warmers`.
+            #
+            # Той самий патерн, що й гард C4: те, що оператор може змінити на
+            # льоту, треба ПЕРЕЧИТУВАТИ щополла, а не лише на старті.
+            _slots_now = {s_.slot_id: s_ for s_ in slots}
+            for sid, w in list(warmers.items()):
+                _s = _slots_now.get(sid)
+                _wk = getattr(_s, "webkey", None) if _s is not None else None
+                if not _wk:
+                    continue
+                if _account_fingerprint(_wk) == getattr(w, "_account_key", None):
+                    continue
+                # Позиція прогріву переживе заміну: перелогін дає НОВУ сесію на
+                # ТОМУ САМОМУ акаунті, тож `recover()` у `start()` підхопить її
+                # новим ключем. Кажемо про це гучно, бо якщо ключ належав
+                # ІНШОМУ акаунту, позиція лишиться сиротою — і це той випадок,
+                # коли оператор мусить глянути на біржу власними очима.
+                _pos = None
+                try:
+                    _pos = getattr(getattr(w, "futures", None), "state", None)
+                    _pos = getattr(_pos, "position", None)
+                except Exception:
+                    pass
+                if _pos:
+                    logger.critical(
+                        "soft-start slot %d: ВЕБКЕЙ ЗАМІНЕНО, а слот тримає "
+                        "позицію %s — перестворюю warmer; якщо ключ від ІНШОГО "
+                        "акаунта, позиція лишиться сиротою, перевір біржу",
+                        sid, _pos.get("symbol") if isinstance(_pos, dict) else _pos)
+                else:
+                    logger.warning("soft-start slot %d: вебкей замінено — "
+                                   "перестворюю warmer зі свіжим ключем", sid)
+                # НЕ кличемо `stop()`: він ходив би на біржу СТАРИМ ключем і
+                # впав би, а невдалий stop лишає warmer у `draining` назавжди —
+                # рівно та пастка, через яку кнопка й не допомагала.
+                warmers.pop(sid, None)
 
             # Start newly enabled ones.
             for slot in slots:
