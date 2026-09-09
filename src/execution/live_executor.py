@@ -488,6 +488,69 @@ def is_slot_level_error(msg: str | None) -> bool:
     return any(kw in lower for kw in SLOT_LEVEL_ERROR_KEYWORDS)
 
 
+# ── ЧОМУ АКАУНТ СТАВ: КЛАСИФІКАЦІЯ ДЛЯ ПОВІДОМЛЕНЬ (не гейт!) ───────────────
+#
+# Превентивний fee-guard халтить слот за ТАРИФОМ і пише «комісія $0.000000».
+# Виміряно 2026-09-04 на слоті 2: за 19 секунд ДО того халту біржа 8 разів
+# відбила ордери з `code=6026 Position opening is unavailable until risk
+# control verification is completed`. Тобто зупинив нас не тариф, а блок
+# акаунта — а оператор читав повідомлення як «впала комісія» і йшов шукати
+# промо замість того, щоб пройти перевірку обличчя в застосунку MEXC.
+#
+# Ці таблиці вживаються ВИКЛЮЧНО для тексту алерта і рядка в панелі.
+# `SLOT_LEVEL_ERROR_KEYWORDS` вище НЕ розширено свідомо: він читається як
+# гейт (обриває ретраї), і додавання туди 6002/6028/Help Center змінило б
+# торгівлю. Латч акаунт-рівневої відмови оператор закрив 2026-09-04.
+#
+# Коди звіряються ОКРЕМИМ полем, а не пошуком «6002» у тексті: голе число
+# збіглося б із ціною або id ордера (та сама пастка, що вже була з «401»).
+ACCOUNT_BLOCK_CODES = {
+    "6001": "акаунт обмежено біржею",
+    "6002": "відкриття позицій заборонено акаунту (код 6002)",
+    "6026": "перевірка особи / risk control на MEXC (код 6026)",
+    "6028": "ризик-перевірка платформи (код 6028)",
+}
+
+# Порядок ВАЖЛИВИЙ — від конкретного до загального: "identity verification"
+# має дати свій ярлик, а не потрапити під ширше "verification".
+ACCOUNT_BLOCK_PHRASES = (
+    ("identity verification", "перевірка особи (identity verification)"),
+    ("risk control", "перевірка особи / risk control на MEXC"),
+    ("risk review", "ризик-перевірка платформи"),
+    ("help center", "MEXC просить подати документи (Help Center)"),
+    ("submit information", "MEXC просить подати документи"),
+    ("position opening is forbidden", "відкриття позицій заборонено акаунту"),
+    ("compliance review", "комплаєнс-перевірка"),
+    ("trading restricted", "торгівлю обмежено біржею"),
+    ("verification", "перевірка особи на MEXC"),
+    ("kyc", "не пройдено KYC"),
+    ("frozen", "акаунт заморожено"),
+    ("suspended", "акаунт призупинено"),
+    ("locked", "акаунт заблоковано"),
+)
+
+# Скільки блок вважається СВІЖИМ. Довше — і халт пояснювався б учорашньою
+# подією, тобто повідомлення знову брехало б, лише в інший бік.
+ACCOUNT_BLOCK_FRESH_SEC = 900.0
+
+
+def classify_account_block(code, msg: str | None) -> str | None:
+    """Людський ярлик для акаунт-рівневої відмови MEXC, або None.
+
+    None означає «це не схоже на блок акаунта» — тоді повідомлення лишається
+    таким, як було. Троттл відкриттів (`9082`/`10014`/`2036`) сюди свідомо
+    НЕ входить: він минає сам за хвилини і акаунт при цьому справний.
+    """
+    label = ACCOUNT_BLOCK_CODES.get(str(code).strip()) if code is not None else None
+    if label:
+        return label
+    lower = (msg or "").lower()
+    for needle, label in ACCOUNT_BLOCK_PHRASES:
+        if needle in lower:
+            return label
+    return None
+
+
 async def _poll_fill_price(
     client,
     symbol: str,
@@ -790,6 +853,12 @@ class LiveExecutor:
         # Per-slot account-level error (face verification, risk control, etc.)
         self.slot_level_error: str | None = None
         self.slot_level_error_at_ts: int = 0
+        # Остання АКАУНТ-РІВНЕВА відмова біржі — лише щоб повідомлення про
+        # халт назвало справжню причину. Ширше за `slot_level_error`: сюди
+        # потрапляють і 6002/6028/Help Center, які той гейт не ловить.
+        self.account_block: str | None = None       # ярлик для оператора
+        self.account_block_msg: str | None = None   # сирий текст біржі
+        self.account_block_at_ts: float = 0.0
 
         # Surface IOC fill-poll config on startup (verify deploy at a glance).
         # NB: entry offset / max_attempts / retry_delay are now PER-PAIR
@@ -881,6 +950,7 @@ class LiveExecutor:
         if code != 0:
             self.opens_failed += 1
             self.last_error = f"api_error_{code}: {msg}"
+            self._note_account_block(code, msg)
             # #4: персист причини стопу (throttle/delay коди) у БД, щоб
             # панель показувала ЧОМУ opens стали. Account-level (risk-control
             # текст) персиститься нижче; health-check із error=None очистить,
@@ -1005,6 +1075,7 @@ class LiveExecutor:
 
         # Clear any previous slot-level error — if we successfully opened,
         # the user must have resolved the verification/risk issue.
+        self._clear_account_block()
         if self.slot_level_error is not None:
             previous_error = self.slot_level_error
             logger.info(
@@ -1069,6 +1140,30 @@ class LiveExecutor:
         except Exception:
             return False
 
+    def _note_account_block(self, code, msg: str | None) -> None:
+        """Запамʼятати акаунт-рівневу відмову. НІЧОГО не гейтить."""
+        label = classify_account_block(code, msg)
+        if not label:
+            return
+        self.account_block = label
+        self.account_block_msg = str(msg)
+        self.account_block_at_ts = time.time()
+
+    def _clear_account_block(self) -> None:
+        """Успішне відкриття доводить, що акаунт не заблокований."""
+        self.account_block = None
+        self.account_block_msg = None
+        self.account_block_at_ts = 0.0
+
+    def account_block_fresh(self, now: float | None = None) -> tuple[str, str] | None:
+        """`(ярлик, текст біржі)`, якщо блок свіжий; інакше None."""
+        if not self.account_block:
+            return None
+        _n = now if now is not None else time.time()
+        if _n - self.account_block_at_ts > ACCOUNT_BLOCK_FRESH_SEC:
+            return None
+        return (self.account_block, self.account_block_msg or "")
+
     async def _trip_fee_guard(self, symbol: str, fee_usdt: float,
                               *, preventive: bool = False) -> None:
         """A fill came back with a non-zero MEXC fee → the 0%-maker premise that
@@ -1087,11 +1182,18 @@ class LiveExecutor:
         self._halted = True
         self._halt_was_preventive = bool(preventive)
         self._fee_probe_until = 0.0        # новий халт гасить пробу, що йшла
+        # Чи стоїть акаунт ПРЯМО ЗАРАЗ. Якщо так, «ненульовий тариф» — це
+        # симптом блоку, а не падіння промо, і повідомлення мусить назвати
+        # саме блок (виміряний випадок 2026-09-04, слот 2: 8 відмов `6026`
+        # за 19с до халту).
+        _blk = self.account_block_fresh() if preventive else None
         if preventive:
             logger.critical(
                 "🚨 FEE GUARD (ПРЕВЕНТИВНО): slot %d %s — ТАРИФ показав ненульову "
-                "ставку, платного філу НЕ БУЛО. Disabling live on this slot.",
+                "ставку, платного філу НЕ БУЛО. %s Disabling live on this slot.",
                 self.slot_id, symbol,
+                (f"ПРИЧИНА, найпевніше, НЕ комісія: {_blk[0]} — «{_blk[1]}»."
+                 if _blk else "Акаунт-рівневих відмов перед цим не було."),
             )
         else:
             logger.critical(
@@ -1109,7 +1211,9 @@ class LiveExecutor:
             try:
                 await self.webkey_store.set_slot_error(
                     self.slot_id,
-                    (f"⚠️ fee guard ПРЕВЕНТИВНО: тариф показав ненульову ставку, філу не було — натисни Reset fee guard, щоб перевірити реальним ордером"
+                    (f"⚠️ слот стоїть НЕ через комісію: {_blk[0]} — розблокуй акаунт на MEXC"
+                     if _blk else
+                     f"⚠️ fee guard ПРЕВЕНТИВНО: тариф показав ненульову ставку, філу не було — натисни Reset fee guard, щоб перевірити реальним ордером"
                      if preventive else
                      f"⚠️ fee guard: MEXC стягнула комісію ${fee_usdt:.6f} (0% премісу зламано)"))
             except Exception:
@@ -1143,6 +1247,16 @@ class LiveExecutor:
         if self.alerts is not None:
             try:
                 _msg = (
+                    f"🚨 <b>АКАУНТ ЗАБЛОКОВАНО — SLOT{self.slot_id} live DISABLED</b>\n\n"
+                    f"{symbol}: <b>це не падіння комісії.</b> Платного філу НЕ БУЛО, "
+                    f"з тебе нічого не знімали.\n\n"
+                    f"Біржа блокує акаунт: <b>{_blk[0]}</b>\n"
+                    f"<i>{_blk[1]}</i>\n\n"
+                    f"Тариф читається ненульовим, поки блок висить. "
+                    f"Спочатку пройди перевірку в застосунку MEXC — доти "
+                    f"Reset fee guard нічого не доведе, бо біржа відбиватиме "
+                    f"кожен ордер."
+                ) if _blk else (
                     f"🚨 <b>ТАРИФ ПОКАЗАВ КОМІСІЮ — SLOT{self.slot_id} live DISABLED</b>\n\n"
                     f"{symbol}: біржа віддала НЕНУЛЬОВУ тарифну ставку.\n"
                     f"<b>Платного філу НЕ БУЛО</b> — з тебе нічого не знімали. Слот "
@@ -1523,6 +1637,7 @@ class LiveExecutor:
 
             if code != 0:
                 last_error_msg = f"api_error_{code}: {msg}"
+                self._note_account_block(code, msg)
                 if str(code) in OPEN_FREQ_CODES:
                     # Remember it: a later attempt that merely expires would
                     # otherwise erase the evidence, and the throttle latch keys
@@ -1670,6 +1785,7 @@ class LiveExecutor:
                 )
 
                 # Clear stale slot-level error if any
+                self._clear_account_block()
                 if self.slot_level_error is not None:
                     previous_error = self.slot_level_error
                     logger.info(

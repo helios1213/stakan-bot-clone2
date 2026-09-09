@@ -34,6 +34,12 @@ def _ex(slot_id=1):
     e._halted = False
     e._halt_was_preventive = False
     e._fee_probe_until = 0.0
+    # Дзеркалить `__init__`: `_trip_fee_guard` питає `account_block_fresh()`,
+    # щоб назвати справжню причину халту. Без цих полів фіча падала б із
+    # AttributeError — а `getattr`-обхід зробив би її мовчки інертною.
+    e.account_block = None
+    e.account_block_msg = None
+    e.account_block_at_ts = 0.0
     e.alerts = None
     e.webkey_store = None
     return e
