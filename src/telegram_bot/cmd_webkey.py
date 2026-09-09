@@ -100,6 +100,26 @@ def _store(context: ContextTypes.DEFAULT_TYPE) -> WebkeyStore:
     return s
 
 
+def _live_pool(context: ContextTypes.DEFAULT_TYPE):
+    """Пул виконавців — там живуть халти й акаунт-рівневі помилки слота."""
+    try:
+        return context.application.bot_data.get("live_pool")
+    except AttributeError:
+        return None
+
+
+async def _clear_restrictions(context, slot_id: int, reason: str) -> list[str]:
+    """Слот після заміни/видалення ключа має бути чистим (рішення оператора)."""
+    pool = _live_pool(context)
+    if pool is None:
+        return []
+    try:
+        return await pool.clear_slot_restrictions(slot_id, reason=reason)
+    except Exception:
+        logger.exception("clear_slot_restrictions failed for slot %s", slot_id)
+        return []
+
+
 def _client_pool(context: ContextTypes.DEFAULT_TYPE):
     """
     Returns the persistent WebkeyClientPool (or None if not wired).
@@ -546,6 +566,9 @@ async def _step_webkey(update, context, text, fsm) -> None:
     pool = _client_pool(context)
     if pool is not None:
         await pool.invalidate(fsm.slot_id)
+    # ...і слот має стати чистим: халти живуть у ПАМʼЯТІ екзекутора, тож без
+    # цього новий ключ мовчки впирався б у старе блокування (виміряно 09.09).
+    _cleared = await _clear_restrictions(context, fsm.slot_id, "новий вебкей")
 
     # Delete sensitive webkey message from chat
     await _delete_message_safely(update)
@@ -560,7 +583,8 @@ async def _step_webkey(update, context, text, fsm) -> None:
         chat_id=update.effective_chat.id,
         text=(
             f"✅ *Slot {slot_id} configured.*\n\n"
-            f"Run /webkey\\_test {slot_id} to verify, "
+            + (f"🧹 Знято обмеження: {', '.join(_cleared)}.\n\n" if _cleared else "")
+            + f"Run /webkey\\_test {slot_id} to verify, "
             f"then /webkey\\_enable {slot_id} when ready."
         ),
         parse_mode=ParseMode.MARKDOWN,
@@ -579,6 +603,7 @@ async def _step_remove_confirm(update, context, text, fsm) -> None:
     pool = _client_pool(context)
     if pool is not None:
         await pool.invalidate(n)
+    await _clear_restrictions(context, n, "вебкей видалено")
     await update.message.reply_text(
         f"🗑 Slot {n}: cleared." if deleted else f"Slot {n}: nothing to delete.",
     )

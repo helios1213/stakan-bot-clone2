@@ -411,6 +411,60 @@ class LiveExecutorPool:
         ex = self._executors.get(slot_id)
         return ex.reset_fee_guard() if ex is not None else False
 
+    async def clear_slot_restrictions(self, slot_id: int, *, reason: str) -> list[str]:
+        """Зняти НАШІ блокування зі слота. Рішення оператора 2026-09-09:
+        видалення або переклеювання вебкея = чистий аркуш для слота.
+
+        НАВІЩО. Виміряно на клоні 09.09: превентивний fee-guard халтнув слот
+        о 18:40, оператор вставив новий ключ о 18:48 — і 66 ордерів поспіль
+        відбились із `fee_guard_halted`, не долетівши до біржі. Халт живе в
+        ПАМʼЯТІ екзекутора, а `cmd_webkey` інвалідував лише кеш клієнта;
+        `rebuild_from_store` екзекутор не перестворює (`if sid not in
+        self._executors`), тож прапорець переживав заміну ключа.
+
+        ОДНА функція на всі шляхи (переклеювання, /webkey_remove, кнопка в
+        меню) — три копії розійшлися б, і слот чистився б по-різному залежно
+        від того, звідки натиснули.
+
+        ЧОГО ВОНА СВІДОМО НЕ ЧІПАЄ:
+          * `live_enabled` — це вимикач ОПЕРАТОРА, а не обмеження. Вмикати
+            живу торгівлю реальними грошима у відповідь на вставлений ключ
+            бот не має права;
+          * кіл просадки — він про ЗБИТКИ, а не про ключ, і має власну кнопку;
+          * латч троттлу відкриттів — у нього вже є власне зняття по НОВОМУ
+            ключу (`_release_throttle_for_new_keys`), і воно свідомо не
+            спрацьовує на ВИДАЛЕННІ: ліміт лежить на акаунті, а не на сесії,
+            тож проба порожнім слотом лише заробила б свіжі 6 годин
+            (виміряно 2026-07-29).
+
+        Повертає перелік знятого — щоб повідомлення оператору казало правду,
+        а не «готово» над слотом, де нічого не стояло.
+        """
+        cleared: list[str] = []
+        ex = self._executors.get(slot_id)
+        if ex is not None:
+            if ex._halted:
+                cleared.append("fee-guard халт")
+            ex._halted = False
+            ex._halt_was_preventive = False
+            ex._fee_probe_until = 0.0
+            if ex.slot_level_error:
+                cleared.append("акаунт-рівнева помилка")
+            ex.slot_level_error = None
+            ex.slot_level_error_at_ts = 0
+            if ex.account_block:
+                cleared.append(f"блок акаунта ({ex.account_block})")
+            ex._clear_account_block()
+            ex.last_error = None
+        if self.webkey_store is not None:
+            try:
+                await self.webkey_store.clear_slot_error(slot_id)
+            except Exception:
+                logger.exception("clear_slot_restrictions: slot %d error-line", slot_id)
+        logger.warning("slot %d: знято обмеження (%s) — %s", slot_id, reason,
+                       ", ".join(cleared) if cleared else "жодного не стояло")
+        return cleared
+
     def fee_probe_active(self, slot_id: int) -> bool:
         """Чи діє проба на слоті — щоб кнопка сказала оператору правду про те,
         що саме вона щойно зробила."""

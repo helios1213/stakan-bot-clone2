@@ -1083,9 +1083,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 sid = int(parts[3])
             except (ValueError, IndexError):
                 return
+            from src.telegram_bot.cmd_webkey import (_clear_restrictions,
+                                                     _client_pool as _wk_client_pool)
             deleted = await _wk_store(context).delete(sid)
+            # Креденшели зникли — кешований клієнт мусить зникнути разом із
+            # ними, інакше слот ще секунди ходив би на біржу СТАРИМ ключем.
+            # (Гілка з /webkey_remove це робила, ця — ні.)
+            _cp = _wk_client_pool(context)
+            if _cp is not None:
+                await _cp.invalidate(sid)
+            _cleared = await _clear_restrictions(context, sid, "вебкей видалено")
+            _tail = f"\n🧹 Знято обмеження: {', '.join(_cleared)}." if _cleared else ""
             await query.edit_message_text(
-                f"🗑 Slot {sid}: cleared." if deleted else f"Slot {sid}: nothing to delete.",
+                (f"🗑 Slot {sid}: cleared.{_tail}") if deleted
+                else f"Slot {sid}: nothing to delete.",
             )
             return
 
