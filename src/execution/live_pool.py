@@ -229,12 +229,66 @@ class LiveExecutorPool:
         # Тут стан дзеркалиться в live_state, а звідти ж забирається запит на
         # зняття. Цикл rebuild іде раз на 30с — саме така затримка і в кнопки.
         await self.sync_kill_state()
+        # Запити «почистити слот» із панелі — той самий цикл, та сама затримка.
+        await self.sync_clear_requests()
 
     # ---- Кіл назовні: дзеркало стану + запит на зняття з панелі ----
 
     @staticmethod
     def _kill_state_key(slot_id: int) -> str:
         return f"kill_state:slot{slot_id}"
+
+    @staticmethod
+    def _clear_request_key(slot_id: int) -> str:
+        return f"clear_restrictions_req:slot{slot_id}"
+
+    async def sync_clear_requests(self) -> None:
+        """Виконати запити «почистити слот» із вебпанелі.
+
+        Панель видаляє/додає вебкей ПОВЗ процес бота (для клона ще й з іншої
+        машини), тож памʼять екзекутора вона не бачить: `_halted` там лишався
+        б стояти, і слот мовчки не торгував би вже з новим ключем. Канал той
+        самий, що в кіла — маркер у `live_state`, який виконує бот.
+
+        Протермінований запит НЕ чистить: він так само знімає запобіжник, як
+        і в кіла (маркер віком у тижні повернув би слот до живих грошей без
+        дії оператора). `live_state` не входить у `RET_LIVE`, prune його не
+        прибирає, тож саме воно не зникне.
+
+        Ніколи не кидає назовні — це зручність, а не торгівля.
+        """
+        if self.live_db is None:
+            return
+        try:
+            rows = await self.live_db.fetchall(
+                "SELECT key, value FROM live_state "
+                "WHERE key LIKE 'clear_restrictions_req:slot%'")
+        except Exception:
+            logger.exception("[SLOT CLEAR] не вдалось перелічити запити")
+            return
+        for _r in rows or []:
+            key, value = str(_r[0]), _r[1]
+            try:
+                sid = int(key.rsplit("slot", 1)[1])
+            except (IndexError, ValueError):
+                await self.live_db.execute(
+                    "DELETE FROM live_state WHERE key = ?", (key,))
+                continue
+            try:
+                if self._release_req_is_stale(value):
+                    logger.warning(
+                        "[SLOT CLEAR] slot %d: запит із панелі ПРОТЕРМІНОВАНИЙ "
+                        "(старший за %dс) — ігнорую і прибираю",
+                        sid, int(KILL_RELEASE_REQ_TTL_SEC))
+                else:
+                    await self.clear_slot_restrictions(
+                        sid, reason="запит із вебпанелі")
+                # Маркер прибираємо В БУДЬ-ЯКОМУ разі, інакше запит
+                # відпрацьовував би на кожному циклі знову.
+                await self.live_db.execute(
+                    "DELETE FROM live_state WHERE key = ?", (key,))
+            except Exception:
+                logger.exception("[SLOT CLEAR] slot %d: запит не оброблено", sid)
 
     @staticmethod
     def _kill_request_key(slot_id: int) -> str:
