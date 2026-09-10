@@ -31,6 +31,11 @@ import websockets
 # only on is_synced). Force one resnap past the cap once the book is this stale,
 # so a frozen-but-"live" Binance reference price can't exceed ~this bound.
 _RESNAP_FORCE_STALE_MS = 3000
+
+# Як часто перевіряти книги, що лишились без знімка (дзеркало mexc_ws:277).
+# 30с — той самий крок, що в MEXC; вибір не переміряний, узятий заради
+# однаковості двох фідів.
+SELF_HEAL_INTERVAL_SEC = 30.0
 from websockets.client import WebSocketClientProtocol
 
 from src.config import BinanceConf
@@ -205,6 +210,7 @@ class BinanceWSClient:
                 interval = getattr(self.cfg, "book_ticker_log_interval_sec", 60)
                 if interval > 0:
                     coros.append(self._book_ticker_summary_loop(interval))
+            coros.append(self._self_heal_loop())
             await asyncio.gather(*coros, return_exceptions=False)
         finally:
             if self._http:
@@ -432,6 +438,63 @@ class BinanceWSClient:
             return
 
         self._apply_depth_diff(symbol, data, expect_pu=True)
+
+    async def _self_heal_loop(self) -> None:
+        """Періодично перезабирати знімок для книг, які лишились без нього.
+
+        НАВІЩО — це був ТЕРМІНАЛЬНИЙ стан, а не транзієнт. `_fetch_snapshot`
+        на невдачі HTTP (:383) і на протухлому знімку (:409) ставить
+        `_snapshot_ready=False` і виходить, а більше ніхто його не кличе:
+        `_handle_depth_msg` при `not ready` лише БУФЕРИЗУЄ диф і повертається
+        (:430), тож `_apply_depth_diff` не виконується — і наявний self-heal
+        по розриву послідовності (:462) не спрацьовує НІКОЛИ. Книга мертва до
+        рестарту процесу.
+
+        ВИМІРЯНО 2026-09-10 16:10 UTC, через 2 год після рестарту primary:
+            primary  BIN synced=7/23   resyncs=297    MEX 23/23
+            клон     BIN synced=22/23  resyncs=332    MEX 23/23
+        MEXC на обох цілий саме тому, що в `mexc_ws` цей цикл є з самого
+        початку; це його дзеркало.
+
+        ЧОМУ ЦЕ БУЛО ТИХО. Детектор гейтить на `OrderBook.is_synced`, який
+        виставляється в `apply_snapshot` і НІКОЛИ не скидається назад, а топ
+        книги тримає свіжим bookTicker-фід. Тому сигнали йшли як ні в чому не
+        бувало (виміряно: розподіл по символах на обох боксах збігається), і
+        псувалась лише ДРАБИНА нижче топу — тобто фічі глибини в
+        `signal_features`, shadow-симуляція і захист від схрещеної книги.
+        """
+        try:
+            while True:
+                await asyncio.sleep(SELF_HEAL_INTERVAL_SEC)
+                if self._stop_event.is_set():
+                    return
+                # Поки depth-сокет не піднято, «немає знімка» означає «ще не
+                # стартували», а не «зламалось». Знімок без живого потоку дифів
+                # однаково протухне, тож не смикаємо біржу дарма.
+                if self._ws_depth is None:
+                    continue
+                unsynced = [s for s in list(self._symbols)
+                            if not self._snapshot_ready.get(s, False)]
+                if not unsynced:
+                    continue
+                logger.warning(
+                    "Binance self-heal: %d книг без знімка → перезабираю: %s",
+                    len(unsynced), sorted(unsynced))
+                for sym in unsynced:
+                    if self._stop_event.is_set():
+                        return
+                    # Той самий тротл 3/хв/символ, що й у решти шляхів resnap —
+                    # інакше 16 мертвих книг дали б чергу запитів до /fapi.
+                    if self._can_resnap(sym):
+                        await self._fetch_snapshot(sym)
+                        await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            # Цикл-лікар не має вбивати WS-задачі: `run()` збирає їх через
+            # gather(return_exceptions=False), тож виняток тут поклав би ВЕСЬ
+            # фід Binance — рівно те, що ми лікуємо.
+            logger.exception("Binance self-heal loop error")
 
     def _can_resnap(self, symbol: str) -> bool:
         """Rate-limit re-snapshots: at most 3 per minute per symbol (mirror of

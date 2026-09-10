@@ -775,24 +775,31 @@ class MexcWebClient:
             body["price"] = price
         # Debug log to verify what we actually send to MEXC.
         # Type meanings: 1=LIMIT(GTC), 2=POST_ONLY, 3=IOC, 4=FOK, 5=MARKET, 6=CONVERT.
-        logger.info(
-            "[ORDER SUBMIT] symbol=%s side=%s type=%s vol=%s lev=%s price=%s",
-            symbol, side, order_type, vol, leverage, price,
-        )
-        return await self._request(
-            "POST", "/order/create",
-            body=body,
-            # dolos на /order/create: НЕ ВИМАГАЄТЬСЯ біржею (абляція 2026-08-12
-            # — ордер приймається і з плоским тілом). ЧИ шлемо його насправді,
-            # вирішує _DOLOS_ON_ORDER: дефолт КОДУ — full (шлемо), але ОБИДВА
-            # боти розгорнуті з MEXC_PATH_MODE=bare, тобто НЕ шлють. Не плутати
-            # дефолт коду з розгорнутою конфігурацією; бот друкує факт на старті
-            # рядком [PATH MODE].
-            # web-sign обовʼязковий у будь-якому разі: без нього code=602.
-            # close_all_positions завжди слав dolos і не змінювався.
-            needs_dolos=_DOLOS_ON_ORDER,
-            needs_web_sign=True,
-        )
+        # ДРУКУЄТЬСЯ ПІСЛЯ POST, у `finally`: сам виклик logger.info коштує
+        # ~0.29мс (виміряно в бойовому контейнері), і до фікса вони стояли між
+        # готовим тілом ордера і дротом. `finally`, а не рядок після return —
+        # інакше на таймауті/виключенні ми втратили б ЄДИНИЙ запис про те, що
+        # саме слали, рівно в тому випадку, коли він потрібен.
+        try:
+            return await self._request(
+                "POST", "/order/create",
+                body=body,
+                # dolos на /order/create: НЕ ВИМАГАЄТЬСЯ біржею (абляція 2026-08-12
+                # — ордер приймається і з плоским тілом). ЧИ шлемо його насправді,
+                # вирішує _DOLOS_ON_ORDER: дефолт КОДУ — full (шлемо), але ОБИДВА
+                # боти розгорнуті з MEXC_PATH_MODE=bare, тобто НЕ шлють. Не плутати
+                # дефолт коду з розгорнутою конфігурацією; бот друкує факт на старті
+                # рядком [PATH MODE].
+                # web-sign обовʼязковий у будь-якому разі: без нього code=602.
+                # close_all_positions завжди слав dolos і не змінювався.
+                needs_dolos=_DOLOS_ON_ORDER,
+                needs_web_sign=True,
+            )
+        finally:
+            logger.info(
+                "[ORDER SUBMIT] symbol=%s side=%s type=%s vol=%s lev=%s price=%s",
+                symbol, side, order_type, vol, leverage, price,
+            )
 
     async def get_order_deals(self, order_id: str) -> dict[str, Any]:
         """Fetch deal (fill) details for a specific order.

@@ -1570,14 +1570,15 @@ class LiveExecutor:
             # on MEXC UI. If user reports "submit price seems off", compare
             # this log against MEXC orderbook UI screenshot at same timestamp.
             # Format: [IOC_OB] SYMBOL DIR bid=PRICE×SIZE ask=PRICE×SIZE submit=PRICE
+            # Сам рядок друкується ПІСЛЯ відправки (див. `finally` нижче) —
+            # виклик logger.info коштує ~0.29мс (виміряно в бойовому
+            # контейнері, best of 3 по 2000 викликів), і до фікса ці
+            # мілісекунди стояли рівно між зняттям BBO і дротом. Значення
+            # знімаються ТУТ, бо описують книгу на момент рішення.
             _mode = "at-touch" if offset_ticks == 0 else ("cross %+d ticks" % offset_ticks)
-            logger.info(
-                "[IOC_OB] %s %s bid=%s×%s ask=%s×%s submit=%s [%s]",
-                symbol, direction.upper(),
-                best_bid.price, best_bid.size if hasattr(best_bid, 'size') else getattr(best_bid, 'qty', '?'),
-                best_ask.price, best_ask.size if hasattr(best_ask, 'size') else getattr(best_ask, 'qty', '?'),
-                limit_raw, _mode,
-            )
+            _ob_bid_sz = best_bid.size if hasattr(best_bid, 'size') else getattr(best_bid, 'qty', '?')
+            _ob_ask_sz = best_ask.size if hasattr(best_ask, 'size') else getattr(best_ask, 'qty', '?')
+            _ob_bid_px, _ob_ask_px = best_bid.price, best_ask.price
 
             # Use scaled price for vol calc (calculate_vol_contracts expects whatever
             # price domain matches contract_size table — currently scaled domain)
@@ -1604,8 +1605,15 @@ class LiveExecutor:
 
             t0 = time.monotonic()
             try:
-                response = await asyncio.wait_for(
-                    client.submit_order(
+                # `asyncio.timeout` замість `asyncio.wait_for`: той обгортав
+                # корутину в Task, тож сабміт стартував лише з НАСТУПНОГО
+                # проходу черги готових колбеків (~1.2мс p50, Python 3.11.16).
+                # Семантика скасування зберігається: у 3.11 вихід із цього
+                # менеджера по таймауту піднімає TimeoutError, який ловить той
+                # самий обробник нижче (`asyncio.TimeoutError` — псевдонім
+                # вбудованого TimeoutError з 3.11).
+                async with asyncio.timeout(self.order_timeout_sec):
+                    response = await client.submit_order(
                         symbol=symbol,
                         side=side,
                         vol=vol,
@@ -1613,9 +1621,7 @@ class LiveExecutor:
                         open_type=open_type,
                         order_type=ORDER_TYPE_IOC_LIMIT,
                         price=price_str,
-                    ),
-                    timeout=self.order_timeout_sec,
-                )
+                    )
             except asyncio.TimeoutError:
                 last_error_msg = "submit_timeout"
                 logger.warning("[IOC OPEN] %s attempt #%d: submit timeout", symbol, attempt)
@@ -1627,6 +1633,17 @@ class LiveExecutor:
                 last_error_msg = f"submit_exception: {type(e).__name__}"
                 logger.exception("[IOC OPEN] %s attempt #%d: submit exception", symbol, attempt)
                 break  # don't retry on unexpected exceptions
+            finally:
+                # Знімок книги на момент рішення — друкуємо ПІСЛЯ відправки,
+                # щоб не тримати ордер зайві ~0.29мс. У `finally`, а не після
+                # try: на таймауті й на винятку гілки роблять continue/break,
+                # і рядок зник би саме тоді, коли він найпотрібніший.
+                logger.info(
+                    "[IOC_OB] %s %s bid=%s×%s ask=%s×%s submit=%s [%s]",
+                    symbol, direction.upper(),
+                    _ob_bid_px, _ob_bid_sz, _ob_ask_px, _ob_ask_sz,
+                    limit_raw, _mode,
+                )
 
             last_latency_ms = int((time.monotonic() - t0) * 1000)
             last_response = response
