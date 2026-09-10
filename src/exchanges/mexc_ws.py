@@ -22,8 +22,15 @@ Snapshot+diff sync (per MEXC docs):
   2. Buffer push.depth messages.
   3. Fetch GET /api/v1/contract/depth/{symbol}?limit=1000, save its `version`.
   4. For each buffered diff, drop those with version <= snapshot_version.
-  5. First applied diff must have version == snapshot_version + 1.
-  6. Subsequent: version must be strictly increasing by 1, else re-snapshot.
+  5. Apply the first diff with version > snapshot_version. Δv > 1 is NORMAL
+     here — MEXC's `version` is a global change-counter and each push is
+     self-contained (absolute levels, vol=0 = delete), so a forward jump is
+     coalescing, not lost data. Only Δv >= _MAX_VERSION_GAP means we really
+     missed messages -> re-snapshot.
+  6. Steady state uses the SAME rule (see `_handle_depth`).
+  ВИПРАВЛЕНО 2026-09-10: пункти 5-6 описували правило BINANCE (строге +1).
+  Через нього активні символи (ZEC/MUSTOCK/SOXL) зависали незасинхронізованими
+  на хвилини, а детектор увесь цей час читав ЗАМОРОЖЕНУ книгу MEXC.
 """
 from __future__ import annotations
 
@@ -44,6 +51,15 @@ from src.exchanges.mexc_rest import MexcRestClient, to_binance, to_mexc
 from src.exchanges.orderbook import OrderBookManager
 
 logger = logging.getLogger(__name__)
+
+# Стеля правдоподібного розриву версій MEXC. Δv між сусідніми пушами штатно
+# 9..300 (коалесценція, кожен пуш самодостатній); більше за це — ми, найпевніше,
+# пропустили повідомлення, і книгу треба перезабрати.
+# ОДНА константа на ОБИДВА вживання — усталений режим (`_handle_depth`) і злив
+# буфера після знімка (`_fetch_snapshot`). Вони вже розійшлись одного разу:
+# у зливі стояло суворе `v == version + 1`, і активні символи через це
+# зависали незасинхронізованими на хвилини.
+_MAX_VERSION_GAP = 10000
 
 
 @dataclass
@@ -340,20 +356,32 @@ class MexcWSClient:
             v = int(diff.get("version", 0))
             if v <= version:
                 continue
-            if v == version + 1:
-                self._apply_depth_diff(mexc_symbol, diff)
-                applied += 1
-                self._last_version[mexc_symbol] = v
-                break
-            else:
+            # ТА САМА рамка, що і в усталеному режимі (`_handle_depth`), і це
+            # НЕ косметика. Тут стояло `v == version + 1` — правило BINANCE,
+            # де дифи інкрементні й строго послідовні. У MEXC `version` — це
+            # ГЛОБАЛЬНИЙ лічильник змін, Δv між сусідніми пушами штатно 9..300
+            # (див. коментар у `_handle_depth`), а кожен пуш самодостатній
+            # (абсолютні рівні, vol=0 = видалення). Тому суворе `+1` оголошувало
+            # `stale` будь-який АКТИВНИЙ символ.
+            # ВИМІРЯНО на primary 2026-09-10: ZEC_USDT — 13 невдалих спроб
+            # поспіль (розриви 2-86), книга не оновлювалась 6 хв 51 с, і за цей
+            # час детектор випустив 403 сигнали ZECUSDT, порівнюючи свіжий
+            # Binance із замороженою MEXC. Те саме з MUSTOCK_USDT і SOXL_USDT —
+            # тобто рівно з найактивнішими символами.
+            _gap = v - version - 1
+            if _gap >= _MAX_VERSION_GAP:
                 logger.warning(
-                    "MEXC %s snapshot stale (diff version=%d, snapshot=%d)",
-                    mexc_symbol, v, version,
+                    "MEXC %s snapshot stale (diff version=%d, snapshot=%d, gap=%d)",
+                    mexc_symbol, v, version, _gap,
                 )
                 self._buffered_diffs[mexc_symbol].clear()
                 self._snapshot_ready[mexc_symbol] = False
                 self.resync_count += 1
                 return
+            self._apply_depth_diff(mexc_symbol, diff)
+            applied += 1
+            self._last_version[mexc_symbol] = v
+            break
         while buf:
             diff = buf.popleft()
             self._apply_depth_diff(mexc_symbol, diff)
@@ -412,9 +440,9 @@ class MexcWSClient:
             if v <= prev:
                 return  # stale or duplicate
             gap = v - prev - 1
-            if 0 < gap < 10000:
+            if 0 < gap < _MAX_VERSION_GAP:
                 pass  # normal coalescing — apply as-is (not a data gap)
-            elif gap >= 10000:
+            elif gap >= _MAX_VERSION_GAP:
                 # huge gap — likely server reset or our side stalled
                 if not self._can_resnap(mexc_symbol):
                     return  # rate-limited; skip and try later
