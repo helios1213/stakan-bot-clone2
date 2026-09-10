@@ -37,6 +37,42 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DEFAULT_CAMPAIGN_DAYS = 3
+
+# ОДНЕ місце, що знає імʼя файлу стану кампанії. Раніше воно жило рядком у
+# `soft_start_runner`, і будь-хто інший (наприклад шлях видалення вебкея) мусив
+# би його продублювати — а два формати імені розʼїхались би мовчки.
+DEFAULT_DATA_DIR = "/app/data"
+
+
+def campaign_state_path(slot_id: int, data_dir: str = DEFAULT_DATA_DIR) -> str:
+    return f"{data_dir}/soft_start_campaign_slot{int(slot_id)}.json"
+
+
+def forget_campaign(slot_id: int, data_dir: str = DEFAULT_DATA_DIR) -> bool:
+    """Забути кампанію слота: наступний 🌱 почне НОВУ з чистим обліком.
+
+    Кличеться рівно з одного місця за змістом — коли вебкей ВИДАЛИЛИ. Саме
+    видалення (а не зміна рядка ключа) означає «цей акаунт більше не мій»:
+    відрізнити перелогін від чужого акаунта за самим ключем неможливо, тож
+    джерелом істини стала дія оператора (див. `start_if_new`).
+
+    Файл ВИДАЛЯЄТЬСЯ, а не позначається `finished`: «завершена кампанія» — це
+    стан, який чекає фінального звіту й розпродажу, а тут ані того, ані іншого
+    вже не зробити — ключа немає. Порожній слот має бути просто порожнім.
+
+    True, якщо файл існував і його прибрано.
+    """
+    p = campaign_state_path(slot_id, data_dir)
+    try:
+        if not os.path.exists(p):
+            return False
+        os.replace(p, p + ".forgotten")   # атомарно, слід лишається для розбору
+        logger.warning("soft-start campaign: слот %d — вебкей видалено, "
+                       "кампанію забуто (наступний 🌱 почне нову)", slot_id)
+        return True
+    except Exception:
+        logger.exception("forget_campaign: слот %s", slot_id)
+        return False
 DAY_SEC = 86400
 
 # РОЗЧИСТКА СПОТА ПЕРЕД НОВОЮ КАМПАНІЄЮ (рішення оператора 2026-09-05).
@@ -215,19 +251,42 @@ class SoftStartCampaign:
             return False
         prev_key = self.state.account_key or ""
         key_changed = bool(account_key) and bool(prev_key) and account_key != prev_key
-        fresh = (not self.state.started_at) or self.state.expired() or key_changed
+        fresh = (not self.state.started_at) or self.state.expired()
 
         if not fresh:
-            # Кампанія триває — лише дописуємо ключ, якщо його ще не було
-            # (файл із часів до появи поля).
-            if account_key and not prev_key:
+            # ПЕРЕКЛЕЮВАННЯ КЛЮЧА ПРОДОВЖУЄ КАМПАНІЮ (рішення оператора
+            # 2026-09-10). До того будь-яка зміна рядка ключа означала «новий
+            # акаунт» і давала повний скид — але відбиток рахується з КЛЮЧА, а
+            # не з акаунта, тож звичайний перелогін на ТОМУ САМОМУ акаунті
+            # (протух вебкей — типова річ) виглядав для коду як чужий акаунт.
+            # Наслідок був дорогий: скид на день 1/3 плюс `preclear_done=False`,
+            # тобто розчистка спота продавала всі монети.
+            #
+            # ВІДРІЗНИТИ САМІ ПО СОБІ КЛЮЧІ НЕМОЖЛИВО, тож джерелом істини стала
+            # ДІЯ ОПЕРАТОРА: переклеїв — той самий акаунт, кампанія триває;
+            # ВИДАЛИВ і вставив — інший акаунт, кампанія починається з нуля
+            # (видалення кличе `forget_campaign`, див. нижче).
+            #
+            # ЦІНА ЦЬОГО ВИБОРУ, і її треба знати: якщо переклеїти ключ ЧУЖОГО
+            # акаунта не видаливши старий, кампанія разом з обліком і монетами
+            # перейде на нього. Тому це не тихо — нижче WARNING.
+            if key_changed:
+                self.state.account_key = account_key
+                self._save()
+                logger.warning(
+                    "soft-start campaign: ключ у слоті ЗАМІНЕНО, кампанію "
+                    "ПРОДОВЖУЄМО (день %.2f/%d, облік і монети лишаються). "
+                    "Якщо це ІНШИЙ акаунт — видали вебкей і встав заново, "
+                    "тоді почнеться нова кампанія з чистим обліком.",
+                    self.state.elapsed_days(), self.state.days)
+            elif account_key and not prev_key:
+                # Файл із часів до появи поля — просто дописуємо ключ.
                 self.state.account_key = account_key
                 self._save()
             return False
 
-        why = ("новий акаунт у слоті" if key_changed
-               else ("попередня завершилась" if self.state.started_at
-                     else "перший запуск"))
+        why = ("попередня завершилась" if self.state.started_at
+               else "перший запуск")
         days = self.state.days
         # ПОВНИЙ СКИД, а не часткове оновлення: лічильники, ваги днів, набір
         # токенів і прапорець finished належали ТІЙ кампанії. Часткове

@@ -37,7 +37,13 @@ RPC = _RPC_PATH.read_text() if _RPC_PATH.exists() else None
 
 
 class _FakeDB:
-    """Мінімальний live_db: рівно ті два методи, що кличе споживач."""
+    """Мінімальний live_db: рівно ті методи, що кличе споживач.
+
+    `fetchone` зʼявився 10.09 разом із парним маркером `campaign_wipe_req`
+    (видалення ключа з панелі забуває кампанію прогріву). Без нього фейк
+    відставав би від реального інтерфейсу — той самий дрейф, що вже ламав
+    фейки warmer'а і сторожа.
+    """
 
     def __init__(self, rows):
         self.rows = list(rows)
@@ -45,6 +51,12 @@ class _FakeDB:
 
     async def fetchall(self, sql, params=()):
         return list(self.rows)
+
+    async def fetchone(self, sql, params=()):
+        for k, v in self.rows:
+            if k == params[0]:
+                return (v,)
+        return None
 
     async def execute(self, sql, params=()):
         if "DELETE" in sql.upper():
@@ -60,8 +72,11 @@ def _pool(rows):
     p.live_db = _FakeDB(rows)
     p.cleared = []
 
-    async def _clear(slot_id, *, reason):
-        p.cleared.append((slot_id, reason))
+    # Дзеркалить РЕАЛЬНИЙ інтерфейс: `wipe_campaign` додано 10.09 (видалення
+    # ключа з панелі забуває кампанію прогріву, вставка — ні). Фейк без нього
+    # мовчки ламав би проводку, а не падав.
+    async def _clear(slot_id, *, reason, wipe_campaign=False):
+        p.cleared.append((slot_id, reason, wipe_campaign))
         return []
 
     p.clear_slot_restrictions = _clear
@@ -76,8 +91,11 @@ async def test_a_fresh_request_clears_the_slot():
 
     await p.sync_clear_requests()
 
-    assert [s for s, _ in p.cleared] == [2]
-    assert p.live_db.deleted == ["clear_restrictions_req:slot2"], "маркер не спожито"
+    assert [s for s, *_ in p.cleared] == [2]
+    assert [w for *_, w in p.cleared] == [False], (
+        "без парного маркера кампанія не має забуватись")
+    assert p.live_db.deleted == ["clear_restrictions_req:slot2",
+                                 "campaign_wipe_req:slot2"], "маркер не спожито"
 
 
 @pytest.mark.asyncio
@@ -91,7 +109,11 @@ async def test_a_STALE_request_does_not_clear():
     await p.sync_clear_requests()
 
     assert p.cleared == [], "протермінований запит почистив слот"
-    assert p.live_db.deleted == ["clear_restrictions_req:slot1"], "і його треба прибрати"
+    # Парний маркер кампанії прибирається разом з основним: лишившись, він
+    # причепився б до НАСТУПНОГО, вже свіжого запиту і забув би кампанію,
+    # якої ніхто не просив забувати.
+    assert p.live_db.deleted == ["clear_restrictions_req:slot1",
+                                 "campaign_wipe_req:slot1"], "і їх треба прибрати"
 
 
 @pytest.mark.asyncio
@@ -118,7 +140,7 @@ async def test_one_bad_slot_does_not_skip_the_rest():
                ("clear_restrictions_req:slot2", now)])
     calls = []
 
-    async def _boom(slot_id, *, reason):
+    async def _boom(slot_id, *, reason, wipe_campaign=False):
         calls.append(slot_id)
         if slot_id == 1:
             raise RuntimeError("бум")
@@ -168,12 +190,14 @@ def test_removing_an_account_queues_the_clear(monkeypatch):
     queued = []
     monkeypatch.setattr(data, "remove_account", lambda sid: True)
     monkeypatch.setattr(data, "request_clear_restrictions_routed",
-                        lambda srv, sid: queued.append((srv, sid)) or {"ok": True})
+                        lambda srv, sid, wipe=False:
+                            queued.append((srv, sid, wipe)) or {"ok": True})
 
     res = data.remove_account_routed("primary", 2)
 
     assert res["ok"] is True
-    assert queued == [("primary", 2)], "слот лишився б із халтом у памʼяті бота"
+    assert queued == [("primary", 2, True)], (
+        "видалення має і чистити слот, і забувати кампанію прогріву")
 
 
 def test_a_FAILED_removal_queues_nothing(monkeypatch):
@@ -181,7 +205,8 @@ def test_a_FAILED_removal_queues_nothing(monkeypatch):
     queued = []
     monkeypatch.setattr(data, "remove_account", lambda sid: False)
     monkeypatch.setattr(data, "request_clear_restrictions_routed",
-                        lambda srv, sid: queued.append((srv, sid)) or {"ok": True})
+                        lambda srv, sid, wipe=False:
+                            queued.append((srv, sid, wipe)) or {"ok": True})
 
     res = data.remove_account_routed("primary", 2)
 
@@ -195,19 +220,21 @@ def test_adding_an_account_queues_the_clear_for_the_REAL_slot(monkeypatch):
     monkeypatch.setattr(data, "add_account",
                         lambda webkey, label, slot_id: {"slot_id": 2})
     monkeypatch.setattr(data, "request_clear_restrictions_routed",
-                        lambda srv, sid: queued.append((srv, sid)) or {"ok": True})
+                        lambda srv, sid, wipe=False:
+                            queued.append((srv, sid, wipe)) or {"ok": True})
 
     res = data.add_account_routed("primary", webkey="WEB" + "a" * 64)
 
     assert res["ok"] is True
-    assert queued == [("primary", 2)]
+    assert queued == [("primary", 2, False)], (
+        "вставка ключа не має забувати кампанію — переклеювання її продовжує")
 
 
 def test_a_queue_failure_does_not_break_the_removal(monkeypatch):
     """Чистка — зручність; вона не має перетворювати успішне видалення на 400."""
     monkeypatch.setattr(data, "remove_account", lambda sid: True)
 
-    def _boom(srv, sid):
+    def _boom(srv, sid, wipe=False):
         raise RuntimeError("ssh впав")
 
     monkeypatch.setattr(data, "request_clear_restrictions_routed", _boom)

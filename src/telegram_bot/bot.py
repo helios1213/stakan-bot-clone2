@@ -1092,7 +1092,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             _cp = _wk_client_pool(context)
             if _cp is not None:
                 await _cp.invalidate(sid)
-            _cleared = await _clear_restrictions(context, sid, "вебкей видалено")
+            # wipe_campaign=True: ВИДАЛЕННЯ ключа означає «цей акаунт більше
+            # не мій», тож кампанія прогріву забувається і наступний 🌱 почне
+            # нову. Переклеювання (майстер вставки) її НЕ чіпає.
+            _cleared = await _clear_restrictions(context, sid, "вебкей видалено",
+                                                 wipe_campaign=True)
             _tail = f"\n🧹 Знято обмеження: {', '.join(_cleared)}." if _cleared else ""
             await query.edit_message_text(
                 (f"🗑 Slot {sid}: cleared.{_tail}") if deleted

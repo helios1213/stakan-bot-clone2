@@ -108,13 +108,21 @@ def _live_pool(context: ContextTypes.DEFAULT_TYPE):
         return None
 
 
-async def _clear_restrictions(context, slot_id: int, reason: str) -> list[str]:
-    """Слот після заміни/видалення ключа має бути чистим (рішення оператора)."""
+async def _clear_restrictions(context, slot_id: int, reason: str,
+                              wipe_campaign: bool = False) -> list[str]:
+    """Слот після заміни/видалення ключа має бути чистим (рішення оператора).
+
+    `wipe_campaign` розділяє ДВА різні наміри оператора: переклеїв ключ (той
+    самий акаунт, кампанія прогріву триває) проти видалив і вставив (інший
+    акаунт, кампанія починається з нуля). Відрізнити їх за самим ключем
+    неможливо — відбиток рахується з рядка ключа, а перелогін його міняє.
+    """
     pool = _live_pool(context)
     if pool is None:
         return []
     try:
-        return await pool.clear_slot_restrictions(slot_id, reason=reason)
+        return await pool.clear_slot_restrictions(slot_id, reason=reason,
+                                                  wipe_campaign=wipe_campaign)
     except Exception:
         logger.exception("clear_slot_restrictions failed for slot %s", slot_id)
         return []
@@ -603,7 +611,7 @@ async def _step_remove_confirm(update, context, text, fsm) -> None:
     pool = _client_pool(context)
     if pool is not None:
         await pool.invalidate(n)
-    await _clear_restrictions(context, n, "вебкей видалено")
+    await _clear_restrictions(context, n, "вебкей видалено", wipe_campaign=True)
     await update.message.reply_text(
         f"🗑 Slot {n}: cleared." if deleted else f"Slot {n}: nothing to delete.",
     )

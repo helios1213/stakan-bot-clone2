@@ -379,7 +379,7 @@ def request_kill_release(slot_id: int) -> dict:
     return {"ok": True, "queued": True}
 
 
-def request_clear_restrictions(slot_id: int) -> dict:
+def request_clear_restrictions(slot_id: int, wipe_campaign: bool = False) -> dict:
     """Попросити бота зняти обмеження зі слота (після видалення/додавання ключа).
 
     ТОЙ САМИЙ КАНАЛ, ЩО В КІЛА, і з тієї ж причини: fee-guard халт,
@@ -390,6 +390,11 @@ def request_clear_restrictions(slot_id: int) -> dict:
 
     Виконує бот у `LiveExecutorPool.sync_clear_requests` (цикл rebuild, ~30с),
     він же прибирає маркер. Затримка до ~30с — очікувана.
+
+    `wipe_campaign` — ОКРЕМИЙ парний маркер, а не суфікс у значенні цього:
+    значення читається ботом як таймстемп (`int(value)`), тож суфікс зробив би
+    запит нечитабельним, а нечитабельний = протермінований, тобто зняття
+    обмежень із панелі мовчки перестало б працювати.
     """
     conn = _rw(LIVE_DB)
     try:
@@ -399,19 +404,27 @@ def request_clear_restrictions(slot_id: int) -> dict:
             "VALUES (?, ?, ?)",
             (f"clear_restrictions_req:slot{int(slot_id)}", str(now), now),
         )
+        if wipe_campaign:
+            conn.execute(
+                "INSERT OR REPLACE INTO live_state (key, value, updated_at) "
+                "VALUES (?, ?, ?)",
+                (f"campaign_wipe_req:slot{int(slot_id)}", str(now), now),
+            )
         conn.commit()
     finally:
         conn.close()
     return {"ok": True, "queued": True}
 
 
-def request_clear_restrictions_routed(server: str, slot_id: int) -> dict:
+def request_clear_restrictions_routed(server: str, slot_id: int,
+                                      wipe_campaign: bool = False) -> dict:
     if server == "primary":
         try:
-            return request_clear_restrictions(slot_id)
+            return request_clear_restrictions(slot_id, wipe_campaign)
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    return _remote_rpc(server, {"op": "clear_restrictions", "slot_id": slot_id})
+    return _remote_rpc(server, {"op": "clear_restrictions", "slot_id": slot_id,
+                                "wipe_campaign": bool(wipe_campaign)})
 
 
 def request_kill_release_routed(server: str, slot_id: int) -> dict:
@@ -501,7 +514,8 @@ def remove_account_routed(server: str, slot_id: int) -> dict:
         res = {"ok": bool(ok)}
     else:
         res = _remote_rpc(server, {"op": "remove", "slot_id": slot_id})
-    return _queue_clear_after(server, slot_id, res)
+    # ВИДАЛЕННЯ = інший акаунт -> кампанія прогріву забувається.
+    return _queue_clear_after(server, slot_id, res, wipe_campaign=True)
 
 
 def add_account_routed(server: str, *, webkey: str,
@@ -513,10 +527,12 @@ def add_account_routed(server: str, *, webkey: str,
         res = _remote_rpc(server,
             {"op": "add", "webkey": webkey, "label": label, "slot_id": slot_id})
     # Слот міг бути вибраний автоматично — беремо той, у який реально лягло.
+    # Вставка ключа кампанію НЕ чіпає (переклеїли той самий акаунт).
     return _queue_clear_after(server, res.get("slot_id", slot_id), res)
 
 
-def _queue_clear_after(server: str, slot_id, res: dict) -> dict:
+def _queue_clear_after(server: str, slot_id, res: dict,
+                       wipe_campaign: bool = False) -> dict:
     """Після УСПІШНОЇ зміни ключа попросити бота почистити слот.
 
     Рішення оператора 2026-09-09: видалення або переклеювання ключа = чистий
@@ -528,7 +544,8 @@ def _queue_clear_after(server: str, slot_id, res: dict) -> dict:
     if not res.get("ok") or slot_id is None:
         return res
     try:
-        q = request_clear_restrictions_routed(server, int(slot_id))
+        q = request_clear_restrictions_routed(server, int(slot_id),
+                                              wipe_campaign)
         res["restrictions_queued"] = bool(q.get("ok"))
     except Exception as e:                       # чистка не має валити видалення
         logging.warning("queue clear-restrictions slot %s: %s", slot_id, e)

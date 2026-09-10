@@ -242,6 +242,17 @@ class LiveExecutorPool:
     def _clear_request_key(slot_id: int) -> str:
         return f"clear_restrictions_req:slot{slot_id}"
 
+    @staticmethod
+    def _campaign_wipe_key(slot_id: int) -> str:
+        """ОКРЕМИЙ маркер, а не суфікс у значенні `clear_restrictions_req`.
+
+        Значення того маркера читається як таймстемп (`_release_req_is_stale`
+        робить `int(value)`), тож будь-який суфікс перетворив би запит на
+        «нечитабельний», а нечитабельний тут = ПРОТЕРМІНОВАНИЙ, і зняття
+        обмежень мовчки перестало б працювати з панелі взагалі.
+        """
+        return f"campaign_wipe_req:slot{slot_id}"
+
     async def sync_clear_requests(self) -> None:
         """Виконати запити «почистити слот» із вебпанелі.
 
@@ -281,12 +292,24 @@ class LiveExecutorPool:
                         "(старший за %dс) — ігнорую і прибираю",
                         sid, int(KILL_RELEASE_REQ_TTL_SEC))
                 else:
+                    # ВИДАЛЕННЯ ключа з панелі кладе парний маркер: тоді
+                    # кампанія прогріву забувається (це інший акаунт).
+                    # Переклеювання його не кладе — кампанія триває далі.
+                    _wipe_row = await self.live_db.fetchone(
+                        "SELECT value FROM live_state WHERE key = ?",
+                        (self._campaign_wipe_key(sid),))
+                    _wipe = bool(_wipe_row and _wipe_row[0]
+                                 and not self._release_req_is_stale(_wipe_row[0]))
                     await self.clear_slot_restrictions(
-                        sid, reason="запит із вебпанелі")
-                # Маркер прибираємо В БУДЬ-ЯКОМУ разі, інакше запит
-                # відпрацьовував би на кожному циклі знову.
+                        sid, reason="запит із вебпанелі", wipe_campaign=_wipe)
+                # Маркери прибираємо В БУДЬ-ЯКОМУ разі, інакше запит
+                # відпрацьовував би на кожному циклі знову. Парний маркер
+                # кампанії живе рівно стільки ж, скільки основний.
                 await self.live_db.execute(
                     "DELETE FROM live_state WHERE key = ?", (key,))
+                await self.live_db.execute(
+                    "DELETE FROM live_state WHERE key = ?",
+                    (self._campaign_wipe_key(sid),))
             except Exception:
                 logger.exception("[SLOT CLEAR] slot %d: запит не оброблено", sid)
 
@@ -465,7 +488,8 @@ class LiveExecutorPool:
         ex = self._executors.get(slot_id)
         return ex.reset_fee_guard() if ex is not None else False
 
-    async def clear_slot_restrictions(self, slot_id: int, *, reason: str) -> list[str]:
+    async def clear_slot_restrictions(self, slot_id: int, *, reason: str,
+                                      wipe_campaign: bool = False) -> list[str]:
         """Зняти НАШІ блокування зі слота. Рішення оператора 2026-09-09:
         видалення або переклеювання вебкея = чистий аркуш для слота.
 
@@ -495,6 +519,18 @@ class LiveExecutorPool:
         а не «готово» над слотом, де нічого не стояло.
         """
         cleared: list[str] = []
+        # ВИДАЛЕННЯ ключа = «цей акаунт більше не мій» -> кампанія забувається,
+        # наступний 🌱 почне нову з чистим обліком. ПЕРЕКЛЕЮВАННЯ (wipe_campaign
+        # False) кампанію НЕ чіпає: відрізнити перелогін від чужого акаунта за
+        # самим ключем неможливо, тож джерелом істини є дія оператора
+        # (рішення 2026-09-10, див. `soft_start_campaign.start_if_new`).
+        if wipe_campaign:
+            try:
+                from src.execution.soft_start_campaign import forget_campaign
+                if forget_campaign(slot_id):
+                    cleared.append("кампанія прогріву забута")
+            except Exception:
+                logger.exception("clear_slot_restrictions: forget_campaign %d", slot_id)
         ex = self._executors.get(slot_id)
         if ex is not None:
             if ex._halted:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -912,21 +913,60 @@ def test_a_finished_campaign_can_be_started_again(tmp_path):
     assert not c.state.finished and not c.expired()
 
 
-def test_a_new_account_in_the_same_slot_starts_fresh(tmp_path):
-    """Стан прогріву лежить per-SLOT. Оператор замінив вебкеї на клоні — новий
-    акаунт успадкував би чужу кампанію разом із її лічильниками і монетами в
-    legacy-відрі, тобто ми б рахували «у монетах» те, чого на цьому акаунті
-    немає."""
+def test_a_repasted_key_CONTINUES_the_campaign(tmp_path):
+    """Рішення оператора 2026-09-10: ПЕРЕКЛЕЮВАННЯ вебкея продовжує поточну
+    кампанію, а нову починає лише ВИДАЛЕННЯ + вставка.
+
+    Раніше тут пінилось протилежне (зміна ключа = чистий аркуш), і це ламало
+    єдиний реальний сценарій: у ключа сплив термін, оператор перелогінився на
+    ТОМУ САМОМУ акаунті — і кампанія на 1.84/3 доби починалась з нуля, а
+    розчистка спота ще й зливала монети. Відрізнити «той самий акаунт» від
+    «іншого» за самим ключем НЕМОЖЛИВО: відбиток рахується з рядка ключа, і
+    перелогін його міняє так само, як інший акаунт. Тож намір бере не код, а
+    оператор — тим, ЯКОЮ дією він поклав ключ.
+    """
     c = _camp(tmp_path)
     c.start_if_new("acc-OLD")
     c.bump("spot_buys", 28)
     c.token_pool(["MX", "DOGE", "XRP", "SOL", "TRX"])
-    assert c.state.stats and c.state.tokens
+    started = c.state.started_at
 
-    assert c.start_if_new("acc-NEW") is True, "заміна акаунта не почала нову кампанію"
-    assert c.state.stats == {}, "лічильники старого акаунта перейшли на новий"
-    assert c.state.tokens == [], "набір токенів старого акаунта перейшов"
-    assert c.state.account_key == "acc-NEW"
+    assert c.start_if_new("acc-NEW") is False, "переклеювання почало НОВУ кампанію"
+    assert c.state.started_at == started, "кампанію перезапущено"
+    assert c.state.stats["spot_buys"] == 28, "лічильники втрачено при переклеюванні"
+    assert c.state.tokens, "набір токенів втрачено при переклеюванні"
+    assert c.state.account_key == "acc-NEW", "новий відбиток не записано"
+
+
+def test_forgetting_the_campaign_is_what_makes_the_next_start_fresh(tmp_path):
+    """Друга половина того самого рішення: ВИДАЛЕННЯ ключа забуває кампанію,
+    і аж тоді наступна вставка починає нову з чистим обліком.
+
+    Файл не стирається, а перейменовується в `.forgotten` — слід лишається,
+    бо в ньому облік завершеної кампанії.
+    """
+    from src.execution.soft_start_campaign import (campaign_state_path,
+                                                   forget_campaign)
+    name = os.path.basename(campaign_state_path(1, str(tmp_path)))
+    c = _camp(tmp_path, name)
+    c.start_if_new("acc-OLD")
+    c.bump("spot_buys", 28)
+    c.token_pool(["MX", "DOGE", "XRP", "SOL", "TRX"])
+
+    assert forget_campaign(1, str(tmp_path)) is True
+    assert not os.path.exists(campaign_state_path(1, str(tmp_path)))
+    assert os.path.exists(campaign_state_path(1, str(tmp_path)) + ".forgotten")
+
+    c2 = _camp(tmp_path, name)
+    assert c2.start_if_new("acc-NEW") is True, "після забуття не почалась нова"
+    assert c2.state.stats == {}, "лічильники старого акаунта перейшли на новий"
+    assert c2.state.tokens == [], "набір токенів старого акаунта перейшов"
+
+
+def test_forgetting_a_slot_with_no_campaign_is_a_no_op(tmp_path):
+    """Видалення ключа зі слота, який ніколи не грівся, не має падати."""
+    from src.execution.soft_start_campaign import forget_campaign
+    assert forget_campaign(7, str(tmp_path)) is False
 
 
 def test_the_same_account_does_not_restart_the_campaign(tmp_path):

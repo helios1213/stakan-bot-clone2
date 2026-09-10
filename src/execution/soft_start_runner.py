@@ -39,7 +39,8 @@ from .fee_gate import FeeGate
 from .futures_soft_start import FuturesSoftStart, FuturesSoftStartConfig, live_allowed
 from .soft_start_budget import (DEFAULT_MAX_COST_USDT, MIN_VIABLE_BALANCE_USDT,
                                 SoftStartBudget, scale_spot_config)
-from .soft_start_campaign import DEFAULT_CAMPAIGN_DAYS, SoftStartCampaign
+from .soft_start_campaign import (DEFAULT_CAMPAIGN_DAYS, SoftStartCampaign,
+                                  campaign_state_path)
 from .soft_start_reporter import SoftStartReporter
 from .spot_soft_start import SoftStartConfig, SpotSoftStart
 from .webkey.spot_client import SpotWebClient
@@ -141,7 +142,7 @@ class SlotWarmer:
             f"{data_dir}/soft_start_budget_slot{slot_id}.json", max_cost_usdt)
         # Warming is a finite 3-day job, not a permanent mode.
         self.campaign = SoftStartCampaign(
-            f"{data_dir}/soft_start_campaign_slot{slot_id}.json", campaign_days)
+            campaign_state_path(slot_id, data_dir), campaign_days)
         # slot_id -> той самий профіль пристрою, що й на фʼючерсному шляху
         # цього слота. Без нього спот ходив під ІНШИМ відбитком з тієї ж
         # IP і того ж акаунта.

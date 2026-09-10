@@ -42,8 +42,17 @@ def test_a_new_campaign_arms_the_preclear(tmp_path):
     assert c.state.preclear_until > t0
 
 
-def test_a_changed_webkey_arms_it_too(tmp_path):
-    """Заміна ключа = інший акаунт: його монети нам не свої."""
+def test_a_REPASTED_webkey_does_NOT_arm_it(tmp_path):
+    """Рішення оператора 2026-09-10: переклеювання ключа кампанію ПРОДОВЖУЄ,
+    тож розчистка спота НЕ озброюється.
+
+    Раніше тут пінилось протилежне («заміна ключа = інший акаунт»), і ціна
+    помилки була в монетах: у ключа сплив термін, оператор перелогінився на
+    ТОМУ САМОМУ акаунті — і перший же тік почав би зливати спот живої
+    кампанії (на primary слот 1 це MX 6.25 + SUI 56.53 ≈ 57 USDT). Відрізнити
+    перелогін від іншого акаунта за рядком ключа неможливо, тож намір задає
+    ДІЯ оператора: видалення забуває кампанію, вставка — ні.
+    """
     p = str(tmp_path / "c.json")
     c = SoftStartCampaign(p, 3, rng=random.Random(1))
     c.start_if_new("acct-1")
@@ -51,7 +60,28 @@ def test_a_changed_webkey_arms_it_too(tmp_path):
     assert c.preclear_pending() is False
 
     again = SoftStartCampaign(p, 3, rng=random.Random(2))
-    assert again.start_if_new("acct-2") is True      # інший ключ
+    assert again.start_if_new("acct-2") is False     # переклеїли
+    assert again.preclear_pending() is False, (
+        "переклеювання ключа озброїло розчистку — це злило б спот живої "
+        "кампанії")
+
+
+def test_a_DELETED_key_arms_it_on_the_next_campaign(tmp_path):
+    """Друга половина: видалення ключа забуває кампанію, і наступна вже
+    озброює розчистку — монети попереднього акаунта нам не свої."""
+    import os
+    from src.execution.soft_start_campaign import (campaign_state_path,
+                                                   forget_campaign)
+    name = os.path.basename(campaign_state_path(1, str(tmp_path)))
+    c = SoftStartCampaign(str(tmp_path / name), 3, rng=random.Random(1))
+    c.start_if_new("acct-1")
+    c.mark_precleared()
+    assert c.preclear_pending() is False
+
+    assert forget_campaign(1, str(tmp_path)) is True
+
+    again = SoftStartCampaign(str(tmp_path / name), 3, rng=random.Random(2))
+    assert again.start_if_new("acct-2") is True
     assert again.preclear_pending() is True
 
 
