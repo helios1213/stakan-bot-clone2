@@ -134,8 +134,9 @@ class _Spot:
         self.boom = boom
         self.calls = []          # keep_frac кожного виклику
 
-    async def wind_down(self, keep, tokens=None):
+    async def wind_down(self, keep, tokens=None, no_dust=False):
         self.calls.append(keep)
+        self.no_dust = no_dust
         if self.boom:
             raise RuntimeError("біржа не віддала баланс")
         return self.per_pass.pop(0) if self.per_pass else 0
@@ -272,3 +273,14 @@ async def test_a_finished_preclear_lets_the_warming_run(tmp_path):
     except AttributeError:
         pass          # фейк не має решти інтерфейсу — нам важливий сам факт
     assert not w.spot.calls, "wind_down не мав викликатись після завершення"
+
+
+@pytest.mark.asyncio
+async def test_preclear_asks_for_no_dust_sales(tmp_path):
+    """ПРОВОДКА правки 14.09: розчистка мусить кликати wind_down з no_dust=True, інакше перша ж частка
+    лишає на монеті залишок нижче біржового мінімуму, який потім не продається (primary слот 2)."""
+    c = _camp(tmp_path)
+    spot = _Spot(per_pass=[1])
+    await _warmer(c, spot).tick()
+    assert spot.calls and spot.no_dust is True, "розчистка не просить продавати без пилу"
+

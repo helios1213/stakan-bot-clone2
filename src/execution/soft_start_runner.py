@@ -565,7 +565,8 @@ class SlotWarmer:
         _pool = list(dict.fromkeys(
             list(self.campaign.state.tokens or []) + list(SPOT_CANDIDATES)))
         try:
-            sent = await self.spot.wind_down(keep, tokens=_pool)
+            # no_dust: частка не лишає на монеті залишок нижче біржового мінімуму — такий уже не продати
+            sent = await self.spot.wind_down(keep, tokens=_pool, no_dust=True)
         except Exception as e:
             # НЕ позначаємо зробленим: гріти на невідомому балансі — це те, чого
             # оператор просив уникнути. Але й не блокуємо вічно (див. нижче).

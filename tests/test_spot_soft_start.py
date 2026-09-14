@@ -716,3 +716,75 @@ async def test_wind_down_sells_are_counted_too(tmp_path, monkeypatch):
     e.plan = DayPlan(date=e.plan.date, tokens=["MX"], buys_target=0, sells_target=0)
     assert await e.wind_down(0.20, tokens=["MX"]) == 1
     assert seen == ["spot_sells"], seen
+
+
+class _PreclearClient:
+    """Баланс як на primary слоті 2 перед розчисткою 14.09 (ціна 1.0, щоб рахувати в USDT)."""
+    def __init__(self, coins, usdt, qty_scale=2):
+        self.coins, self.usdt, self.qs = dict(coins), usdt, qty_scale
+        self.sold = []
+
+    async def currency(self, t):
+        return type("C", (), {"currency_id": t, "qty_scale": self.qs})()
+
+    async def balances(self, ids):
+        out = {t: {"available": v} for t, v in self.coins.items() if t in ids}
+        if "128f589271cb4951b03e71e6323eb7be" in ids:
+            out["USDT"] = {"available": self.usdt}
+        return out
+
+    async def sell(self, ticker, *, quantity, price):
+        self.sold.append((ticker, quantity))
+        from src.execution.webkey.spot_client import OrderResult
+        return OrderResult(True, False, ticker, "SELL", str(price), str(quantity), {"code": 200})
+
+
+def _preclear_engine(tmp_path, monkeypatch, client):
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price", lambda s: 1.0)
+    e = SpotSoftStart(client, cfg(tmp_path, universe=("TRX", "LINK"), order_usdt_min=0.5), rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["TRX", "LINK"], buys_target=0, sells_target=0)
+    return e
+
+
+@pytest.mark.asyncio
+async def test_preclear_no_dust_sells_the_whole_coin_instead_of_leaving_unsellable_dust(tmp_path, monkeypatch):
+    """ЖИВИЙ ВИПАДОК primary слот 2, 14.09: монети 2.07 + 1.87, USDT 21.45, keep 6% -> продали 59% кожної,
+    лишилось 0.84 і 0.76 — нижче мінімуму 1.10, наступний тік їх пропустив, розчистку «завершено»."""
+    cl = _PreclearClient({"TRX": 2.07, "LINK": 1.87}, usdt=21.45)
+    e = _preclear_engine(tmp_path, monkeypatch, cl)
+    assert await e.wind_down(0.06, tokens=["TRX", "LINK"], no_dust=True) == 2
+    assert sorted(cl.sold) == [("LINK", 1.87), ("TRX", 2.07)], f"мала продатись уся монета: {cl.sold}"
+
+
+@pytest.mark.asyncio
+async def test_without_no_dust_the_old_partial_behaviour_is_unchanged(tmp_path, monkeypatch):
+    """Контроль: кінцевий розпродаж кампанії (no_dust за замовчуванням False) продає частку, як і раніше."""
+    cl = _PreclearClient({"TRX": 2.07, "LINK": 1.87}, usdt=21.45)
+    e = _preclear_engine(tmp_path, monkeypatch, cl)
+    assert await e.wind_down(0.06, tokens=["TRX", "LINK"]) == 2
+    assert all(q < full for (t, q), full in zip(sorted(cl.sold), (1.87, 2.07))), cl.sold
+
+
+@pytest.mark.asyncio
+async def test_no_dust_full_sale_floors_quantity_to_the_pair_step(tmp_path, monkeypatch):
+    cl = _PreclearClient({"TRX": 3.617}, usdt=20.0, qty_scale=2)
+    e = _preclear_engine(tmp_path, monkeypatch, cl)
+    assert await e.wind_down(0.0, tokens=["TRX"], no_dust=True) == 1
+    assert cl.sold == [("TRX", 3.61)], f"кількість округлено вгору понад баланс: {cl.sold}"
+
+
+@pytest.mark.asyncio
+async def test_no_dust_keeps_a_remainder_that_is_itself_sellable(tmp_path, monkeypatch):
+    """Великий баланс: частковий продаж лишає >= мінімуму — продаємо частку, а не все (розмазування діє)."""
+    cl = _PreclearClient({"TRX": 20.0}, usdt=0.0)
+    e = _preclear_engine(tmp_path, monkeypatch, cl)
+    assert await e.wind_down(0.5, tokens=["TRX"], no_dust=True) == 1
+    assert cl.sold == [("TRX", 10.0)], cl.sold
+
+
+@pytest.mark.asyncio
+async def test_coin_already_below_the_minimum_is_still_skipped(tmp_path, monkeypatch):
+    cl = _PreclearClient({"TRX": 0.5}, usdt=20.0)
+    e = _preclear_engine(tmp_path, monkeypatch, cl)
+    assert await e.wind_down(0.0, tokens=["TRX"], no_dust=True) == 0 and cl.sold == []

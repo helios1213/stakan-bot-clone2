@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import urllib.request
@@ -434,7 +435,7 @@ class SpotSoftStart:
         return total if seen else None
 
     async def wind_down(self, keep_frac: float = 0.20,
-                        tokens: list | None = None) -> int:
+                        tokens: list | None = None, no_dust: bool = False) -> int:
         """Розпродати монети наприкінці кампанії, лишивши ~`keep_frac` вартості.
 
         НАВІЩО ОКРЕМИЙ РЕЖИМ, А НЕ ЗВИЧАЙНІ ПРОДАЖІ. `maybe_sell` НІКОЛИ не
@@ -450,6 +451,11 @@ class SpotSoftStart:
         Продажі йдуть по одному на виклик і НЕ рахуються в денний план: план
         уже вичерпано, а розпродаж — окрема дія завершення.
         Повертає кількість відправлених ордерів.
+
+        `no_dust` (розчистка спота перед кампанією): якщо після часткового продажу на монеті лишився б
+        залишок НИЖЧЕ біржового мінімуму, монета продається ПОВНІСТЮ цим же ордером. Такий залишок потім
+        не продати вже ніколи: primary слот 2, 2026-09-14 — перший тік продав 59% кожної монети, лишилось
+        TRX 0.84 і LINK 0.70 USDT, а наступний тік пропустив обидві як «нижче мінімуму 1.10».
         """
         cfg = self.cfg
         sent = 0
@@ -481,7 +487,7 @@ class SpotSoftStart:
             px = await _price_async(symbol)
             if not px or held <= 0:
                 continue
-            holdings.append((token, symbol, held, px, held * px))
+            holdings.append((token, symbol, held, px, held * px, cur))
 
         coins_value = sum(h[4] for h in holdings)
         usdt_free = 0.0
@@ -515,8 +521,11 @@ class SpotSoftStart:
         #
         # Порожній баланс токена коштує один запит і нічого не ламає, тож
         # дешевше перевірити зайве, ніж лишити гроші замкненими.
-        for token, symbol, held, px, value in holdings:
+        for token, symbol, held, px, value, cur in holdings:
             sell_value = value * sell_frac
+            full = False
+            if no_dust and value - sell_value < MIN_EXCHANGE_NOTIONAL_USDT:
+                sell_value, full = value, True
             # БІРЖОВИЙ мінімум, а не розмір ордера прогріву: другий росте з
             # балансом і блокував би розпродаж тим сильніше, чим більший
             # гаманець — тобто саме там, де продати треба найбільше.
@@ -527,6 +536,15 @@ class SpotSoftStart:
                 skipped += 1
                 continue
             qty = min(held, sell_value / px)
+            if full:
+                # Увесь залишок — ВНИЗ до кроку кількості пари: `fmt_decimals` округлює до найближчого, і
+                # 3.617 при кроці 0.01 стало б 3.62 > балансу -> відмова біржі.
+                qs = getattr(cur, "qty_scale", None)
+                d = 2 if qs is None else int(qs)
+                qty = math.floor(held * 10 ** d + 1e-9) / 10 ** d
+                if qty <= 0:
+                    skipped += 1
+                    continue
             cost = _order_cost(qty * px, cfg.marketable_buffer, cfg.spot_fee_frac)
             res = await self.client.sell(token, quantity=qty,
                                          price=px * (1 - cfg.marketable_buffer))
