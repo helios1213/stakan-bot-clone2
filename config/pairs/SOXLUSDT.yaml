@@ -1,6 +1,6 @@
 meta:
   symbol: SOXLUSDT
-  behavioral_epoch: 1787568048
+  behavioral_epoch: 1789390028
   note: |
     STOCK-перп, доданий у SHADOW 2026-08-11. SOXL (Direxion 3x semis ETF) stock-perp; MEXC=SOXL_USDT
     Ворота стартові (~2.1bps геп), історії немає — перетюнити з
@@ -51,8 +51,11 @@ execution:
   # (~7 угод/хв). При 30с цикл стає ~33с, тобто **менш ніж 2 угоди/хв** —
   # приблизно вчетверо менше угод на SOXL і в live, і в shadow.
   # Кулдаун спільний для обох режимів: ключ (slot, symbol), а у shadow slot=None.
-  cooldown_after_loss_sec: 30
-  cooldown_after_win_sec: 30
+  # 2026-09-14: 30/30 -> 3/3 (рішення оператора). Цикл знову ~6с на угоду;
+  # shadow-статистика SOXL з цього моменту незіставна з періодом 30/30.
+  # cooldown_sec (сигнальний, 3.0) не змінено.
+  cooldown_after_loss_sec: 3
+  cooldown_after_win_sec: 3
   binance_reversal_ticks: 0.0
   gap_retrace_frac: 0.0
   min_mexc_lag_pct: 0.0
