@@ -222,6 +222,9 @@ class SpotSoftStart:
         self.cfg.validate()
         self.client = client
         self.rng = rng or random.Random()
+        # Що лишилось НЕпроданим в останньому wind_down і чому — читає розчистка спота, щоб не
+        # оголошувати «чистий баланс», коли монету відхилила біржа або її не вдалось прочитати.
+        self.wind_down_report: dict = {"rejected": [], "unreadable": [], "unpriced": [], "dust": []}
         # Optional hard spend ceiling shared with the futures warmer. None means
         # "no ceiling" — kept optional so existing callers and tests are unchanged.
         self.budget = budget
@@ -434,6 +437,10 @@ class SpotSoftStart:
                 total += held * px
         return total if seen else None
 
+    async def held_tokens(self) -> list[str]:
+        """Усі монети спотового гаманця з available > 0, крім котирувальної (USDT)."""
+        return sorted(t for t in await self.client.holdings() if t != self.cfg.quote)
+
     async def wind_down(self, keep_frac: float = 0.20,
                         tokens: list | None = None, no_dust: bool = False) -> int:
         """Розпродати монети наприкінці кампанії, лишивши ~`keep_frac` вартості.
@@ -472,7 +479,9 @@ class SpotSoftStart:
         # одною до нуля виглядало б як зачистка, а рівномірне зменшення — як
         # звичайне скорочення позицій.
         skipped = 0
-        holdings: list = []          # (token, symbol, held, px, value)
+        report = {"rejected": [], "unreadable": [], "unpriced": [], "dust": []}
+        self.wind_down_report = report
+        holdings: list = []          # (token, symbol, held, px, value, cur)
         pool0 = tokens if tokens is not None else list(self.plan.tokens)
         for token in list(dict.fromkeys(pool0)):
             symbol = f"{token}{cfg.quote}"
@@ -483,9 +492,14 @@ class SpotSoftStart:
             except Exception as e:
                 logger.warning("[wind-down] %s: баланс не прочитано (%s)",
                                symbol, e)
+                report["unreadable"].append(symbol)
+                continue
+            if held <= 0:
                 continue
             px = await _price_async(symbol)
-            if not px or held <= 0:
+            if not px:
+                logger.warning("[wind-down] %s: тримаємо %g, але ціни немає — не продається", symbol, held)
+                report["unpriced"].append(symbol)
                 continue
             holdings.append((token, symbol, held, px, held * px, cur))
 
@@ -534,6 +548,8 @@ class SpotSoftStart:
                             "мінімальний ноціонал біржі %.2f — пропускаю",
                             symbol, sell_value, MIN_EXCHANGE_NOTIONAL_USDT)
                 skipped += 1
+                if full or value < MIN_EXCHANGE_NOTIONAL_USDT:
+                    report["dust"].append((symbol, round(value, 2)))
                 continue
             qty = min(held, sell_value / px)
             if full:
@@ -544,12 +560,14 @@ class SpotSoftStart:
                 qty = math.floor(held * 10 ** d + 1e-9) / 10 ** d
                 if qty <= 0:
                     skipped += 1
+                    report["dust"].append((symbol, round(value, 2)))
                     continue
             cost = _order_cost(qty * px, cfg.marketable_buffer, cfg.spot_fee_frac)
             res = await self.client.sell(token, quantity=qty,
                                          price=px * (1 - cfg.marketable_buffer))
             if not res.ok:
                 logger.warning("[wind-down] %s відхилено: %s", symbol, res.error)
+                report["rejected"].append(symbol)
                 continue
             sent += 1
             self._count("spot_sells")     # розпродаж — теж продаж

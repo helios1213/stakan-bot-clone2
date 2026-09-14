@@ -170,3 +170,47 @@ async def test_bad_sizes_rejected_before_any_io():
         await c.buy("PENGU", usdt=0, price=1.0)
     with pytest.raises(ValueError):
         await c.sell("PENGU", quantity=1.0, price=0)
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return self._body
+
+
+class _Sess:
+    def __init__(self, resp):
+        self.resp, self.urls = resp, []
+
+    async def get(self, url, **kw):
+        self.urls.append(url)
+        return self.resp
+
+
+@pytest.mark.asyncio
+async def test_holdings_lists_every_coin_with_available_balance():
+    """Форма відповіді виміряна на живому акаунті 2026-09-14 (primary слот 2): data.assets — усі монети,
+    data.balances — вартість спота в BTC/ETH/..., а НЕ монети (BTC там 0.0003 при BTC=0 на балансі)."""
+    from src.execution.webkey.spot_client import ASSETS_URL
+    body = {"code": 0, "data": {
+        "balances": [{"currency": "BTC", "available": "0.00031966"}, {"currency": "USDT", "available": "25.26"}],
+        "assets": [{"currency": "BTC", "available": "0"}, {"currency": "USDT", "available": "18.35772923"},
+                   {"currency": "SUI", "available": "3.92", "frozen": "0"}, {"currency": "WLD", "available": "10.23"},
+                   {"currency": "ETH", "available": "0", "frozen": "1"}]}}
+    c = _client()
+    c._session = _Sess(_Resp(200, body))
+    assert await c.holdings() == {"USDT": 18.35772923, "SUI": 3.92, "WLD": 10.23}
+    assert c._session.urls == [ASSETS_URL]
+
+
+@pytest.mark.asyncio
+async def test_holdings_unreadable_is_an_error_not_an_empty_wallet():
+    from src.execution.webkey.spot_client import SpotBalancesUnavailable
+    for resp in (_Resp(403, {}), _Resp(200, {"code": 0, "data": None}), _Resp(200, {"code": 0, "data": {"balances": []}})):
+        c = _client()
+        c._session = _Sess(resp)
+        with pytest.raises(SpotBalancesUnavailable):
+            await c.holdings()
+

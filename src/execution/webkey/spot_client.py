@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 WEB_ORIGIN = "https://www.mexc.com"
 SPOT_ORDER_URL = f"{WEB_ORIGIN}/api/platform/spot/order/place"
 BALANCES_URL = f"{WEB_ORIGIN}/api/gateway/spot/finance/asset/currency/balances"
+# ВСІ монети спотового гаманця. BALANCES_URL віддає ЛИШЕ запитані coinId (виміряно 2026-09-14: запит USDT
+# повернув лише USDT, хоча на слоті лежали SUI і WLD). У відповіді `data.assets` — довідник усіх монет
+# (~1600) із `available`/`frozen`; `data.balances` — НЕ монети, а вартість усього спота в BTC/ETH/MX/USDC/USDT.
+ASSETS_URL = f"{WEB_ORIGIN}/api/platform/asset/api/asset/spot/convert/v2"
 
 # ЗАПАСНИЙ відбиток, якщо профіль слота недоступний (ручні проби без slot_id).
 # Був хардкод `Chrome/151` при `impersonate="chrome"`, і це суперечило само
@@ -219,6 +223,28 @@ class SpotWebClient:
                 "available": float(row.get("available") or 0),
                 "currency_id": row.get("vcoinId"),
             }
+        return out
+
+    async def holdings(self) -> dict[str, float]:
+        """{TICKER: available} для ВСІХ монет спотового гаманця з available > 0 (разом із USDT).
+        Замороженого в ордерах тут немає. Не прочитали -> SpotBalancesUnavailable, а не порожній словник."""
+        s = self._ensure_session()
+        r = await s.get(ASSETS_URL, headers=self._headers(), timeout=self._timeout)
+        if r.status_code != 200:
+            raise SpotBalancesUnavailable(f"spot assets HTTP {r.status_code}")
+        data = (r.json() or {}).get("data")
+        assets = data.get("assets") if isinstance(data, dict) else None
+        if not isinstance(assets, list):
+            raise SpotBalancesUnavailable("spot assets: немає data.assets")
+        out: dict[str, float] = {}
+        for a in assets:
+            cur = a.get("currency")
+            try:
+                avail = float(a.get("available") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cur and avail > 0:
+                out[cur] = avail
         return out
 
     async def currency(self, ticker: str) -> SpotCurrency:

@@ -788,3 +788,43 @@ async def test_coin_already_below_the_minimum_is_still_skipped(tmp_path, monkeyp
     cl = _PreclearClient({"TRX": 0.5}, usdt=20.0)
     e = _preclear_engine(tmp_path, monkeypatch, cl)
     assert await e.wind_down(0.0, tokens=["TRX"], no_dust=True) == 0 and cl.sold == []
+
+
+@pytest.mark.asyncio
+async def test_wind_down_report_lists_what_stayed_unsold(tmp_path, monkeypatch):
+    from src.execution.spot_soft_start import DayPlan, SpotSoftStart
+    from src.execution.webkey.spot_client import OrderResult
+    prices = {"OKUSDT": 1.0, "BADUSDT": 1.0, "DUSTUSDT": 1.0, "NOPXUSDT": None}
+    monkeypatch.setattr("src.execution.spot_soft_start.public_last_price", lambda s: prices.get(s))
+
+    class _Cl:
+        async def currency(self, t):
+            if t == "GONE":
+                raise RuntimeError("пари немає")
+            return type("C", (), {"currency_id": t, "qty_scale": 2})()
+        async def balances(self, ids):
+            bal = {"OK": 5.0, "BAD": 5.0, "DUST": 0.4, "NOPX": 3.0}
+            return {t: {"available": bal[t]} for t in ids if t in bal}
+        async def sell(self, ticker, *, quantity, price):
+            ok = ticker != "BAD"
+            return OrderResult(ok, False, ticker, "SELL", str(price), str(quantity),
+                               {"code": 200 if ok else 30004})
+
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("OK",), order_usdt_min=0.5), rng=random.Random(1))
+    e.plan = DayPlan(date=e.plan.date, tokens=["OK"], buys_target=0, sells_target=0)
+    assert await e.wind_down(0.0, tokens=["OK", "BAD", "DUST", "NOPX", "GONE"], no_dust=True) == 1
+    r = e.wind_down_report
+    assert r["rejected"] == ["BADUSDT"] and r["unreadable"] == ["GONEUSDT"], r
+    assert r["unpriced"] == ["NOPXUSDT"] and r["dust"] == [("DUSTUSDT", 0.4)], r
+
+
+@pytest.mark.asyncio
+async def test_held_tokens_excludes_the_quote(tmp_path):
+    from src.execution.spot_soft_start import SpotSoftStart
+
+    class _Cl:
+        async def holdings(self):
+            return {"USDT": 18.3, "SUI": 3.92, "BTC": 0.0003}
+    e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("SUI",)), rng=random.Random(1))
+    assert await e.held_tokens() == ["BTC", "SUI"]
+

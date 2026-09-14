@@ -130,6 +130,9 @@ class SlotWarmer:
         # лише як запобіжник проти вічного блокування: сам дедлайн уже є межею,
         # а це ловить випадок, коли біржа стабільно не віддає баланси.
         self._preclear_grace = 0
+        # Скільки тіків після дедлайну розчистка чекала на монети, які ще лишились (відмова біржі, не
+        # прочитано, немає ціни). Межа — MAX_PRECLEAR_STUCK, далі алерт і прогрів на балансі як є.
+        self._preclear_stuck = 0
         # Виміряна вартість монет на біржі + коли міряли. None = ще не міряли.
         self._held_market: float | None = None
         self._held_market_at: float = 0.0
@@ -562,9 +565,9 @@ class SlotWarmer:
         now = time.time()
         keep = self.campaign.preclear_keep_frac(now)
         past_deadline = now >= self.campaign.state.preclear_until
-        _pool = list(dict.fromkeys(
-            list(self.campaign.state.tokens or []) + list(SPOT_CANDIDATES)))
         try:
+            # УСІ монети гаманця, а не список кандидатів: оператор хоче на старті суто USDT (2026-09-14).
+            _pool = await self.spot.held_tokens()
             # no_dust: частка не лишає на монеті залишок нижче біржового мінімуму — такий уже не продати
             sent = await self.spot.wind_down(keep, tokens=_pool, no_dust=True)
         except Exception as e:
@@ -597,14 +600,37 @@ class SlotWarmer:
                         max(0.0, self.campaign.state.preclear_until - now) / 60)
             return                      # ще один тік на решту
 
-        # Ордерів не пішло. Це або «монет уже немає», або «лишився пил нижче
-        # біржового мінімуму» — обидва означають, що продавати більше нічого.
-        # До дедлайну ще чекаємо: монета могла не влізти в поточну частку і
-        # піде наступним тіком, коли keep_frac просяде.
+        # Ордерів не пішло. До дедлайну ще чекаємо: монета могла не влізти в поточну частку і піде
+        # наступним тіком, коли keep_frac просяде.
         if not past_deadline and keep > 0.0:
             return
-        logger.info("soft-start slot %d: розчистку спота завершено — прогрів "
-                    "починається з чистого балансу", self.slot_id)
+        # «Ордерів не пішло» ще не означає «продано все»: біржа могла відхилити ордер, баланс монети
+        # міг не прочитатись, у монети могло не бути ціни. Такі монети пробуємо ще MAX_PRECLEAR_STUCK
+        # тіків і лише потім стартуємо — з алертом, а не мовчки.
+        rep = self.spot.wind_down_report
+        stuck = list(rep.get("rejected", [])) + list(rep.get("unreadable", [])) + list(rep.get("unpriced", []))
+        if stuck and self._preclear_stuck < MAX_PRECLEAR_STUCK:
+            self._preclear_stuck += 1
+            logger.warning("soft-start slot %d: розчистка — лишились непродані %s, повтор %d/%d",
+                           self.slot_id, stuck, self._preclear_stuck, MAX_PRECLEAR_STUCK)
+            return
+        notes = []
+        if stuck:
+            notes.append("не продано: " + ", ".join(stuck))
+        if rep.get("dust"):
+            notes.append("пил нижче мінімуму біржі: " + ", ".join(f"{s} ~{v:.2f}$" for s, v in rep["dust"]))
+        if notes:
+            logger.warning("soft-start slot %d: розчистка спота завершена НЕ до нуля — %s",
+                           self.slot_id, "; ".join(notes))
+            if self.reporter is not None:
+                try:
+                    await self.reporter.skipped("⚠️ розчистка спота: " + "; ".join(notes)
+                                                + " — прогрів починається", **self._status())
+                except Exception:
+                    logger.debug("soft-start slot %d: preclear leftover alert failed", self.slot_id)
+        else:
+            logger.info("soft-start slot %d: розчистку спота завершено — прогрів "
+                        "починається з чистого балансу", self.slot_id)
         self.campaign.mark_precleared()
 
     async def tick(self) -> None:
@@ -807,6 +833,7 @@ MAX_WIND_DOWN_PASSES = 6
 # почати його з монетами на балансі: другий стан оператор бачить у звіті,
 # а перший виглядає як мовчазна зупинка.
 MAX_PRECLEAR_GRACE = 10
+MAX_PRECLEAR_STUCK = 5      # тіків після дедлайну на монети, які біржа відхилила / не прочитались
 
 
 async def _alert_stuck(w, slot_id: int) -> None:
