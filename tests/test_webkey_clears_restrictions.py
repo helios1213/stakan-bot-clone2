@@ -186,6 +186,9 @@ class _WkStore(_Store):
     async def set_webkey(self, slot_id, text):
         self.saved.append(slot_id)
 
+    async def get(self, slot_id):        # майстер після ключа читає слот для кроку тегу
+        return None
+
     async def delete(self, slot_id):
         self.deleted.append(slot_id)
         return True

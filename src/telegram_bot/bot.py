@@ -17,6 +17,7 @@ Commands:
 """
 from __future__ import annotations
 
+import html
 import logging
 import re
 import time
@@ -168,6 +169,8 @@ def _kb_webkey_slot(slot: Any) -> InlineKeyboardMarkup:
                 callback_data=f"m:webkey:setup:{sid}",
             ),
         ])
+        # Тег (мітка) — те саме поле, що «Мітка (ім'я)» у вебпанелі
+        rows.append([InlineKeyboardButton("🏷 Тег", callback_data=f"m:webkey:label:{sid}")])
 
         # Proxy support fully removed (direct mode): the bot connects to
         # futures.mexc.com directly from a Tokyo VPS, no SOCKS proxy.
@@ -216,6 +219,10 @@ def _kb_pair_actions(symbol: str, state: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🔄 Refresh",         callback_data=f"p:refresh:{symbol}"),
     ])
     return InlineKeyboardMarkup(rows)
+
+
+KEYBOARD_BUTTONS = frozenset({"📊 Menu", "📋 Trades Today", "🧪 Shadow PnL", "🔴 Live PnL",
+                              "🔔 Signals", "💵 Balance", "🔑 Webkey", "❓ Help"})
 
 
 def _kb_persistent() -> ReplyKeyboardMarkup:
@@ -753,8 +760,8 @@ async def keyboard_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # Webkey wizard takes priority — if a setup/remove flow is in progress,
-    # the user's free-text message is consumed by it.
-    if await webkey_text_handler(update, context):
+    # the user's free-text message is consumed by it. Кнопки клавіатури тегом не стають.
+    if await webkey_text_handler(update, context, passthrough=KEYBOARD_BUTTONS):
         return
 
     # Sizing wizard — when user tapped "Edit margin" / "Edit leverage",
@@ -971,6 +978,43 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except (ValueError, IndexError):
                 return
             await _send_webkey_slot(query, context, sid, edit=True)
+            return
+
+        # m:webkey:label_skip:N / label_clear:N / label:N — тег слота
+        if data.startswith("m:webkey:label"):
+            from src.telegram_bot.cmd_webkey import (
+                STEP_LABEL, _enter_step, _fsm, _reset, _store as _wk_store, send_label_prompt,
+            )
+            try:
+                action, sid = data.split(":")[2], int(data.split(":")[3])
+            except (ValueError, IndexError):
+                return
+            store = _wk_store(context)
+            uid = query.from_user.id
+            if action == "label_skip":
+                fsm = _fsm(uid)
+                if fsm.step == STEP_LABEL and fsm.slot_id == sid:
+                    _reset(uid)
+                slot = await store.get(sid)
+                cur = getattr(slot, "label", None) if slot else None
+                await query.message.reply_text(
+                    f"🏷 Slot {sid}: тег без змін" + (f" — <code>{html.escape(cur)}</code>" if cur else " (немає)"),
+                    parse_mode=ParseMode.HTML)
+                return
+            if action == "label_clear":
+                fsm = _fsm(uid)
+                if fsm.step == STEP_LABEL and fsm.slot_id == sid:
+                    _reset(uid)
+                await store.set_label(sid, None)
+                await query.message.reply_text(f"🏷 Slot {sid}: тег прибрано")
+                return
+            if action == "label":
+                slot = await store.get(sid)
+                if slot is None or slot.is_empty:
+                    await query.message.reply_text(f"Slot {sid}: спершу встав webkey.")
+                    return
+                _enter_step(uid, STEP_LABEL, slot_id=sid)
+                await send_label_prompt(context.bot, query.message.chat_id, sid, slot.label)
             return
 
         # m:webkey:setup or m:webkey:setup:N — start wizard

@@ -15,16 +15,20 @@ Commands:
     /webkey_remove N           — clear slot N (with confirmation)
     /webkey_label N "name"     — set friendly label for slot N
     /webkey_cancel             — abort active wizard
+
+Тег (мітка) слота — те саме поле `label`, що «Мітка (ім'я)» у вебпанелі. Після вставки ключа майстер
+пропонує НЕОБОВʼЯЗКОВИЙ тег; змінити/прибрати — кнопкою «🏷 Тег» у меню слота.
 """
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
@@ -47,6 +51,9 @@ logger = logging.getLogger(__name__)
 # Wizard step constants — shared with bot.py for inline-button entry
 STEP_WEBKEY = "webkey"
 STEP_REMOVE_CONFIRM = "remove_confirm"
+STEP_LABEL = "label"
+
+LABEL_MAX_LEN = 50          # як у вебпанелі та WebkeyStore.set_label
 
 WIZARD_TIMEOUT_SEC = 600
 
@@ -525,8 +532,13 @@ async def cmd_webkey_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # Free-text router (wizard FSM)
 # ---------------------------------------------------------------------------
 
-async def webkey_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Returns True if the message was consumed by an active wizard."""
+async def webkey_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              passthrough: frozenset[str] = frozenset()) -> bool:
+    """Returns True if the message was consumed by an active wizard.
+
+    passthrough — тексти кнопок постійної клавіатури. На кроці тегу такий текст НЕ стає тегом: крок
+    покидається (ключ уже збережено, тег необовʼязковий), а кнопка спрацьовує як завжди.
+    """
     user_id = update.effective_user.id
     fsm = _fsm(user_id)
     if fsm.is_idle():
@@ -536,8 +548,14 @@ async def webkey_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not text:
         return False
 
+    if fsm.step == STEP_LABEL and text in passthrough:
+        _reset(user_id)
+        return False
+
     if fsm.step == STEP_WEBKEY:
         await _step_webkey(update, context, text, fsm)
+    elif fsm.step == STEP_LABEL:
+        await _step_label(update, context, text, fsm)
     elif fsm.step == STEP_REMOVE_CONFIRM:
         await _step_remove_confirm(update, context, text, fsm)
     else:
@@ -581,11 +599,10 @@ async def _step_webkey(update, context, text, fsm) -> None:
     # Delete sensitive webkey message from chat
     await _delete_message_safely(update)
 
-    # v6.1: wizard finishes here. Proxy step removed — bot connects to
-    # futures.mexc.com directly without a SOCKS hop. Slot is ready to test
-    # / enable as soon as webkey is saved.
+    # v6.1: proxy step removed — bot connects to futures.mexc.com directly. Slot is ready to test / enable
+    # as soon as webkey is saved. Далі — НЕОБОВʼЯЗКОВИЙ крок тегу (ключ уже збережено, тож пропуск нічого не ламає).
     slot_id = fsm.slot_id
-    _reset(update.effective_user.id)
+    _enter_step(update.effective_user.id, STEP_LABEL, slot_id)
 
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
@@ -597,6 +614,39 @@ async def _step_webkey(update, context, text, fsm) -> None:
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
+    slot = await _store(context).get(slot_id)
+    await send_label_prompt(context.bot, update.effective_chat.id, slot_id,
+                            getattr(slot, "label", None) if slot else None)
+
+
+def label_prompt(slot_id: int, current: str | None) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст і кнопки запиту тегу. Кнопка «пропустити» лишає поточний тег як є."""
+    cur = (f"Зараз: <code>{html.escape(current)}</code>\n" if current else "")
+    text = (f"🏷 <b>Тег слота {slot_id}</b> (необовʼязково) — щоб знати, що це за акаунт.\n{cur}"
+            f"Надішли назву наступним повідомленням (до {LABEL_MAX_LEN} символів), напр. <code>acc-main</code>.")
+    skip = f"Лишити «{current}»" if current else "Без тегу"
+    rows = [[InlineKeyboardButton(skip, callback_data=f"m:webkey:label_skip:{slot_id}")]]
+    if current:
+        rows.append([InlineKeyboardButton("🧹 Прибрати тег", callback_data=f"m:webkey:label_clear:{slot_id}")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def send_label_prompt(bot, chat_id: int, slot_id: int, current: str | None) -> None:
+    text, kb = label_prompt(slot_id, current)
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _step_label(update, context, text, fsm) -> None:
+    label = text.strip()
+    if len(label) > LABEL_MAX_LEN:
+        await update.message.reply_text(
+            f"❌ Тег задовгий ({len(label)} > {LABEL_MAX_LEN}). Надішли коротший або натисни «Без тегу».")
+        return
+    slot_id = fsm.slot_id
+    await _store(context).set_label(slot_id, label)
+    _reset(update.effective_user.id)
+    await update.message.reply_text(f"🏷 Slot {slot_id}: тег <code>{html.escape(label)}</code>",
+                                    parse_mode=ParseMode.HTML)
 
 
 async def _step_remove_confirm(update, context, text, fsm) -> None:
