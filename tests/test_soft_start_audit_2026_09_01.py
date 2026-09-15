@@ -891,6 +891,8 @@ async def test_a_pending_open_is_rechecked_before_being_written_off(tmp_path):
     e._last_fee_estimate = 0.0
     e.rng = __import__("random").Random(0)
     e.last_closed = None
+    # __init__ пропущено: дзеркалимо поля, які рушій читає (з 15.09 — журнал відмов біржі).
+    e.rejections = __import__("src.execution.soft_start_errors", fromlist=["RejectionLog"]).RejectionLog()
 
     adopted = await e.reconcile_pending()
 
@@ -924,6 +926,8 @@ async def test_a_genuinely_unopened_order_is_still_cleared(tmp_path):
     e._last_fee_estimate = 0.0
     e.rng = __import__("random").Random(0)
     e.last_closed = None
+    # __init__ пропущено: дзеркалимо поля, які рушій читає (з 15.09 — журнал відмов біржі).
+    e.rejections = __import__("src.execution.soft_start_errors", fromlist=["RejectionLog"]).RejectionLog()
 
     assert await e.reconcile_pending() is False
     assert e.state.pending is None, "pending завис назавжди"
@@ -950,6 +954,8 @@ async def test_an_unreadable_exchange_keeps_the_question_open(tmp_path):
     e._last_fee_estimate = 0.0
     e.rng = __import__("random").Random(0)
     e.last_closed = None
+    # __init__ пропущено: дзеркалимо поля, які рушій читає (з 15.09 — журнал відмов біржі).
+    e.rejections = __import__("src.execution.soft_start_errors", fromlist=["RejectionLog"]).RejectionLog()
 
     assert await e.reconcile_pending() is False
     assert e.state.pending is not None, "питання закрили без відповіді"
@@ -1328,6 +1334,8 @@ async def test_the_close_is_persisted_before_the_pnl_read(tmp_path):
     e.on_action = None
     e.rng = __import__("random").Random(0)
     e.last_closed = None
+    # __init__ пропущено: дзеркалимо поля, які рушій читає (з 15.09 — журнал відмов біржі).
+    e.rejections = __import__("src.execution.soft_start_errors", fromlist=["RejectionLog"]).RejectionLog()
     e._last_fee_estimate = 0.0
 
     async def _pnl(pos):

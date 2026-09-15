@@ -41,6 +41,7 @@ from .soft_start_budget import (DEFAULT_MAX_COST_USDT, MIN_VIABLE_BALANCE_USDT,
                                 SoftStartBudget, scale_spot_config)
 from .soft_start_campaign import (DEFAULT_CAMPAIGN_DAYS, SoftStartCampaign,
                                   campaign_state_path)
+from .soft_start_errors import RejectionAlerter
 from .soft_start_reporter import SoftStartReporter
 from .spot_soft_start import SoftStartConfig, SpotSoftStart
 from .webkey.spot_client import SpotWebClient
@@ -99,6 +100,10 @@ class SlotWarmer:
     """Both warming engines for one slot, sized from the slot's real balances
     and sharing one spend ceiling."""
 
+    # Класові дефолти: тестові фейки, зібрані через __new__, мають працювати й без Telegram.
+    alerts = None
+    _rej_alerter: RejectionAlerter | None = None
+
     def __init__(self, slot_id: int, webkey: str, client, universe: list[str],
                  *, dry_run: bool, data_dir: str = "/app/data",
                  max_cost_usdt: float = DEFAULT_MAX_COST_USDT,
@@ -107,6 +112,8 @@ class SlotWarmer:
         self.slot_id = slot_id
         self.client = client
         self.universe = universe
+        self.alerts = alerts
+        self._rej_alerter = RejectionAlerter()
         self.dry_run = dry_run
         self.data_dir = data_dir
         # False when the arb strategy is live on this slot: two systems opening
@@ -634,6 +641,27 @@ class SlotWarmer:
         self.campaign.mark_precleared()
 
     async def tick(self) -> None:
+        try:
+            await self._tick()
+        finally:
+            await self._alert_rejections()
+
+    async def _alert_rejections(self) -> None:
+        """Відмови біржі з обох рушіїв за цей тік -> Telegram (див. soft_start_errors)."""
+        if self._rej_alerter is None:
+            return
+        items: list[dict] = []
+        for eng in (self.spot, self.futures):
+            log_ = getattr(eng, "rejections", None)
+            if log_ is not None:
+                items += log_.drain()
+        if items:
+            try:
+                await self._rej_alerter.process(items, self.alerts, self.slot_id)
+            except Exception:
+                logger.debug("soft-start slot %d: rejection alerts failed", self.slot_id, exc_info=True)
+
+    async def _tick(self) -> None:
         if self.spot is None or self.futures is None:
             return                                  # start() has not run yet
         if self.draining:
@@ -806,6 +834,7 @@ class SlotWarmer:
         logger.warning("soft-start slot %d: switching OFF with exposure — "
                        "closing it first", self.slot_id)
         clean = await self._drain_futures()
+        await self._alert_rejections()          # відмова закриття на OFF — теж причина сказати оператору
         if not clean:
             self._stop_attempts += 1
             logger.error("soft-start slot %d: close FAILED on OFF (attempt %d) — "

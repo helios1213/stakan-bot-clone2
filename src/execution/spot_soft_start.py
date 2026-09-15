@@ -37,6 +37,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .soft_start_errors import RejectionLog
 from .webkey.spot_client import SpotWebClient
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,8 @@ class SpotSoftStart:
         self.cfg.validate()
         self.client = client
         self.rng = rng or random.Random()
+        # Відмови біржі -> раннер -> Telegram (блок акаунта одразу, решта при повторах).
+        self.rejections = RejectionLog()
         # Що лишилось НЕпроданим в останньому wind_down і чому — читає розчистка спота, щоб не
         # оголошувати «чистий баланс», коли монету відхилила біржа або її не вдалось прочитати.
         self.wind_down_report: dict = {"rejected": [], "unreadable": [], "unpriced": [], "dust": []}
@@ -398,6 +401,7 @@ class SpotSoftStart:
                                       if cfg.spot_fee_frac else ""))
             return True
         logger.warning("[buy] %s rejected: %s", symbol, res.error)
+        self.rejections.note("спот", "купівля", symbol, res.response.get("code"), res.error)
         return False
 
     def _count(self, kind: str, n: int = 1) -> None:
@@ -568,6 +572,7 @@ class SpotSoftStart:
             if not res.ok:
                 logger.warning("[wind-down] %s відхилено: %s", symbol, res.error)
                 report["rejected"].append(symbol)
+                self.rejections.note("спот", "розпродаж", symbol, res.response.get("code"), res.error)
                 continue
             sent += 1
             self._count("spot_sells")     # розпродаж — теж продаж
@@ -676,6 +681,7 @@ class SpotSoftStart:
                                       if cfg.spot_fee_frac else ""))
             return True
         logger.warning("[sell] %s rejected: %s", symbol, res.error)
+        self.rejections.note("спот", "продаж", symbol, res.response.get("code"), res.error)
         return False
 
     async def tick(self) -> None:

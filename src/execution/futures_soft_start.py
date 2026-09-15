@@ -245,6 +245,9 @@ class FuturesSoftStart:
         # Лічильник дій кампанії — див. коментар у spot_soft_start: диф у
         # раннері стояв за перевіркою репортера і губив короткі цикли.
         self.on_action = on_action
+        # Відмови біржі -> раннер -> Telegram (блок акаунта одразу, решта при повторах).
+        from .soft_start_errors import RejectionLog
+        self.rejections = RejectionLog()
         # Наша ОЦІНКА комісії за round-trip останнього відкриття — щоб на
         # закритті звірити її з тим, що біржа взяла насправді.
         self._last_fee_estimate: float = 0.0
@@ -527,6 +530,7 @@ class FuturesSoftStart:
             # A definitive refusal from the exchange: nothing was opened.
             logger.warning("[futures] OPEN %s rejected: %s", sym,
                            json.dumps(resp or {})[:200])
+            self.rejections.note_resp("фʼючерси", "відкриття", sym, resp)
             self.state.pending = None
             save_state(c.state_path, self.state)
             return False
@@ -594,6 +598,7 @@ class FuturesSoftStart:
         if str((resp or {}).get("code")) != "0":
             logger.error("[futures] CLOSE %s rejected: %s — will retry",
                          pos.symbol, json.dumps(resp or {})[:200])
+            self.rejections.note_resp("фʼючерси", "закриття", pos.symbol, resp)
             return False
 
         held = pos.held_minutes()
@@ -732,6 +737,7 @@ class FuturesSoftStart:
         if str((resp or {}).get("code")) != "0":
             logger.error("futures soft-start: open-positions rejected: %s",
                          json.dumps(resp or {})[:200])
+            self.rejections.note_resp("фʼючерси", "читання позицій", None, resp)
             return None
         return list((resp or {}).get("data") or [])
 
