@@ -5,7 +5,7 @@ import sqlite3, json, time, os, sys
 import datetime
 from zoneinfo import ZoneInfo
 
-SERVER_NAME = sys.argv[1] if len(sys.argv) > 1 else "clone1"
+SERVER_NAME = sys.argv[1] if len(sys.argv) > 1 else "clone2"
 SHADOW = "/root/stakan-bot/data/stakan.db"
 LIVE   = "/root/stakan-bot/data/stakan-live.db"
 OUT    = "/root/state-export.json"
