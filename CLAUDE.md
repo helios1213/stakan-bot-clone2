@@ -1890,6 +1890,10 @@ MX returned exactly to 1.08. **The whole round trip cost 0.0031 USDT** — the b
 
 ## Three bots — keep them identical
 (Розділ колись звався «Two bots»; з 2026-09-15 ботів ТРИ — усе нижче стосується всіх трьох: primary, clone1, clone2.)
+
+**ПРАВИЛО ОПЕРАТОРА (2026-09-15): БУДЬ-ЯКА зміна на одному боті — одразу на всіх трьох.** Не лише `client.py`/`signing.py`: будь-який код у `src/`, тести, скрипти, інструменти, `CLAUDE.md`. Робота не закінчена, доки зміна не закомічена й не запушена в усіх трьох репо і не підтягнута на всі три бокси — щоб жоден бот не відставав за кодом. Перебудову живих ботів робити по черзі (гейт: відкриті угоди), не одночасно.
+Відрізняються ЛИШЕ налаштування машини: `.env`, БД, значення в `docker-compose.yml` (посів/зсув профілю, `SOFT_START_LIVE` тощо), `config/pairs/*.yaml` і `config/*.yaml` (тюнінг кожного бота, їх комітить `autocommit_configs.sh`), імʼя сервера в `clone_overrides/`. Файли панелі (`src/webpanel/**`) реально виконуються лише на primary; на клонах із них живе тільки `data.py` під SSH-RPC — синхронізувати їх окремим перевіреним кроком (RPC клона має лишитись робочим).
+**Виміряно 2026-09-15 (diff робочих копій):** clone1 = clone2 байт-у-байт поза налаштуваннями машини. primary vs клони в торговому коді: `live_executor.py` — у клонів зайві записи `XRP_USDC` у таблицях розмірів (жоден конфіг цю пару не торгує), `shadow_engine.py` — детальніший текст лога `[NEVERGREEN_CUT]` на primary; решта — коментарі (AST-порівняння). На торгівлю не впливає; вирівняти при наступному розгортанні коду.
 Three bots run the same execution code on three servers, in three repos (stakan-bot, stakan-bot-clone, stakan-bot-clone2). You have access to all three. Shared code (src/execution/webkey/client.py, signing.py) must never diverge.
 When you change that code on one bot, mirror it to the other as part of finishing:
 - Make the identical edit on the other bot over ssh (discover how to connect and where its repo lives yourself; confirm with git remote -v).
