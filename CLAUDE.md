@@ -29,6 +29,7 @@ Project instructions for Claude Code. Read this fully at the start of every sess
 - `src/execution/soft_start_budget.py` — облік: `spent` / `futures_pnl` / `spot_pnl` (за собівартістю) / legacy-відро; сайзинг (`scale_spot_config`, `human_order_usdt`, `futures_target_margin`).
 - `src/execution/soft_start_campaign.py` — 3 доби, вага дня, набір токенів, **персистентні лічильники** підсумкового звіту.
 - `src/execution/soft_start_reporter.py` — живе повідомлення в Telegram + фінальний звіт.
+- **Залишок монети на споті — 0 або >= 1.5 USDT (рішення оператора 2026-09-15):** `MIN_HOLD_USDT=1.5`, `MIN_BUY_USDT=1.6` у `spot_soft_start.py`. Купівля >= 1.6, базовий залишок звичайних продажів >= 1.5 (`scale_spot_config`), а `wind_down` (і розчистка, і кінцевий розпродаж) продає монету ПОВНІСТЮ, якщо частка лишила б < 1.5. Параметра `no_dust` більше немає. Пил, що вже < 1.10 (напр. SUI 0.71 на клоні 2), так не продати — лишається в звіті `dust`.
 - `src/execution/soft_start_errors.py` — відмови біржі -> Telegram (з 15.09): `RejectionLog` у кожному рушії, `RejectionAlerter` у раннері; блок акаунта через `live_executor.classify_account_block`.
 - Стан на диску (per-slot, у `/app/data/`): `futures_soft_start_slotN.json`, `spot_soft_start_slotN.json`, `soft_start_budget_slotN.json`, `soft_start_campaign_slotN.json`.
 

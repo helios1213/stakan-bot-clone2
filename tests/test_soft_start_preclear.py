@@ -143,10 +143,9 @@ class _Spot:
             raise RuntimeError("біржа не віддала список активів")
         return list(self.held)
 
-    async def wind_down(self, keep, tokens=None, no_dust=False):
+    async def wind_down(self, keep, tokens=None):
         self.calls.append(keep)
         self.pools.append(tokens)
-        self.no_dust = no_dust
         if self.reports:
             self.wind_down_report = self.reports.pop(0)
         if self.boom:
@@ -286,16 +285,6 @@ async def test_a_finished_preclear_lets_the_warming_run(tmp_path):
     except AttributeError:
         pass          # фейк не має решти інтерфейсу — нам важливий сам факт
     assert not w.spot.calls, "wind_down не мав викликатись після завершення"
-
-
-@pytest.mark.asyncio
-async def test_preclear_asks_for_no_dust_sales(tmp_path):
-    """ПРОВОДКА правки 14.09: розчистка мусить кликати wind_down з no_dust=True, інакше перша ж частка
-    лишає на монеті залишок нижче біржового мінімуму, який потім не продається (primary слот 2)."""
-    c = _camp(tmp_path)
-    spot = _Spot(per_pass=[1])
-    await _warmer(c, spot).tick()
-    assert spot.calls and spot.no_dust is True, "розчистка не просить продавати без пилу"
 
 
 # ------------------------------------------------ 2026-09-14: ВСЕ в USDT, не мовчки

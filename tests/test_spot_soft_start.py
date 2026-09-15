@@ -401,7 +401,9 @@ async def test_wind_down_keeps_a_share_of_the_WHOLE_spot_balance(
     prices = {"MXUSDT": 1.0, "TRXUSDT": 1.0}
     monkeypatch.setattr("src.execution.spot_soft_start.public_last_price",
                         lambda s: prices.get(s))
-    held = {"MX": 16.0, "TRX": 4.0}          # монет на 20.0
+    # Числа 15.09 змінено з MX 16 / TRX 4 / USDT 5: TRX лишав би 1.0 < MIN_HOLD_USDT і продавався б
+    # повністю (так і має бути), а тест перевіряє частку ВІД УСЬОГО балансу і пропорційність.
+    held = {"MX": 16.0, "TRX": 8.0}          # монет на 24.0
     sold = {}
 
     class _Cl:
@@ -409,7 +411,7 @@ async def test_wind_down_keeps_a_share_of_the_WHOLE_spot_balance(
             return type("C", (), {"currency_id": "id-" + t})()
         async def balances(self, ids):
             if ids[0] == USDT_CURRENCY_ID:
-                return {"USDT": {"available": 5.0}}   # спот разом = 25.0
+                return {"USDT": {"available": 1.0}}   # спот разом = 25.0
             t = ids[0].replace("id-", "")
             return {t: {"available": held.get(t, 0.0)}}
         async def sell(self, ticker, *, quantity, price):
@@ -428,7 +430,7 @@ async def test_wind_down_keeps_a_share_of_the_WHOLE_spot_balance(
     assert abs(left - 5.0) < 1e-6, f"лишилось {left}, а мало 5.0"
     # і ріжеться ПРОПОРЦІЙНО, а не одна монета в нуль
     assert sold["MX"] > 0 and sold["TRX"] > 0, sold
-    assert abs(sold["MX"] / 16.0 - sold["TRX"] / 4.0) < 1e-6, "непропорційно"
+    assert abs(sold["MX"] / held["MX"] - sold["TRX"] / held["TRX"]) < 1e-6, "непропорційно"
 
 
 @pytest.mark.asyncio
@@ -578,7 +580,8 @@ async def test_a_wind_down_that_sold_nothing_says_so(tmp_path, monkeypatch,
         async def balances(self, ids):
             if ids[0] == USDT_CURRENCY_ID:
                 return {"USDT": {"available": 0.0}}
-            return {"MX": {"available": 1.2}}
+            # 1.0 < біржового мінімуму 1.10: пил, продати не можна (1.2 з 15.09 продається ЦІЛКОМ — див. MIN_HOLD_USDT)
+            return {"MX": {"available": 1.0}}
         async def sell(self, *a, **k):
             raise AssertionError("не мало")
 
@@ -748,38 +751,47 @@ def _preclear_engine(tmp_path, monkeypatch, client):
 
 
 @pytest.mark.asyncio
-async def test_preclear_no_dust_sells_the_whole_coin_instead_of_leaving_unsellable_dust(tmp_path, monkeypatch):
+async def test_preclear_sells_the_whole_coin_instead_of_leaving_unsellable_dust(tmp_path, monkeypatch):
     """ЖИВИЙ ВИПАДОК primary слот 2, 14.09: монети 2.07 + 1.87, USDT 21.45, keep 6% -> продали 59% кожної,
     лишилось 0.84 і 0.76 — нижче мінімуму 1.10, наступний тік їх пропустив, розчистку «завершено»."""
     cl = _PreclearClient({"TRX": 2.07, "LINK": 1.87}, usdt=21.45)
     e = _preclear_engine(tmp_path, monkeypatch, cl)
-    assert await e.wind_down(0.06, tokens=["TRX", "LINK"], no_dust=True) == 2
+    assert await e.wind_down(0.06, tokens=["TRX", "LINK"]) == 2
     assert sorted(cl.sold) == [("LINK", 1.87), ("TRX", 2.07)], f"мала продатись уся монета: {cl.sold}"
 
 
 @pytest.mark.asyncio
-async def test_without_no_dust_the_old_partial_behaviour_is_unchanged(tmp_path, monkeypatch):
-    """Контроль: кінцевий розпродаж кампанії (no_dust за замовчуванням False) продає частку, як і раніше."""
-    cl = _PreclearClient({"TRX": 2.07, "LINK": 1.87}, usdt=21.45)
+async def test_remainder_between_exchange_minimum_and_1_5_is_sold_fully(tmp_path, monkeypatch):
+    """Рішення оператора 15.09: залишок монети після прогріву — 0 або >= 1.5 USDT. Частка 1.40 лишила б 1.40:
+    це вище біржового мінімуму 1.10, але після просідання ціни стає пилом — тож продаємо всю монету."""
+    cl = _PreclearClient({"TRX": 2.80}, usdt=0.0)
     e = _preclear_engine(tmp_path, monkeypatch, cl)
-    assert await e.wind_down(0.06, tokens=["TRX", "LINK"]) == 2
-    assert all(q < full for (t, q), full in zip(sorted(cl.sold), (1.87, 2.07))), cl.sold
+    assert await e.wind_down(0.5, tokens=["TRX"]) == 1
+    assert cl.sold == [("TRX", 2.8)], cl.sold
 
 
 @pytest.mark.asyncio
-async def test_no_dust_full_sale_floors_quantity_to_the_pair_step(tmp_path, monkeypatch):
+async def test_remainder_of_exactly_1_5_or_more_is_kept(tmp_path, monkeypatch):
+    cl = _PreclearClient({"TRX": 3.0}, usdt=0.0)
+    e = _preclear_engine(tmp_path, monkeypatch, cl)
+    assert await e.wind_down(0.5, tokens=["TRX"]) == 1
+    assert cl.sold == [("TRX", 1.5)], cl.sold
+
+
+@pytest.mark.asyncio
+async def test_full_sale_floors_quantity_to_the_pair_step(tmp_path, monkeypatch):
     cl = _PreclearClient({"TRX": 3.617}, usdt=20.0, qty_scale=2)
     e = _preclear_engine(tmp_path, monkeypatch, cl)
-    assert await e.wind_down(0.0, tokens=["TRX"], no_dust=True) == 1
+    assert await e.wind_down(0.0, tokens=["TRX"]) == 1
     assert cl.sold == [("TRX", 3.61)], f"кількість округлено вгору понад баланс: {cl.sold}"
 
 
 @pytest.mark.asyncio
-async def test_no_dust_keeps_a_remainder_that_is_itself_sellable(tmp_path, monkeypatch):
+async def test_partial_sale_keeps_a_remainder_that_is_itself_sellable(tmp_path, monkeypatch):
     """Великий баланс: частковий продаж лишає >= мінімуму — продаємо частку, а не все (розмазування діє)."""
     cl = _PreclearClient({"TRX": 20.0}, usdt=0.0)
     e = _preclear_engine(tmp_path, monkeypatch, cl)
-    assert await e.wind_down(0.5, tokens=["TRX"], no_dust=True) == 1
+    assert await e.wind_down(0.5, tokens=["TRX"]) == 1
     assert cl.sold == [("TRX", 10.0)], cl.sold
 
 
@@ -787,7 +799,7 @@ async def test_no_dust_keeps_a_remainder_that_is_itself_sellable(tmp_path, monke
 async def test_coin_already_below_the_minimum_is_still_skipped(tmp_path, monkeypatch):
     cl = _PreclearClient({"TRX": 0.5}, usdt=20.0)
     e = _preclear_engine(tmp_path, monkeypatch, cl)
-    assert await e.wind_down(0.0, tokens=["TRX"], no_dust=True) == 0 and cl.sold == []
+    assert await e.wind_down(0.0, tokens=["TRX"]) == 0 and cl.sold == []
 
 
 @pytest.mark.asyncio
@@ -812,7 +824,7 @@ async def test_wind_down_report_lists_what_stayed_unsold(tmp_path, monkeypatch):
 
     e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("OK",), order_usdt_min=0.5), rng=random.Random(1))
     e.plan = DayPlan(date=e.plan.date, tokens=["OK"], buys_target=0, sells_target=0)
-    assert await e.wind_down(0.0, tokens=["OK", "BAD", "DUST", "NOPX", "GONE"], no_dust=True) == 1
+    assert await e.wind_down(0.0, tokens=["OK", "BAD", "DUST", "NOPX", "GONE"]) == 1
     r = e.wind_down_report
     assert r["rejected"] == ["BADUSDT"] and r["unreadable"] == ["GONEUSDT"], r
     assert r["unpriced"] == ["NOPXUSDT"] and r["dust"] == [("DUSTUSDT", 0.4)], r

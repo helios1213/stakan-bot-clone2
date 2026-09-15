@@ -575,8 +575,8 @@ class SlotWarmer:
         try:
             # УСІ монети гаманця, а не список кандидатів: оператор хоче на старті суто USDT (2026-09-14).
             _pool = await self.spot.held_tokens()
-            # no_dust: частка не лишає на монеті залишок нижче біржового мінімуму — такий уже не продати
-            sent = await self.spot.wind_down(keep, tokens=_pool, no_dust=True)
+            # Частка не лишає на монеті залишок < MIN_HOLD_USDT — див. wind_down
+            sent = await self.spot.wind_down(keep, tokens=_pool)
         except Exception as e:
             # НЕ позначаємо зробленим: гріти на невідомому балансі — це те, чого
             # оператор просив уникнути. Але й не блокуємо вічно (див. нижче).

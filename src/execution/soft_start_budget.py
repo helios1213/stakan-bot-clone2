@@ -490,10 +490,12 @@ def scale_spot_config(balance_usdt: float, *, max_tokens: int = 4) -> SpotSizing
     # ламало сайзинг: при 13 USDT стеля 12% = 1.59, тобто діапазон 1.5-1.59 —
     # усі ордери фактично однакові, а нижче 12.5 нижня межа взагалі
     # перевищувала верхню. 1.1 — запас над мінімальним ноціоналом MEXC (~1).
-    order_min = max(1.1, round(bal * 0.04, 2))
+    # 1.1 -> MIN_BUY_USDT (2026-09-15): монета, куплена на 1.1, після просідання ціни стає непродажним пилом.
+    from .spot_soft_start import MIN_BUY_USDT, MIN_HOLD_USDT
+    order_min = max(MIN_BUY_USDT, round(bal * 0.04, 2))
     # Стеля не менша за 1.6x від низу, інакше «діапазон» вироджується в точку.
     order_max = max(round(order_min * 1.6, 2), round(bal * 0.12, 2))
-    baseline = max(1.0, round(bal * 0.08, 2))
+    baseline = max(MIN_HOLD_USDT, round(bal * 0.08, 2))   # звичайний продаж не лишає менше 1.5
     return SpotSizing(
         order_usdt_min=order_min,
         order_usdt_max=order_max,

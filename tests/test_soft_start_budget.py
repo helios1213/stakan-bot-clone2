@@ -149,6 +149,17 @@ def test_order_size_never_drops_below_the_exchange_minimum():
     assert s.order_usdt_max >= 1.5
 
 
+def test_spot_sizing_never_creates_a_coin_position_below_1_5():
+    """Рішення оператора 15.09: купівля >= 1.6 (1.5 + перетин книги/комісія), базовий залишок >= 1.5 —
+    на будь-якому балансі, зокрема на порозі життєздатності 20 і на малих 13."""
+    from src.execution.spot_soft_start import MIN_BUY_USDT, MIN_HOLD_USDT
+    assert MIN_HOLD_USDT == 1.5 and MIN_BUY_USDT >= MIN_HOLD_USDT * (1 + 0.002 + 0.0005)
+    for bal in (5.0, 13.21, MIN_VIABLE_BALANCE_USDT, 25.0, 37.0):
+        s = scale_spot_config(bal)
+        assert s.order_usdt_min >= MIN_BUY_USDT, (bal, s)
+        assert s.baseline_usdt_per_token >= MIN_HOLD_USDT, (bal, s)
+
+
 def test_ten_max_orders_cannot_drain_the_balance():
     for bal in (25.0, 50.0, 200.0):
         s = scale_spot_config(bal)
