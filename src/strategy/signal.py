@@ -17,7 +17,7 @@ from typing import Any
 
 import orjson
 
-from src.storage.db import Database
+from src.storage.db import Database, retry_if_locked
 
 logger = logging.getLogger(__name__)
 
@@ -138,14 +138,16 @@ class SignalWriter:
         ]
         # Bulk insert via executemany
         try:
-            await self.db.conn.executemany(
+            # Повтор на «database is locked» — див. retry_if_locked у storage/db.py (клон 1: 1-6 сигналів
+            # губилось на кожному прибиранні бази).
+            await retry_if_locked(self.db.conn, lambda: self.db.conn.executemany(
                 """INSERT INTO signals (
                     symbol, direction, source,
                     binance_impulse_pct, mexc_lag_pct, confidence,
                     metadata_json, created_at, consumed, consumed_by
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 rows,
-            )
+            ))
             await self.db.conn.commit()
             self.total_written += len(batch)
         except Exception as e:

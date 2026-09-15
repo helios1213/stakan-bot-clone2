@@ -19,12 +19,39 @@ v5 (Webkey-only): webkey_slots simplified — dolos_blob dropped, replaced
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+# ПОВТОР ЗАПИСУ НА «database is locked» (2026-09-15). Виміряно на клоні 1: помилка приходить НЕ після
+# busy_timeout=5с, а МИТТЄВО — рівно під час db_prune_loop (через ~2 хв після кожного старту):
+# 22:48:55.8 старт прибирання -> 22:48:57.5 відмова; так само 10:06, 13:31, 21:35. Механізм відтворено
+# (lockrepro у ворклозі): зʼєднання одне на всі корутини, і якщо в мить запису інша корутина тримає
+# ще не закрите читання, а потік прибирання щойно закомітив, SQLite віддає SQLITE_BUSY БЕЗ очікування.
+# Статус транзієнтний (читання закривається за мілісекунди), тож короткий повтор рятує рядок.
+# ПЕРЕД ПОВТОРОМ — ROLLBACK, без нього повтор марний (перевірено тестом): невдала вставка лишає
+# зʼєднання у відкритій транзакції зі СТАРИМ знімком, і кожна наступна спроба падає так само.
+# Нічого не втрачається: транзакція, що отримала BUSY на запис, ще не записала жодного рядка
+# (інакше вона вже тримала б блокування запису і BUSY не отримала б).
+_LOCK_RETRY_DELAYS = (0.05, 0.1, 0.2)
+
+
+async def retry_if_locked(conn, op):
+    """Виконати `op()` (корутинна фабрика), повторюючи лише на «database is locked»."""
+    for delay in (*_LOCK_RETRY_DELAYS, None):
+        try:
+            return await op()
+        except sqlite3.OperationalError as e:
+            if delay is None or "locked" not in str(e).lower():
+                raise
+            if conn.in_transaction:
+                await conn.rollback()
+            await asyncio.sleep(delay)
 
 logger = logging.getLogger(__name__)
 
@@ -849,7 +876,7 @@ class Database:
         return self._conn
 
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        await self.conn.execute(sql, params)
+        await retry_if_locked(self.conn, lambda: self.conn.execute(sql, params))
         await self.conn.commit()
 
     async def execute_write(self, sql: str, params: tuple[Any, ...] = (),
@@ -876,7 +903,7 @@ class Database:
                 raise
 
     async def executemany(self, sql: str, params_list: list[tuple[Any, ...]]) -> None:
-        await self.conn.executemany(sql, params_list)
+        await retry_if_locked(self.conn, lambda: self.conn.executemany(sql, params_list))
         await self.conn.commit()
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Row | None:

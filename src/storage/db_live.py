@@ -19,6 +19,8 @@ from typing import Any
 
 import aiosqlite
 
+from src.storage.db import retry_if_locked
+
 logger = logging.getLogger(__name__)
 
 
@@ -144,11 +146,13 @@ class LiveDatabase:
         return self._conn
 
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        await self.conn.execute(sql, params)
+        # Той самий повтор, що в Database.execute: цю базу теж чистить db_prune_loop (live_trades),
+        # а втрачений запис живої угоди дорожчий за будь-який сигнал.
+        await retry_if_locked(self.conn, lambda: self.conn.execute(sql, params))
         await self.conn.commit()
 
     async def executemany(self, sql: str, params_list: list[tuple[Any, ...]]) -> None:
-        await self.conn.executemany(sql, params_list)
+        await retry_if_locked(self.conn, lambda: self.conn.executemany(sql, params_list))
         await self.conn.commit()
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Row | None:
