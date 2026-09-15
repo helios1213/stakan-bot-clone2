@@ -840,3 +840,11 @@ async def test_held_tokens_excludes_the_quote(tmp_path):
     e = SpotSoftStart(_Cl(), cfg(tmp_path, universe=("SUI",)), rng=random.Random(1))
     assert await e.held_tokens() == ["BTC", "SUI"]
 
+
+def test_day_plan_always_has_at_least_one_buy():
+    """Після розчистки слот тримає лише USDT: день без купівель — це день без спота взагалі (клон 1 слот 2, 15.09)."""
+    from src.execution.spot_soft_start import SoftStartConfig, new_day_plan
+    cfg = SoftStartConfig()
+    rng = random.Random(7)
+    assert min(new_day_plan(cfg, rng).buys_target for _ in range(3000)) >= 1
+
