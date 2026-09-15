@@ -76,9 +76,31 @@ async def test_history_shows_newest_first():
     b = FakeBot()
     r = rep(b)
     await r.spot_buy("MX", 2.5, "1.52")
-    await r.futures_open("HYPE_USDT", 1, 10, 45)
+    await r.spot_sell("MX", "1.52")
     body = b.sent[-1]
-    assert body.index("FUTURES OPEN") < body.index("SPOT BUY")
+    assert body.index("SPOT SELL") < body.index("SPOT BUY")
+
+
+@pytest.mark.asyncio
+async def test_futures_and_spot_are_separate_blocks_of_six():
+    """Запит оператора 15.09: окремо фʼючерси і спот, по 6 останніх, без спільного «Recent actions»."""
+    b = FakeBot()
+    r = rep(b)
+    for i in range(3):
+        await r.futures_open(f"F{i}USDT", 1, 10, 45)
+        await r.futures_close(f"F{i}USDT", 45, 0.1)
+    for i in range(9):
+        await r.spot_buy(f"S{i}USDT", 2.0, "1")
+    await r.skipped("⚠️ розчистка спота: не продано X")
+    body = b.sent[-1]
+    assert "Recent actions" not in body
+    fut = body[body.index("<b>Futures</b>"):body.index("<b>Spot</b>")]
+    spot = body[body.index("<b>Spot</b>"):body.index("<b>Інше</b>")]
+    assert fut.count("FUTURES") == 6 and "SPOT" not in fut
+    assert spot.count("SPOT BUY") == 6 and "FUTURES" not in spot
+    assert "S8USDT" in spot and "S2USDT" not in spot, "мають лишатись 6 НОВІШИХ"
+    assert spot.index("S8USDT") < spot.index("S3USDT"), "новіші зверху"
+    assert "розчистка спота" in body[body.index("<b>Інше</b>"):], "попередження не мають зникнути"
 
 
 @pytest.mark.asyncio

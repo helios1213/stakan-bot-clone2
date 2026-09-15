@@ -32,9 +32,12 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY = 8
-# Окремий, коротший журнал ФʼЮЧЕРСНИХ подій. Їх одиниці на день проти
-# десятків спотових, тож у спільному списку вони гарантовано витісняються.
+# Окремі журнали ФʼЮЧЕРСНИХ і СПОТОВИХ подій, по 6 останніх (запит оператора 2026-09-15: «не recent actions,
+# а окремо спот і фʼючі»). У спільному списку фʼючерсні події (одиниці на день) витіснялись спотом (десятки).
 MAX_FUTURES_LOG = 6
+MAX_SPOT_LOG = 6
+# Решта подій (старт кампанії, пропуски/попередження розчистки) — окремим коротким блоком «Інше».
+MAX_OTHER_LOG = 3
 
 
 def _hhmm() -> str:
@@ -63,6 +66,8 @@ class SoftStartReporter:
         # Фʼючерсні події живуть ОКРЕМО і не витісняються спотом.
         self.futures_log: list[str] = []
         self.max_futures = MAX_FUTURES_LOG
+        self.spot_log: list[str] = []
+        self.other_log: list[str] = []
         self._message_id: int | None = None
         self.started_at = time.time()
         # Counters for the closing report. The rolling history only keeps the
@@ -80,20 +85,24 @@ class SoftStartReporter:
 
     # ---- recording ------------------------------------------------------
 
-    async def action(self, icon: str, text: str, **status) -> None:
-        """Record an action and repost the live message."""
+    async def action(self, icon: str, text: str, kind: str = "other", **status) -> None:
+        """Record an action and repost the live message. `kind`: futures | spot | other — у який блок звіту."""
         self.history.append(Action(time.time(), icon, text))
+        log, cap = {"futures": (self.futures_log, self.max_futures),
+                    "spot": (self.spot_log, MAX_SPOT_LOG)}.get(kind, (self.other_log, MAX_OTHER_LOG))
+        log.append(f"{_hhmm()} {icon} {text}")
+        del log[:-cap]
         await self._repost(**status)
 
     async def spot_buy(self, symbol: str, usdt: float, qty: str, **st) -> None:
         self.stats["spot_buys"] += 1
-        await self.action("🟢", f"SPOT BUY {symbol} ~{usdt:.2f} USDT (qty {qty})", **st)
+        await self.action("🟢", f"SPOT BUY {symbol} ~{usdt:.2f} USDT (qty {qty})", kind="spot", **st)
 
     async def spot_sell(self, symbol: str, qty: str, usdt: float = 0.0,
                         **st) -> None:
         self.stats["spot_sells"] += 1
         amt = f" ~{usdt:.2f} USDT" if usdt else ""
-        await self.action("🔴", f"SPOT SELL {symbol}{amt} (qty {qty})", **st)
+        await self.action("🔴", f"SPOT SELL {symbol}{amt} (qty {qty})", kind="spot", **st)
 
     async def futures_open(self, symbol: str, side: int, leverage: int,
                            hold_min: int, vol: int = 0, notional: float = 0.0,
@@ -104,13 +113,7 @@ class SoftStartReporter:
         size += f" ~{notional:.2f} USDT" if notional else ""
         line = (f"FUTURES OPEN {symbol} {s} {leverage}x{size} "
                 f"— closing in {hold_min}min")
-        # Фʼючерсні події ДУБЛЮЮТЬСЯ в окремий короткий журнал. Спот робить
-        # десятки дій на день, фʼючерси — одну-три, тож у спільному списку з 8
-        # рядків найважливіше витіснялось спотовим шумом за півгодини: у звіті
-        # лишався тільки спот, і оператор не бачив ані відкриття, ані закриття.
-        self.futures_log.append(f"{_hhmm()} 📈 {line}")
-        del self.futures_log[:-self.max_futures]
-        await self.action("📈", line, **st)
+        await self.action("📈", line, kind="futures", **st)
 
     async def futures_close(self, symbol: str, held_min: float,
                             realised: float | None = None, **st) -> None:
@@ -121,9 +124,7 @@ class SoftStartReporter:
         pnl = (f" | PnL {realised:+.4f}" if realised is not None
                else " | PnL невідомий")
         line = f"FUTURES CLOSE {symbol}{held}{pnl}"
-        self.futures_log.append(f"{_hhmm()} 📉 {line}")
-        del self.futures_log[:-self.max_futures]
-        await self.action("📉", line, **st)
+        await self.action("📉", line, kind="futures", **st)
 
     async def campaign_started(self, days: int, **st) -> None:
         await self.action("🌱", f"Soft-start campaign began — {days} days", **st)
@@ -325,24 +326,21 @@ class SoftStartReporter:
         lines.append(" · ".join(meta))
         lines.append("")
 
-        # ФʼЮЧЕРСИ ПЕРШИМИ й окремим блоком. У спільному списку з 8 рядків
-        # їх за півгодини витісняв спот (десятки дій на день проти одиниць), і
-        # у звіті лишався тільки спот — оператор не бачив ані відкриття, ані
-        # закриття позиції, тобто найдорожчих подій прогріву.
-        if self.futures_log:
-            lines.append("<b>Futures</b>")
-            for ln in reversed(self.futures_log):
+        # ОКРЕМІ БЛОКИ, по 6 останніх, новіші зверху (запит оператора 2026-09-15). Спільного
+        # «Recent actions» більше немає: у ньому фʼючерси й спот перемішувались і дублювали блок Futures.
+        blocks = (("Futures", self.futures_log), ("Spot", self.spot_log), ("Інше", self.other_log))
+        shown = False
+        for title, log in blocks:
+            if not log:
+                continue
+            lines.append(f"<b>{title}</b>")
+            for ln in reversed(log):
                 lines.append(f"<code>{ln}</code>")
             lines.append("")
-
-        if self.history:
-            lines.append("<b>Recent actions</b>")
-            # newest first — the thing that just happened should be at the top
-            for a in reversed(self.history):
-                lines.append(f"<code>{a.line()}</code>")
-        else:
+            shown = True
+        if not shown:
             lines.append("<i>no actions yet</i>")
-        return "\n".join(lines)
+        return "\n".join(lines).rstrip("\n")
 
     # ---- delivery -------------------------------------------------------
 
