@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Account RPC handler — invoked over SSH from the primary panel.
 
+DEPLOY: цей файл має лежати на КОЖНОМУ віддаленому боті як
+    /usr/local/bin/stakan-account-rpc.py   (chmod +x)
+Копію тримаємо в репо з 2026-08-24: доти скрипт існував ЛИШЕ на srv1 у
+/usr/local/bin, поза git — тобто перевстановлення машини стирало його
+безслідно, а зміни в ньому ніде не було видно в діффі.
+Оновлюючи його — не забудь скопіювати на віддалені боти, інакше панель
+мовчки працюватиме лише з основою.
+
 Reads a JSON command from stdin, performs the action via webpanel.data
 (which uses THIS bot's MASTER_KEY from .env for credential encryption),
 writes the result as JSON to stdout. Returning `{"ok": True, ...}` on
@@ -19,6 +27,10 @@ Supported ops:
   {"op": "slot_sizing_set", "symbol": "X", "slot_id": N, ...fields…}
                                                       → per-(slot,pair) sizing
   {"op": "assign_pair", "slot_id": N, "pair": "X"|null} → assign / unassign
+  {"op": "unkill",      "slot_id": N}                   → запит на зняття kill-switch
+  {"op": "clear_restrictions", "slot_id": N, "wipe_campaign": bool}
+                                                       → запит на зняття обмежень слота
+                                                         (wipe_campaign=true ще й забуває кампанію прогріву)
 """
 import sys, json, os
 from pathlib import Path
@@ -67,6 +79,7 @@ def handle(req: dict) -> dict:
         res = data.add_account(
             webkey=req.get("webkey", ""),
             label=req.get("label") or None,
+            slot_id=req.get("slot_id"),
         )
         return {"ok": True, **res}
     if op == "pairs_list":
@@ -91,6 +104,23 @@ def handle(req: dict) -> dict:
         return {"ok": True,
                 "trades": data.live_trades(limit),
                 "summary": data.live_trades_summary()}
+    if op == "unkill":
+        # Панель лише СТАВИТЬ ЗАПИТ у live_state; знімає халт сам бот у
+        # LiveExecutorPool.sync_kill_state (цикл rebuild, ~30с). Писати щось
+        # інше звідси марно: SafetyController живе в памʼяті бота, і зміна
+        # повз нього дала б кнопку, яка «працює» лише візуально.
+        return data.request_kill_release(int(req["slot_id"]))
+    if op == "clear_restrictions":
+        # Те саме, що unkill, але для fee-guard халту / акаунт-рівневої
+        # помилки / блоку акаунта: вони живуть у памʼяті LiveExecutor, тож
+        # панель лише ставить запит, а виконує його бот у
+        # LiveExecutorPool.sync_clear_requests (цикл rebuild, ~30с).
+        # `wipe_campaign` РОЗДІЛЯЄ НАМІР: видалення ключа (інший акаунт ->
+        # кампанію прогріву забути) проти переклеювання (той самий акаунт ->
+        # кампанія триває). Дефолт False — старий виклик без поля лишається
+        # «переклеїли», тобто нічого не руйнує.
+        return data.request_clear_restrictions(
+            int(req["slot_id"]), bool(req.get("wipe_campaign")))
     if op == "kill_all":
         # Panel KILL ALL fans out here: demote every LIVE pair on THIS bot.
         return {"ok": True, "demoted": data.set_all_pairs_shadow()}
