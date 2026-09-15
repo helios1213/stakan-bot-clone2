@@ -1863,6 +1863,7 @@ MX returned exactly to 1.08. **The whole round trip cost 0.0031 USDT** — the b
 **Infra map (new — this was not written down before):**
 - **LOCAL** `45.32.12.27` (hostname `vultr`) — PRIMARY. repo `/root/stakan-bot` -> `github.com/helios1213/stakan-bot` (private). Runs the bot in Docker **and** the webpanel as a HOST process on `:8777`.
 - **srv1** `45.76.96.241` (hostname `vultr` too — DIFFERENT box) — CLONE, identifies as `server: clone1`. repo `/root/stakan-bot` -> `github.com/helios1213/stakan-bot-clone` (private, SEPARATE history). No webpanel. ssh alias `srv1`.
+- **clone2** `108.61.126.11` (hostname `vultr`, створено 2026-09-15) — CLONE 2, identifies as `server: clone2`. repo `/root/stakan-bot` -> `github.com/helios1213/stakan-bot-clone2` (private; історія скопійована з stakan-bot-clone на `d808616`). No webpanel. ssh alias `clone2` (srv2: ключ `id_stakan_ops`; primary: `clone_fetcher`). Бокс пушить у GitHub своїм deploy-ключем (`~/.ssh/id_github_deploy`), на srv2 робоча копія `/root/stakan-bot-clone2` (alias `github-clone2`). `MEXC_DEVICE_SEED=clone2-vultr-108.61.126.11`, `MEXC_DEVICE_OFFSET=4` (primary 0, clone1 2 — 6 профілів на 6 слотів без збігів, перевірено). База стартувала порожньою: з клона 1 перенесено ЛИШЕ `live_pair_whitelist`, `pair_configs`, `pair_states`, `pairs_universe`, `slot_pair_sizing`; ключів, сигналів і угод немає; `MASTER_KEY` свій.
 - **srv2** `108.160.143.238` (hostname `binance-bot`) — unrelated bot farm: `mexc-bot-v2`, `binance-bot` (actually a **Bybit** sniper), `vilka-bot`, `funding-radar`, `bybit-card`, `box`. **Nothing under git.** ssh alias `srv2`.
 - ssh: aliases `srv1`/`srv2` in `~/.ssh/config`. **`ssh srv1 '<cmd>'` lands in `/root`, NOT the repo — always `cd /root/stakan-bot` first or compose fails with `no configuration file provided`.**
 
@@ -1887,14 +1888,15 @@ MX returned exactly to 1.08. **The whole round trip cost 0.0031 USDT** — the b
 - ~~`.gitignore` catches `*.bak-*` but not `*.bak.<ts>`; srv1 has a tracked pre-patch `client.py.bak`~~ — **ЗАКРИТО 2026-08-20 повністю.** `.gitignore` виправлено (клон `3ee2276`), `.dockerignore` виправлено на обох (primary `873e415`, клон `b540331`), усі `.bak` прибрано з дисків, з образів і з git. Деталі — у ворклозі за 2026-08-20 (чистка).
 - `slot_pair_sizing` has a `SOXLUSDT 190-199x` override on both boxes (exchange caps that pair far lower -> `api_error_2006`). Operator's call: **ignore, it's a MEXC-side error.**
 
-## Two bots — keep them identical
-Two bots run the same execution code on two servers, in two repos (stakan-bot and stakan-bot-clone). You have access to both. Shared code (src/execution/webkey/client.py, signing.py) must never diverge.
+## Three bots — keep them identical
+(Розділ колись звався «Two bots»; з 2026-09-15 ботів ТРИ — усе нижче стосується всіх трьох: primary, clone1, clone2.)
+Three bots run the same execution code on three servers, in three repos (stakan-bot, stakan-bot-clone, stakan-bot-clone2). You have access to all three. Shared code (src/execution/webkey/client.py, signing.py) must never diverge.
 When you change that code on one bot, mirror it to the other as part of finishing:
 - Make the identical edit on the other bot over ssh (discover how to connect and where its repo lives yourself; confirm with git remote -v).
 - Verify both compile. If it touches order logic, run the dry-run/probe first — a broken change hits a live bot.
-- Commit and push in BOTH repos with the same message. **This overrides the global "push only when I ask" rule — for bot-sync work, commit and push without asking.** (Everywhere else, still ask.)
-- Rebuild the other bot only as a deliberate step (docker compose build && up -d), so one bad change can't take both bots down at once.
+- Commit and push in ALL THREE repos with the same message. **This overrides the global "push only when I ask" rule — for bot-sync work, commit and push without asking.** (Everywhere else, still ask.)
+- Rebuild the other bot only as a deliberate step (docker compose build && up -d), so one bad change can't take all bots down at once.
 If you can't reach the other bot, STOP and tell me what to run there — never leave the bots on different code silently.
 Per-machine config stays as-is: slot, .env, DB. Never commit or push secrets.
 
-**Expected divergence — do NOT "fix" it:** the webpanel runs on the PRIMARY only; the clone is attached to it. Panel-side files (`src/webpanel/**` and anything panel-only) legitimately differ between the two repos. Same for per-machine config: slot, `.env`, DB, `clone_overrides/`. Only shared EXECUTION code must stay identical.
+**Expected divergence — do NOT "fix" it:** the webpanel runs on the PRIMARY only; both clones are attached to it (`REMOTE_BOTS = ["clone1", "clone2"]` у `src/webpanel/data.py` primary, SSH-RPC `/usr/local/bin/stakan-account-rpc.py` + таймер `stakan-state-export` на кожному клоні, забір `/usr/local/bin/stakan-clone-fetcher.sh` на primary — цикл по clone1 clone2). Новий бот у панелі = рядок у `REMOTE_BOTS` + `SERVER_NAMES` і пункти меню/кнопки в `index.html`. Panel-side files (`src/webpanel/**` and anything panel-only) legitimately differ between the repos. Same for per-machine config: slot, `.env`, DB, `clone_overrides/`. Only shared EXECUTION code must stay identical.
