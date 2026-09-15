@@ -71,10 +71,9 @@ CONTRACT_SIZES: dict[str, float] = {
     "ETH_USDT": 0.001,
     "SUI_USDT": 1.0,       # 1 contract = 1 SUI
     "XLM_USDT": 10.0,      # 1 contract = 10 XLM (verified /contract/detail 2026-05-31)
-    "ONDO_USDT": 10,      # 1 contract = 10 ONDO (verified /contract/detail 2026-06-19)
-    "SOL_USDT":  0.1,     # 1 contract = 0.1 SOL (verified /contract/detail 2026-06-19)
-    "XRP_USDT":  1,       # 1 contract = 1 XRP (verified /contract/detail 2026-06-19)
-    "XRP_USDC":  1,       # 1 contract = 1 XRP (USDC)
+    "ONDO_USDT": 10,      # 1 contract = 10 ONDO (verified 2026-06-19)
+    "SOL_USDT":  0.1,     # 1 contract = 0.1 SOL (verified 2026-06-19)
+    "XRP_USDT":  1,       # 1 contract = 1 XRP (verified 2026-06-19)
     "AVAX_USDT": 0.1,      # 1 contract = 0.1 AVAX (verified /contract/detail 2026-06-07)
     "WLD_USDT": 1.0,       # 1 contract = 1 WLD
     "XMR_USDT": 0.01,      # 1 contract = 0.01 XMR (verified 2026-06-13) (verified /contract/detail 2026-06-13)
@@ -116,7 +115,6 @@ PRICE_SCALES: dict[str, int] = {
     "ONDO_USDT": 4,    # priceUnit=0.0001
     "SOL_USDT":  2,    # priceUnit=0.01
     "XRP_USDT":  4,    # priceUnit=0.0001
-    "XRP_USDC":  4,    # priceUnit=0.0001
     "AVAX_USDT": 3,    # priceUnit=0.001
 }
 
@@ -399,10 +397,9 @@ TICK_SIZES: dict[str, float] = {
     "ETH_USDT":  1e-2,
     "SUI_USDT":  1e-4,    # priceScale=4
     "XLM_USDT":  1e-5,    # priceScale=5
-    "SOL_USDT":  1e-2,    # priceScale=2 (was fallback 1e-5 = 1000x off)
-    "XRP_USDT":  1e-4,    # priceScale=4 (was fallback 1e-5 = 10x off)
-    "XRP_USDC":  1e-4,    # USDC variant (same tick as USDT)
-    "AVAX_USDT": 1e-3,    # priceScale=3 (was fallback 1e-5 = 100x off)
+    "SOL_USDT":  1e-2,    # priceScale=2 (was fallback 1e-5 = 1000x off, fixed 2026-06-19)
+    "XRP_USDT":  1e-4,    # priceScale=4 (was fallback 1e-5 = 10x off, fixed 2026-06-19)
+    "AVAX_USDT": 1e-3,    # priceScale=3 (was fallback 1e-5 = 100x off, fixed 2026-06-19)
     "ONDO_USDT": 1e-4,    # priceScale=4 (fixed 2026-06-19)
     "WLD_USDT":  1e-4,    # priceScale=4 (was fallback 1e-5 = 10x off, fixed 2026-06-19)
     "XMR_USDT":  1e-2,    # priceScale=2 (was fallback 1e-5 = 1000x off, fixed 2026-06-19)
@@ -2168,6 +2165,11 @@ class LiveExecutor:
             real_exit, real_pnl, real_entry = await self._close_fill_ws_or_rest(
                 client, symbol=symbol, position_id=snapshot_position_id,
                 close_after_ts_ms=close_ts, after_ts_monotonic=t0,
+                # Fast miss-detection: an IOC fills (and pushes) within the
+                # 400ms WS wait or never. Polling 2s on a MISS just lets the
+                # book run before the market fallback sweeps it (the 21-39t
+                # over-fills). 0.5s caps that dead-wait; close_all is a no-op
+                # if the IOC actually filled, so this never strands/dupes.
                 rest_timeout_sec=0.5,
                 close_order_id=(str((resp.get("data") or {}).get("orderId", "") or "")
                                if isinstance(resp.get("data"), dict) else ""),
