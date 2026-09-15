@@ -8,6 +8,8 @@ clone's setup. Tracked here so a full disk-wipe is recoverable from git.
 - `usr_local_bin/stakan-state-export.py`  → deploy to `/usr/local/bin/` (writes `/root/state-export.json`: accounts, pairs, recent_trades(25), pnl_24h, live_summary). Run by the timer below.
 - `systemd/stakan-state-export.service` + `.timer` → deploy to `/etc/systemd/system/`, then `systemctl daemon-reload && systemctl enable --now stakan-state-export.timer`.
 
+⚠️ **Спершу бот, потім таймер.** Експортер і RPC працюють від root: якщо запустити таймер ДО першого старту бота, `sqlite3.connect` створить порожній `data/stakan-live.db` з власником root, і бот (uid 1000) впаде з `attempt to write a readonly database` (спіймано на clone2 2026-09-15; лік — `chown 1000:1000` порожнього файлу).
+
 ## Redeploy after a wipe
 ```
 cp clone_overrides/usr_local_bin/*.py /usr/local/bin/ && chmod +x /usr/local/bin/stakan-*.py
