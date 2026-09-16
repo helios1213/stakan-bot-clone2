@@ -377,8 +377,12 @@ class SoftStartCampaign:
 
     # ---- per-day randomisation ------------------------------------------
 
+    # 0.15 -> 0.35 (2026-09-16, рішення оператора). Клон 1 отримав 0.17 і 0.22/0.28 два дні поспіль:
+    # плани виходили «2 купівлі, 3 продажі» на добу, і прогрів виглядав як простій.
+    WEIGHT_MIN = 0.35
+
     def day_weight(self) -> float:
-        """Activity weight for today, in [0.15, 1.0], rolled once and kept.
+        """Activity weight for today, in [WEIGHT_MIN, 1.0], rolled once and kept.
 
         A low weight makes a quiet day: fewer actions, sometimes none. Rolled
         per campaign-day rather than per tick so the day has a shape instead of
@@ -387,7 +391,7 @@ class SoftStartCampaign:
         """
         key = str(self.state.day_index())
         if key not in self.state.day_weights:
-            self.state.day_weights[key] = round(self.rng.uniform(0.15, 1.0), 3)
+            self.state.day_weights[key] = round(self.rng.uniform(self.WEIGHT_MIN, 1.0), 3)
             self._save()
             logger.info("soft-start campaign: day %s weight %.2f",
                         key, self.state.day_weights[key])

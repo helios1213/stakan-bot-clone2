@@ -124,6 +124,20 @@ def test_day_weight_persists_across_restart(tmp_path):
     assert c2.day_weight() == w
 
 
+def test_day_weight_never_drops_below_the_floor(tmp_path):
+    """Рішення оператора 16.09: вага дня нижча за 0.35 давала плани «2 купівлі на добу» (клон 1, 15-16.09)."""
+    from src.execution.soft_start_campaign import SoftStartCampaign
+    ws = []
+    for seed in range(300):
+        c = SoftStartCampaign(str(tmp_path / f"w{seed}.json"), rng=random.Random(seed))
+        c.start_if_new()
+        ws.append(c.day_weight())
+    # Число, а не SoftStartCampaign.WEIGHT_MIN: звірка з тією ж константою робить тест тавтологією
+    # (перевірено мутантом — з порогом 0.15 він проходив).
+    assert min(ws) >= 0.35, min(ws)
+    assert max(ws) > 0.9, "верхня межа не мала зміститись"
+
+
 def test_day_weights_differ_across_days(tmp_path):
     c = SoftStartCampaign(str(tmp_path / "c.json"), rng=random.Random(5))
     c.start_if_new()
@@ -132,7 +146,7 @@ def test_day_weights_differ_across_days(tmp_path):
         c.state.started_at = time.time() - (day + 0.5) * DAY_SEC
         seen.append(c.day_weight())
     assert len(set(seen)) > 1, "every day the same weight is not randomisation"
-    assert all(0.15 <= w <= 1.0 for w in seen)
+    assert all(0.35 <= w <= 1.0 for w in seen)   # нижню межу піднято 16.09
 
 
 def test_scale_target_makes_quiet_and_busy_days(tmp_path):
